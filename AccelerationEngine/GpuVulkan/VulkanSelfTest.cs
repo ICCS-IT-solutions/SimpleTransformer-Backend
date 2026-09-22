@@ -4,8 +4,8 @@ using SimpleTransformer.Model;
 namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 {
     /// <summary>
-    /// Bring-up harness for the Vulkan backend: compares the 6 GPU
-    /// element-wise kernels against the CPU reference on random data.
+    /// Bring-up harness for the Vulkan backend: compares all GPU
+    /// kernels against the CPU reference on random data.
     /// Run with: dotnet run -- --vulkan-selftest
     /// </summary>
     public static class VulkanSelfTest
@@ -176,6 +176,124 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                         for (int c = 0; c < 3; c++)
                             max = MathF.Max(max, MathF.Abs(exp[l, r, c] - act[l, r, c]));
                 Report("MatMul batch 2x5x4*4x3", max, 2e-3f);
+            }
+
+            // ---- Phase 3: nonlinear / norm / layout ops ----
+
+            using (var x = Rand(6, 8))
+            using (var exp = (Tensor)x.Clone())
+            using (var act = (Tensor)x.Clone())
+            {
+                reference.GeluInPlace(exp);
+                gpu.GeluInPlace(act);
+                Report("GeluInPlace", MaxDiff(exp, act), 1e-5f);
+            }
+
+            using (var x = Rand(6, 8))
+            using (var exp = new Tensor(6, 8))
+            using (var act = new Tensor(6, 8))
+            {
+                reference.GeluInto(x, exp);
+                gpu.GeluInto(x, act);
+                Report("GeluInto", MaxDiff(exp, act), 1e-5f);
+            }
+
+            using (var x = Rand(6, 8))
+            using (var dy = Rand(6, 8))
+            using (var exp = new Tensor(6, 8))
+            using (var act = new Tensor(6, 8))
+            {
+                reference.GeluBackwardInto(x, dy, exp);
+                gpu.GeluBackwardInto(x, dy, act);
+                Report("GeluBackward", MaxDiff(exp, act), 1e-4f);
+            }
+
+            Tensor RandVec(int n)
+            {
+                var t = new Tensor(n);
+                for (int i = 0; i < n; i++)
+                    t.Data[i] = (float)(random.NextDouble() * 2 - 1);
+                return t;
+            }
+
+            using (var x = Rand(4, 8))
+            using (var g = RandVec(8))
+            using (var b = RandVec(8))
+            using (var exp = (Tensor)x.Clone())
+            using (var act = (Tensor)x.Clone())
+            {
+                reference.LayerNormInPlace(exp, g, b);
+                gpu.LayerNormInPlace(act, g, b);
+                Report("LayerNormInPlace", MaxDiff(exp, act), 1e-4f);
+            }
+
+            using (var x = Rand(4, 8))
+            using (var g = RandVec(8))
+            using (var b = RandVec(8))
+            using (var exp = new Tensor(4, 8))
+            using (var act = new Tensor(4, 8))
+            {
+                reference.LayerNormInto(x, g, b, exp);
+                gpu.LayerNormInto(x, g, b, act);
+                Report("LayerNormInto", MaxDiff(exp, act), 1e-4f);
+            }
+
+            using (var x = Rand(4, 8))
+            using (var exp = (Tensor)x.Clone())
+            using (var act = (Tensor)x.Clone())
+            {
+                reference.SoftmaxInPlace(exp);
+                gpu.SoftmaxInPlace(act);
+                Report("SoftmaxInPlace", MaxDiff(exp, act), 1e-5f);
+            }
+
+            using (var s = Rand(4, 8))
+            using (var dy = Rand(4, 8))
+            using (var exp = new Tensor(4, 8))
+            using (var act = new Tensor(4, 8))
+            {
+                // SoftmaxBackward needs real softmax outputs, not raw randoms.
+                using var sx = (Tensor)s.Clone();
+                using var sy = (Tensor)s.Clone();
+                reference.SoftmaxInPlace(sx);
+                gpu.SoftmaxInPlace(sy);
+                reference.SoftmaxBackwardInto(sx, dy, exp);
+                gpu.SoftmaxBackwardInto(sy, dy, act);
+                Report("SoftmaxBackward", MaxDiff(exp, act), 1e-5f);
+            }
+
+            using (var s = Rand(5, 5))
+            using (var m = new Tensor(5, 5))
+            using (var exp = (Tensor)s.Clone())
+            using (var act = (Tensor)s.Clone())
+            {
+                for (int i = 0; i < 25; i++)
+                    m.Data[i] = (i % 3 == 0) ? 0f : 1f;
+                reference.ApplyMaskInPlace(exp, m);
+                gpu.ApplyMaskInPlace(act, m);
+                Report("ApplyMask", MaxDiff(exp, act), 1e-5f);
+            }
+
+            using (var s = Rand(4, 6))
+            using (var exp = new Tensor(6, 4))
+            using (var act = new Tensor(6, 4))
+            {
+                reference.TransposeInto(s, exp);
+                gpu.TransposeInto(s, act);
+                float max = 0f;
+                for (int r = 0; r < 6; r++)
+                    for (int c = 0; c < 4; c++)
+                        max = MathF.Max(max, MathF.Abs(exp[r, c] - act[r, c]));
+                Report("Transpose", max, 1e-6f);
+            }
+
+            using (var s = Rand(4, 6))
+            using (var exp = new Tensor(4, 6))
+            using (var act = new Tensor(4, 6))
+            {
+                reference.CopyInto(s, exp);
+                gpu.CopyInto(s, act);
+                Report("CopyInto", MaxDiff(exp, act), 1e-6f);
             }
 
             Console.WriteLine();

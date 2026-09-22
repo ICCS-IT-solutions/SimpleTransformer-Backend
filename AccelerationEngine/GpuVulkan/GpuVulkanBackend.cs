@@ -224,25 +224,115 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             => RunBinaryInto(VulkanKernel.MulInto, a, b, result);
 
         public void GeluInPlace(TensorBase tensor)
-            => _fallback.GeluInPlace(tensor);
+        {
+            if (_launcher == null) { _fallback.GeluInPlace(tensor); return; }
+            float[] f = Pack(tensor);
+            using var b = new VulkanBuffer(_ctx!, (ulong)(f.Length * 4));
+            b.Upload(f);
+            _launcher.DispatchRowwise(VulkanKernel.GeluInPlace, new[] { b }, (uint)RowCount(tensor), (uint)tensor.Cols);
+            b.Download(f);
+            Unpack(f, tensor);
+        }
 
         public void GeluInto(TensorBase input, TensorBase result)
-            => _fallback.GeluInto(input, result);
+        {
+            ValidateSame(input, result, "GeluInto");
+            if (_launcher == null) { _fallback.GeluInto(input, result); return; }
+            float[] fa = Pack(input);
+            var fr = new float[fa.Length];
+            using var ba = new VulkanBuffer(_ctx!, (ulong)(fa.Length * 4));
+            using var br = new VulkanBuffer(_ctx!, (ulong)(fr.Length * 4));
+            ba.Upload(fa);
+            _launcher.DispatchRowwise(VulkanKernel.GeluInto, new[] { ba, br }, (uint)RowCount(input), (uint)input.Cols);
+            br.Download(fr);
+            Unpack(fr, result);
+        }
 
         public void GeluBackwardInto(TensorBase input, TensorBase outputGradient, TensorBase inputGradient)
-            => _fallback.GeluBackwardInto(input, outputGradient, inputGradient);
+        {
+            ValidateSame(input, outputGradient, "GeluBackwardInto");
+            ValidateSame(input, inputGradient, "GeluBackwardInto");
+            if (_launcher == null) { _fallback.GeluBackwardInto(input, outputGradient, inputGradient); return; }
+            float[] fx = Pack(input);
+            float[] fy = Pack(outputGradient);
+            var fr = new float[fx.Length];
+            using var bx = new VulkanBuffer(_ctx!, (ulong)(fx.Length * 4));
+            using var by = new VulkanBuffer(_ctx!, (ulong)(fy.Length * 4));
+            using var br = new VulkanBuffer(_ctx!, (ulong)(fr.Length * 4));
+            bx.Upload(fx);
+            by.Upload(fy);
+            _launcher.DispatchRowwise(VulkanKernel.GeluBackward, new[] { bx, by, br }, (uint)RowCount(input), (uint)input.Cols);
+            br.Download(fr);
+            Unpack(fr, inputGradient);
+        }
 
         public void LayerNormInPlace(TensorBase tensor, TensorBase gamma, TensorBase beta, float epsilon = 1e-5f)
-            => _fallback.LayerNormInPlace(tensor, gamma, beta, epsilon);
+        {
+            ValidateNorm(tensor, gamma, beta, "LayerNormInPlace");
+            if (_launcher == null) { _fallback.LayerNormInPlace(tensor, gamma, beta, epsilon); return; }
+            float[] f = Pack(tensor);
+            float[] g = Pack1D(gamma);
+            float[] bb = Pack1D(beta);
+            using var bx = new VulkanBuffer(_ctx!, (ulong)(f.Length * 4));
+            using var bg = new VulkanBuffer(_ctx!, (ulong)(g.Length * 4));
+            using var bbb = new VulkanBuffer(_ctx!, (ulong)(bb.Length * 4));
+            bx.Upload(f);
+            bg.Upload(g);
+            bbb.Upload(bb);
+            _launcher.DispatchRowwise(VulkanKernel.LayerNormInPlace, new[] { bx, bg, bbb }, (uint)RowCount(tensor), (uint)tensor.Cols, epsilon);
+            bx.Download(f);
+            Unpack(f, tensor);
+        }
 
         public void LayerNormInto(TensorBase input, TensorBase gamma, TensorBase beta, TensorBase result, float epsilon = 1e-5f)
-            => _fallback.LayerNormInto(input, gamma, beta, result, epsilon);
+        {
+            ValidateSame(input, result, "LayerNormInto");
+            ValidateNorm(input, gamma, beta, "LayerNormInto");
+            if (_launcher == null) { _fallback.LayerNormInto(input, gamma, beta, result, epsilon); return; }
+            float[] fa = Pack(input);
+            float[] g = Pack1D(gamma);
+            float[] bb = Pack1D(beta);
+            var fr = new float[fa.Length];
+            using var ba = new VulkanBuffer(_ctx!, (ulong)(fa.Length * 4));
+            using var bg = new VulkanBuffer(_ctx!, (ulong)(g.Length * 4));
+            using var bbb = new VulkanBuffer(_ctx!, (ulong)(bb.Length * 4));
+            using var br = new VulkanBuffer(_ctx!, (ulong)(fr.Length * 4));
+            ba.Upload(fa);
+            bg.Upload(g);
+            bbb.Upload(bb);
+            _launcher.DispatchRowwise(VulkanKernel.LayerNormInto, new[] { ba, bg, bbb, br }, (uint)RowCount(input), (uint)input.Cols, epsilon);
+            br.Download(fr);
+            Unpack(fr, result);
+        }
 
         public void SoftmaxInPlace(TensorBase tensor)
-            => _fallback.SoftmaxInPlace(tensor);
+        {
+            if (_launcher == null) { _fallback.SoftmaxInPlace(tensor); return; }
+            float[] f = Pack(tensor);
+            using var b = new VulkanBuffer(_ctx!, (ulong)(f.Length * 4));
+            b.Upload(f);
+            _launcher.DispatchRowwise(VulkanKernel.SoftmaxInPlace, new[] { b }, (uint)RowCount(tensor), (uint)tensor.Cols);
+            b.Download(f);
+            Unpack(f, tensor);
+        }
 
         public void SoftmaxBackwardInto(TensorBase softmaxOutput, TensorBase outputGradient, TensorBase inputGradient)
-            => _fallback.SoftmaxBackwardInto(softmaxOutput, outputGradient, inputGradient);
+        {
+            ValidateSame(softmaxOutput, outputGradient, "SoftmaxBackwardInto");
+            ValidateSame(softmaxOutput, inputGradient, "SoftmaxBackwardInto");
+            if (_launcher == null) { _fallback.SoftmaxBackwardInto(softmaxOutput, outputGradient, inputGradient); return; }
+            float[] fs = Pack(softmaxOutput);
+            float[] fy = Pack(outputGradient);
+            var fr = new float[fs.Length];
+            using var bs = new VulkanBuffer(_ctx!, (ulong)(fs.Length * 4));
+            using var by = new VulkanBuffer(_ctx!, (ulong)(fy.Length * 4));
+            using var br = new VulkanBuffer(_ctx!, (ulong)(fr.Length * 4));
+            bs.Upload(fs);
+            by.Upload(fy);
+            _launcher.DispatchRowwise(VulkanKernel.SoftmaxBackward, new[] { bs, by, br }, (uint)RowCount(softmaxOutput), (uint)softmaxOutput.Cols);
+            br.Download(fr);
+            Unpack(fr, inputGradient);
+        }
 
         public void MatMul(TensorBase a, TensorBase b, TensorBase result, bool transposeA = false, bool transposeB = false)
             => RunMatMul(a, b, result, transposeA, transposeB, false);
@@ -251,13 +341,69 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             => RunMatMul(a, b, result, transposeA, transposeB, true);
 
         public void ApplyMaskInPlace(TensorBase scores, TensorBase mask)
-            => _fallback.ApplyMaskInPlace(scores, mask);
+        {
+            if (scores.Rank != 2 || mask.Rank != 2 || scores.Rows != mask.Rows || scores.Cols != mask.Cols)
+                throw new ArgumentException("Mask shape mismatch.");
+            if (_launcher == null) { _fallback.ApplyMaskInPlace(scores, mask); return; }
+            float[] fs = Pack(scores);
+            float[] fm = Pack(mask);
+            using var bs = new VulkanBuffer(_ctx!, (ulong)(fs.Length * 4));
+            using var bm = new VulkanBuffer(_ctx!, (ulong)(fm.Length * 4));
+            bs.Upload(fs);
+            bm.Upload(fm);
+            _launcher.DispatchRowwise(VulkanKernel.ApplyMask, new[] { bs, bm }, (uint)fs.Length, 1);
+            bs.Download(fs);
+            Unpack(fs, scores);
+        }
 
         public void TransposeInto(TensorBase source, TensorBase destination)
-            => _fallback.TransposeInto(source, destination);
+        {
+            if (source.Rank != 2 || destination.Rank != 2 ||
+                destination.Rows != source.Cols || destination.Cols != source.Rows)
+                throw new ArgumentException("Transpose shape mismatch.");
+            if (_launcher == null) { _fallback.TransposeInto(source, destination); return; }
+            float[] fs = Pack(source);
+            var fr = new float[fs.Length];
+            using var bs = new VulkanBuffer(_ctx!, (ulong)(fs.Length * 4));
+            using var br = new VulkanBuffer(_ctx!, (ulong)(fr.Length * 4));
+            bs.Upload(fs);
+            _launcher.DispatchTranspose(bs, br, (uint)source.Rows, (uint)source.Cols);
+            br.Download(fr);
+            Unpack(fr, destination);
+        }
 
         public void CopyInto(TensorBase source, TensorBase destination)
-            => _fallback.CopyInto(source, destination);
+        {
+            ValidateSame(source, destination, "CopyInto");
+            if (_launcher == null) { _fallback.CopyInto(source, destination); return; }
+            float[] fs = Pack(source);
+            var fr = new float[fs.Length];
+            using var bs = new VulkanBuffer(_ctx!, (ulong)(fs.Length * 4));
+            using var br = new VulkanBuffer(_ctx!, (ulong)(fr.Length * 4));
+            bs.Upload(fs);
+            _launcher.DispatchRowwise(VulkanKernel.Copy, new[] { bs, br }, (uint)fs.Length, 1);
+            br.Download(fr);
+            Unpack(fr, destination);
+        }
+
+        private static void ValidateSame(TensorBase a, TensorBase b, string op)
+        {
+            if (a.Rank != b.Rank || a.Layers != b.Layers || a.Rows != b.Rows || a.Cols != b.Cols)
+                throw new ArgumentException($"{op}: shape mismatch.");
+        }
+
+        private static void ValidateNorm(TensorBase t, TensorBase gamma, TensorBase beta, string op)
+        {
+            if (gamma.Rank != 1 || beta.Rank != 1 || gamma.Cols != t.Cols || beta.Cols != t.Cols)
+                throw new ArgumentException($"{op}: gamma/beta must be rank-1 length Cols.");
+        }
+
+        private static float[] Pack1D(TensorBase t)
+        {
+            var flat = new float[t.Cols];
+            t.Buffer.AsSpan(t.Offset, t.Cols).CopyTo(flat);
+            return flat;
+        }
 
         public void Synchronize()
         {

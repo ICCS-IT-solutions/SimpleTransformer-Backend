@@ -13,13 +13,31 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         MulInPlace,
         MulInto,
         MatMul,
-        MatMulAccumulate
+        MatMulAccumulate,
+        GeluInPlace,
+        GeluInto,
+        GeluBackward,
+        LayerNormInPlace,
+        LayerNormInto,
+        SoftmaxInPlace,
+        SoftmaxBackward,
+        ApplyMask,
+        Transpose,
+        Copy
     }
 
     internal struct PushConstants
     {
         public uint N;
         public float Alpha;
+    }
+
+    internal struct RowPushConstants
+    {
+        public uint Rows;
+        public uint Cols;
+        public float Epsilon;
+        public uint Flags;
     }
 
     internal struct MatMulPushConstants
@@ -168,6 +186,179 @@ void main() {
         r[ri] = p.accumulate != 0 ? r[ri] + sum : sum;
     }
 }";
+
+        public const string GeluInPlace = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer T { float x[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float _e; uint _f; } p;
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) return;
+    for (uint c = 0u; c < p.cols; c++) {
+        uint i = r * p.cols + c;
+        float v = x[i];
+        float t = tanh(0.7978845608 * (v + 0.044715 * v * v * v));
+        x[i] = 0.5 * v * (1.0 + t);
+    }
+}";
+
+        public const string GeluInto = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer R { float r[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float _e; uint _f; } p;
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= p.rows) return;
+    for (uint c = 0u; c < p.cols; c++) {
+        uint i = row * p.cols + c;
+        float v = a[i];
+        float t = tanh(0.7978845608 * (v + 0.044715 * v * v * v));
+        r[i] = 0.5 * v * (1.0 + t);
+    }
+}";
+
+        public const string GeluBackward = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) buffer DY { float dy[]; };
+layout(set = 0, binding = 2) buffer DX { float dx[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float _e; uint _f; } p;
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= p.rows) return;
+    for (uint c = 0u; c < p.cols; c++) {
+        uint i = row * p.cols + c;
+        float v = x[i];
+        float t = tanh(0.7978845608 * (v + 0.044715 * v * v * v));
+        float dt = 0.7978845608 * (1.0 + 3.0 * 0.044715 * v * v);
+        dx[i] = dy[i] * (0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * dt);
+    }
+}";
+
+        public const string LayerNormInPlace = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer T { float x[]; };
+layout(set = 0, binding = 1) buffer G { float g[]; };
+layout(set = 0, binding = 2) buffer B { float b[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float eps; uint _f; } p;
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) return;
+    uint base_ = r * p.cols;
+    float sum = 0.0;
+    for (uint c = 0u; c < p.cols; c++) sum += x[base_ + c];
+    float mean = sum / float(p.cols);
+    float var_ = 0.0;
+    for (uint c = 0u; c < p.cols; c++) {
+        float d = x[base_ + c] - mean;
+        var_ += d * d;
+    }
+    var_ /= float(p.cols);
+    float inv = inversesqrt(var_ + p.eps);
+    for (uint c = 0u; c < p.cols; c++) {
+        uint i = base_ + c;
+        x[i] = (x[i] - mean) * inv * g[c] + b[c];
+    }
+}";
+
+        public const string LayerNormInto = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer G { float g[]; };
+layout(set = 0, binding = 2) buffer B { float b[]; };
+layout(set = 0, binding = 3) buffer R { float r[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float eps; uint _f; } p;
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= p.rows) return;
+    uint base_ = row * p.cols;
+    float sum = 0.0;
+    for (uint c = 0u; c < p.cols; c++) sum += a[base_ + c];
+    float mean = sum / float(p.cols);
+    float var_ = 0.0;
+    for (uint c = 0u; c < p.cols; c++) {
+        float d = a[base_ + c] - mean;
+        var_ += d * d;
+    }
+    var_ /= float(p.cols);
+    float inv = inversesqrt(var_ + p.eps);
+    for (uint c = 0u; c < p.cols; c++) {
+        uint i = base_ + c;
+        r[i] = (a[i] - mean) * inv * g[c] + b[c];
+    }
+}";
+
+        public const string SoftmaxInPlace = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer T { float x[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float _e; uint _f; } p;
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) return;
+    uint base_ = r * p.cols;
+    float m = x[base_];
+    for (uint c = 1u; c < p.cols; c++) m = max(m, x[base_ + c]);
+    float s = 0.0;
+    for (uint c = 0u; c < p.cols; c++) {
+        float e = exp(x[base_ + c] - m);
+        x[base_ + c] = e;
+        s += e;
+    }
+    for (uint c = 0u; c < p.cols; c++) x[base_ + c] /= s;
+}";
+
+        public const string SoftmaxBackward = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer S { float s[]; };
+layout(set = 0, binding = 1) buffer DY { float dy[]; };
+layout(set = 0, binding = 2) buffer DX { float dx[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float _e; uint _f; } p;
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) return;
+    uint base_ = r * p.cols;
+    float dot = 0.0;
+    for (uint c = 0u; c < p.cols; c++) dot += dy[base_ + c] * s[base_ + c];
+    for (uint c = 0u; c < p.cols; c++) {
+        uint i = base_ + c;
+        dx[i] = s[i] * (dy[i] - dot);
+    }
+}";
+
+        public const string ApplyMask = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer S { float s[]; };
+layout(set = 0, binding = 1) buffer M { float m[]; };
+layout(push_constant) uniform Push { uint n; float _v; uint _a; uint _b; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    if (m[i] == 0.0) s[i] = -1e9;
+}";
+
+        public const string Transpose = @"#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) buffer S { float s[]; };
+layout(set = 0, binding = 1) buffer D { float d[]; };
+layout(push_constant) uniform Push { uint rows; uint cols; float _e; uint _f; } p;
+void main() {
+    uint r = gl_GlobalInvocationID.y;
+    uint c = gl_GlobalInvocationID.x;
+    if (r >= p.rows || c >= p.cols) return;
+    d[c * p.rows + r] = s[r * p.cols + c];
+}";
+
+        public const string Copy = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer S { float s[]; };
+layout(set = 0, binding = 1) buffer D { float d[]; };
+layout(push_constant) uniform Push { uint n; float _v; uint _a; uint _b; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    d[i] = s[i];
+}";
     }
 
     internal sealed unsafe class VulkanKernelLauncher : IDisposable
@@ -190,16 +381,26 @@ void main() {
             Register(VulkanKernel.MulInto, compiler, VulkanShaders.MulInto, 3, 8);
             Register(VulkanKernel.MatMul, compiler, VulkanShaders.MatMul, 3, 32);
             Register(VulkanKernel.MatMulAccumulate, compiler, VulkanShaders.MatMul, 3, 32);
+            Register(VulkanKernel.GeluInPlace, compiler, VulkanShaders.GeluInPlace, 1, 16);
+            Register(VulkanKernel.GeluInto, compiler, VulkanShaders.GeluInto, 2, 16);
+            Register(VulkanKernel.GeluBackward, compiler, VulkanShaders.GeluBackward, 3, 16);
+            Register(VulkanKernel.LayerNormInPlace, compiler, VulkanShaders.LayerNormInPlace, 3, 16);
+            Register(VulkanKernel.LayerNormInto, compiler, VulkanShaders.LayerNormInto, 4, 16);
+            Register(VulkanKernel.SoftmaxInPlace, compiler, VulkanShaders.SoftmaxInPlace, 1, 16);
+            Register(VulkanKernel.SoftmaxBackward, compiler, VulkanShaders.SoftmaxBackward, 3, 16);
+            Register(VulkanKernel.ApplyMask, compiler, VulkanShaders.ApplyMask, 2, 16);
+            Register(VulkanKernel.Transpose, compiler, VulkanShaders.Transpose, 2, 16);
+            Register(VulkanKernel.Copy, compiler, VulkanShaders.Copy, 2, 16);
 
             var poolSize = new DescriptorPoolSize
             {
                 Type = DescriptorType.StorageBuffer,
-                DescriptorCount = 64
+                DescriptorCount = 256
             };
             var poolInfo = new DescriptorPoolCreateInfo
             {
                 SType = StructureType.DescriptorPoolCreateInfo,
-                MaxSets = 32,
+                MaxSets = 64,
                 PoolSizeCount = 1,
                 PPoolSizes = &poolSize
             };
@@ -383,6 +584,69 @@ void main() {
                 uint gx = (n + 15) / 16;
                 uint gy = (m + 15) / 16;
                 vk.CmdDispatch(cmd, gx, gy, batch);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
+            finally
+            {
+                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
+            }
+            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+        }
+
+        public void DispatchRowwise(
+            VulkanKernel kernel,
+            VulkanBuffer[] buffers,
+            uint rows,
+            uint cols,
+            float epsilon = 0f,
+            uint flags = 0)
+        {
+            var vk = _ctx.Vk;
+            var layout = _layouts[kernel];
+            var setLayout = _setLayouts[kernel];
+            var pipeline = _pipelines[kernel];
+
+            DescriptorSet set = AllocateAndBind(buffers, setLayout);
+            CommandBuffer cmd = BeginOneTime();
+            try
+            {
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = epsilon, Flags = flags };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
+                uint groups = (rows + 255) / 256;
+                vk.CmdDispatch(cmd, groups, 1, 1);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
+            finally
+            {
+                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
+            }
+            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+        }
+
+        public void DispatchTranspose(
+            VulkanBuffer src,
+            VulkanBuffer dst,
+            uint rows,
+            uint cols)
+        {
+            var vk = _ctx.Vk;
+            var layout = _layouts[VulkanKernel.Transpose];
+            var setLayout = _setLayouts[VulkanKernel.Transpose];
+            var pipeline = _pipelines[VulkanKernel.Transpose];
+
+            DescriptorSet set = AllocateAndBind(new[] { src, dst }, setLayout);
+            CommandBuffer cmd = BeginOneTime();
+            try
+            {
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = 0f, Flags = 0 };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
+                vk.CmdDispatch(cmd, (cols + 15) / 16, (rows + 15) / 16, 1);
                 vk.EndCommandBuffer(cmd);
                 SubmitAndWait(cmd);
             }
