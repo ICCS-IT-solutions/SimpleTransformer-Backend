@@ -367,8 +367,57 @@ void main() {
         private readonly Dictionary<VulkanKernel, Pipeline> _pipelines = new();
         private readonly Dictionary<VulkanKernel, PipelineLayout> _layouts = new();
         private readonly Dictionary<VulkanKernel, DescriptorSetLayout> _setLayouts = new();
+        private readonly Dictionary<ulong, Dictionary<DescriptorSetCacheKey, DescriptorSet>> _setCache = new();
         private DescriptorPool _pool;
+        private Fence _fence;
+        private CommandBuffer _cmd;
         private bool _disposed;
+
+        /// <summary>Distinct descriptor sets currently held by the cache.</summary>
+        public int CachedDescriptorSetCount
+        {
+            get
+            {
+                int total = 0;
+                foreach (var perLayout in _setCache.Values)
+                    total += perLayout.Count;
+                return total;
+            }
+        }
+
+        /// <summary>Total compute dispatches issued (one per backend op).</summary>
+        public long DispatchCount { get; private set; }
+
+        /// <summary>Times the descriptor pool had to be reset and refilled.</summary>
+        public long DescriptorPoolRecycles { get; private set; }
+
+        private readonly struct DescriptorSetCacheKey : IEquatable<DescriptorSetCacheKey>
+        {
+            private readonly ulong _h0;
+            private readonly ulong _h1;
+            private readonly ulong _h2;
+            private readonly ulong _h3;
+            private readonly int _count;
+
+            public DescriptorSetCacheKey(VulkanBuffer[] buffers)
+            {
+                _count = buffers.Length;
+                _h0 = buffers.Length > 0 ? buffers[0].Handle.Handle : 0;
+                _h1 = buffers.Length > 1 ? buffers[1].Handle.Handle : 0;
+                _h2 = buffers.Length > 2 ? buffers[2].Handle.Handle : 0;
+                _h3 = buffers.Length > 3 ? buffers[3].Handle.Handle : 0;
+            }
+
+            public bool Equals(DescriptorSetCacheKey other)
+                => _count == other._count && _h0 == other._h0 && _h1 == other._h1 &&
+                   _h2 == other._h2 && _h3 == other._h3;
+
+            public override bool Equals(object? obj)
+                => obj is DescriptorSetCacheKey other && Equals(other);
+
+            public override int GetHashCode()
+                => HashCode.Combine(_h0, _h1, _h2, _h3, _count);
+        }
 
         public VulkanKernelLauncher(VulkanContext ctx, VulkanShaderCompiler compiler)
         {
@@ -522,30 +571,24 @@ void main() {
 
         public void Dispatch(VulkanKernel kernel, VulkanBuffer[] buffers, uint n, float alpha)
         {
+            DispatchCount++;
             var vk = _ctx.Vk;
             var layout = _layouts[kernel];
             var setLayout = _setLayouts[kernel];
             var pipeline = _pipelines[kernel];
 
             DescriptorSet set = AllocateAndBind(buffers, setLayout);
-            CommandBuffer cmd = BeginOneTime();
-            try
-            {
-                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-                var push = new PushConstants { N = n, Alpha = alpha };
-                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 8, &push);
-                uint groups = (n + 255) / 256;
-                vk.CmdDispatch(cmd, groups, 1, 1);
-                vk.EndCommandBuffer(cmd);
-                SubmitAndWait(cmd);
-            }
-            finally
-            {
-                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
-            }
-
-            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+            // Phase 4: one persistent command buffer, reset+re-recorded per
+            // dispatch instead of vkAllocate/vkFreeCommandBuffers every op.
+            CommandBuffer cmd = BeginRecording();
+            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+            var push = new PushConstants { N = n, Alpha = alpha };
+            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 8, &push);
+            uint groups = (n + 255) / 256;
+            vk.CmdDispatch(cmd, groups, 1, 1);
+            vk.EndCommandBuffer(cmd);
+            SubmitAndWait(cmd);
         }
 
         public void DispatchMatMul(
@@ -561,37 +604,30 @@ void main() {
             bool transposeB,
             bool accumulate)
         {
+            DispatchCount++;
             var vk = _ctx.Vk;
             var layout = _layouts[kernel];
             var setLayout = _setLayouts[kernel];
             var pipeline = _pipelines[kernel];
 
             DescriptorSet set = AllocateAndBind(new[] { a, b, r }, setLayout);
-            CommandBuffer cmd = BeginOneTime();
-            try
+            CommandBuffer cmd = BeginRecording();
+            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+            var push = new MatMulPushConstants
             {
-                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-                var push = new MatMulPushConstants
-                {
-                    M = m, N = n, K = k, Batch = batch,
-                    TransposeA = transposeA ? 1u : 0u,
-                    TransposeB = transposeB ? 1u : 0u,
-                    Accumulate = accumulate ? 1u : 0u,
-                    Pad = 0
-                };
-                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 32, &push);
-                uint gx = (n + 15) / 16;
-                uint gy = (m + 15) / 16;
-                vk.CmdDispatch(cmd, gx, gy, batch);
-                vk.EndCommandBuffer(cmd);
-                SubmitAndWait(cmd);
-            }
-            finally
-            {
-                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
-            }
-            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+                M = m, N = n, K = k, Batch = batch,
+                TransposeA = transposeA ? 1u : 0u,
+                TransposeB = transposeB ? 1u : 0u,
+                Accumulate = accumulate ? 1u : 0u,
+                Pad = 0
+            };
+            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 32, &push);
+            uint gx = (n + 15) / 16;
+            uint gy = (m + 15) / 16;
+            vk.CmdDispatch(cmd, gx, gy, batch);
+            vk.EndCommandBuffer(cmd);
+            SubmitAndWait(cmd);
         }
 
         public void DispatchRowwise(
@@ -602,29 +638,22 @@ void main() {
             float epsilon = 0f,
             uint flags = 0)
         {
+            DispatchCount++;
             var vk = _ctx.Vk;
             var layout = _layouts[kernel];
             var setLayout = _setLayouts[kernel];
             var pipeline = _pipelines[kernel];
 
             DescriptorSet set = AllocateAndBind(buffers, setLayout);
-            CommandBuffer cmd = BeginOneTime();
-            try
-            {
-                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-                var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = epsilon, Flags = flags };
-                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
-                uint groups = (rows + 255) / 256;
-                vk.CmdDispatch(cmd, groups, 1, 1);
-                vk.EndCommandBuffer(cmd);
-                SubmitAndWait(cmd);
-            }
-            finally
-            {
-                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
-            }
-            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+            CommandBuffer cmd = BeginRecording();
+            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+            var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = epsilon, Flags = flags };
+            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
+            uint groups = (rows + 255) / 256;
+            vk.CmdDispatch(cmd, groups, 1, 1);
+            vk.EndCommandBuffer(cmd);
+            SubmitAndWait(cmd);
         }
 
         public void DispatchTranspose(
@@ -633,33 +662,39 @@ void main() {
             uint rows,
             uint cols)
         {
+            DispatchCount++;
             var vk = _ctx.Vk;
             var layout = _layouts[VulkanKernel.Transpose];
             var setLayout = _setLayouts[VulkanKernel.Transpose];
             var pipeline = _pipelines[VulkanKernel.Transpose];
 
             DescriptorSet set = AllocateAndBind(new[] { src, dst }, setLayout);
-            CommandBuffer cmd = BeginOneTime();
-            try
-            {
-                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-                var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = 0f, Flags = 0 };
-                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
-                vk.CmdDispatch(cmd, (cols + 15) / 16, (rows + 15) / 16, 1);
-                vk.EndCommandBuffer(cmd);
-                SubmitAndWait(cmd);
-            }
-            finally
-            {
-                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
-            }
-            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+            CommandBuffer cmd = BeginRecording();
+            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+            var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = 0f, Flags = 0 };
+            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
+            vk.CmdDispatch(cmd, (cols + 15) / 16, (rows + 15) / 16, 1);
+            vk.EndCommandBuffer(cmd);
+            SubmitAndWait(cmd);
         }
 
         private DescriptorSet AllocateAndBind(VulkanBuffer[] buffers, DescriptorSetLayout setLayout)
         {
             var vk = _ctx.Vk;
+
+            // Fast path: reuse a cached descriptor set when the exact same
+            // buffer handles were bound last time for this layout. Handle
+            // identity implies identical sizes (pool buckets are power-of-two
+            // and buffers are never destroyed), so no re-write is needed -
+            // this is what removes vkUpdateDescriptorSets from the hot path.
+            DescriptorSetCacheKey key = new(buffers);
+            if (_setCache.TryGetValue(setLayout.Handle, out var perLayout) &&
+                perLayout.TryGetValue(key, out DescriptorSet cached))
+            {
+                return cached;
+            }
+
             var allocInfo = new DescriptorSetAllocateInfo
             {
                 SType = StructureType.DescriptorSetAllocateInfo,
@@ -669,8 +704,38 @@ void main() {
             };
             Result r = vk.AllocateDescriptorSets(_ctx.Device, allocInfo, out DescriptorSet set);
             if (r != Result.Success)
-                throw new InvalidOperationException($"alloc set: {r}");
+            {
+                // Pool exhausted (more distinct binding tuples than MaxSets).
+                // Every dispatch waits on its fence, so no set is in flight and
+                // the whole pool can be recycled; the cache must go with it.
+                vk.ResetDescriptorPool(_ctx.Device, _pool, 0);
+                DescriptorPoolRecycles++;
+                _setCache.Clear();
+                r = vk.AllocateDescriptorSets(_ctx.Device, allocInfo, out set);
+                if (r != Result.Success)
+                    throw new InvalidOperationException($"alloc set: {r}");
+                UpdateBindings(set, buffers);
+                _setCache[setLayout.Handle] = new Dictionary<DescriptorSetCacheKey, DescriptorSet>
+                {
+                    [key] = set
+                };
+                return set;
+            }
 
+            UpdateBindings(set, buffers);
+
+            if (!_setCache.TryGetValue(setLayout.Handle, out perLayout))
+            {
+                perLayout = new Dictionary<DescriptorSetCacheKey, DescriptorSet>();
+                _setCache[setLayout.Handle] = perLayout;
+            }
+            perLayout[key] = set;
+            return set;
+        }
+
+        private void UpdateBindings(DescriptorSet set, VulkanBuffer[] buffers)
+        {
+            var vk = _ctx.Vk;
             var infos = new DescriptorBufferInfo[buffers.Length];
             var writes = new WriteDescriptorSet[buffers.Length];
             for (int i = 0; i < buffers.Length; i++)
@@ -699,26 +764,44 @@ void main() {
                     vk.UpdateDescriptorSets(_ctx.Device, (uint)writes.Length, w, 0, null);
                 }
             }
-            return set;
         }
 
-        private CommandBuffer BeginOneTime()
+        /// <summary>
+        /// Phase 4: reuses a single primary command buffer. It is reset and
+        /// re-recorded for every dispatch, so no vkAllocateCommandBuffers /
+        /// vkFreeCommandBuffers traffic per op. Safe because SubmitAndWait
+        /// blocks on the fence, leaving the buffer never pending here.
+        /// </summary>
+        private CommandBuffer BeginRecording()
         {
-            var cmdAlloc = new CommandBufferAllocateInfo
+            var vk = _ctx.Vk;
+            if (_cmd.Handle == 0)
             {
-                SType = StructureType.CommandBufferAllocateInfo,
-                CommandPool = _ctx.CommandPool,
-                Level = CommandBufferLevel.Primary,
-                CommandBufferCount = 1
-            };
-            _ctx.Vk.AllocateCommandBuffers(_ctx.Device, cmdAlloc, out CommandBuffer cmd);
+                var cmdAlloc = new CommandBufferAllocateInfo
+                {
+                    SType = StructureType.CommandBufferAllocateInfo,
+                    CommandPool = _ctx.CommandPool,
+                    Level = CommandBufferLevel.Primary,
+                    CommandBufferCount = 1
+                };
+                Result r = vk.AllocateCommandBuffers(_ctx.Device, cmdAlloc, out _cmd);
+                if (r != Result.Success)
+                    throw new InvalidOperationException($"alloc cmd: {r}");
+            }
+            else
+            {
+                vk.ResetCommandBuffer(_cmd, CommandBufferResetFlags.None);
+            }
+
             var begin = new CommandBufferBeginInfo
             {
                 SType = StructureType.CommandBufferBeginInfo,
                 Flags = CommandBufferUsageFlags.OneTimeSubmitBit
             };
-            _ctx.Vk.BeginCommandBuffer(cmd, begin);
-            return cmd;
+            Result rb = vk.BeginCommandBuffer(_cmd, begin);
+            if (rb != Result.Success)
+                throw new InvalidOperationException($"begin cmd: {rb}");
+            return _cmd;
         }
 
         private void SubmitAndWait(CommandBuffer cmd)
@@ -730,18 +813,17 @@ void main() {
                 CommandBufferCount = 1,
                 PCommandBuffers = &cmd
             };
-            var fenceInfo = new FenceCreateInfo { SType = StructureType.FenceCreateInfo };
-            vk.CreateFence(_ctx.Device, fenceInfo, null, out Fence fence);
-            try
+            if (_fence.Handle == 0)
             {
-                vk.QueueSubmit(_ctx.Queue, 1, submit, fence);
-                vk.WaitForFences(_ctx.Device, 1, fence, true, 10_000_000_000);
-                vk.ResetFences(_ctx.Device, 1, fence);
+                var fenceInfo = new FenceCreateInfo { SType = StructureType.FenceCreateInfo };
+                vk.CreateFence(_ctx.Device, fenceInfo, null, out _fence);
             }
-            finally
+            else
             {
-                vk.DestroyFence(_ctx.Device, fence, null);
+                vk.ResetFences(_ctx.Device, 1, _fence);
             }
+            vk.QueueSubmit(_ctx.Queue, 1, submit, _fence);
+            vk.WaitForFences(_ctx.Device, 1, _fence, true, 10_000_000_000);
         }
 
         public void Dispose()
@@ -749,6 +831,16 @@ void main() {
             if (_disposed)
                 return;
             _disposed = true;
+            if (_cmd.Handle != 0)
+            {
+                _ctx.Vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, _cmd);
+                _cmd = default;
+            }
+            if (_fence.Handle != 0)
+            {
+                _ctx.Vk.DestroyFence(_ctx.Device, _fence, null);
+                _fence = default;
+            }
             foreach (var p in _pipelines.Values)
                 _ctx.Vk.DestroyPipeline(_ctx.Device, p, null);
             foreach (var l in _layouts.Values)

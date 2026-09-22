@@ -29,6 +29,21 @@ namespace SimpleTransformer
                 Environment.Exit(ok ? 0 : 1);
             }
 
+            // Vulkan Phase 4 latency + allocation harness: dotnet run -c Release -- --vulkan-bench
+            if (args.Contains("--vulkan-bench"))
+            {
+                bool ok = SimpleTransformer.AccelerationEngine.GpuVulkan.VulkanBenchmark.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // Vulkan heap/memory-type diagnostic: dotnet run -c Release -- --vulkan-meminfo
+            if (args.Contains("--vulkan-meminfo"))
+            {
+                using var probe = new SimpleTransformer.AccelerationEngine.GpuVulkan.GpuVulkanBackend();
+                probe.LogMemoryInfo();
+                Environment.Exit(0);
+            }
+
             Log.Logger = new LoggerConfiguration()
                 .MinimumLevel.Information()
                 .WriteTo.Console()
