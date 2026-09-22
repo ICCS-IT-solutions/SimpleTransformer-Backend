@@ -22,7 +22,7 @@ namespace SimpleTransformer.Model
 
             if (input.Rank == 2)
             {
-                TensorMathSimd.GeluInto(input, output);
+                workspace.Backend.GeluInto(input, output);
             }
             else
             {
@@ -31,7 +31,7 @@ namespace SimpleTransformer.Model
                 {
                     TensorBase inputSlice = TensorUtilitiesSimd.GetLayer(input, layer);
                     TensorBase outputSlice = TensorUtilitiesSimd.GetLayer(output, layer);
-                    TensorMathSimd.GeluInto(inputSlice, outputSlice);
+                    workspace.Backend.GeluInto(inputSlice, outputSlice);
                 });
             }
 
@@ -51,7 +51,7 @@ namespace SimpleTransformer.Model
 
             if (gradient.Rank == 2)
             {
-                TensorMathSimd.GeluBackwardInto(_lastInput, gradient, inputGradient);
+                workspace.Backend.GeluBackwardInto(_lastInput, gradient, inputGradient);
             }
             else
             {
@@ -62,7 +62,7 @@ namespace SimpleTransformer.Model
                     TensorBase gradSlice = TensorUtilitiesSimd.GetLayer(gradient, layer);
                     TensorBase outGradSlice = TensorUtilitiesSimd.GetLayer(inputGradient, layer);
 
-                    TensorMathSimd.GeluBackwardInto(inputSlice, gradSlice, outGradSlice);
+                    workspace.Backend.GeluBackwardInto(inputSlice, gradSlice, outGradSlice);
                 });
             }
 

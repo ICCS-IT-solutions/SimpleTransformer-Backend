@@ -182,8 +182,8 @@ namespace SimpleTransformer.Model
 
                 TensorBase dInputHead = _heads[i].Backward(headGradient, workspace);
 
-                // Accumulate gradients into target Input Gradient using SIMD
-                TensorMathSimd.ElementWiseAddInPlace(targetInputGradient, dInputHead);
+                // Accumulate gradients into target Input Gradient through the backend
+                workspace.Backend.ElementWiseAddInPlace(targetInputGradient, dInputHead);
 
                 // Release local workspace buffers
                 workspace.Release(headGradient);

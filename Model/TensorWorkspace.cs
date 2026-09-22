@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using SimpleTransformer.AccelerationEngine;
 
 namespace SimpleTransformer.Model
 {
@@ -11,9 +12,28 @@ namespace SimpleTransformer.Model
         private readonly ConcurrentBag<TensorBase> _activeTensors = new();
         private bool _isDisposed;
 
-        public TensorWorkspace() { }
+        /// <summary>
+        /// The acceleration backend used for tensor math performed against tensors
+        /// borrowed from this workspace. Defaults to the process-wide auto-selected
+        /// backend (see <see cref="BackendSelector.SelectDefault"/>) when not provided.
+        /// </summary>
+        public IAccelerationBackend Backend { get; }
+
+        public TensorWorkspace()
+            : this(BackendSelector.SelectDefault())
+        {
+        }
+
+        /// <summary>
+        /// Creates a workspace that executes tensor math through the given backend.
+        /// </summary>
+        public TensorWorkspace(IAccelerationBackend? backend)
+        {
+            Backend = backend ?? BackendSelector.SelectDefault();
+        }
 
         public TensorWorkspace(int capacityHint)
+            : this(BackendSelector.SelectDefault())
         {
             _pool = new ConcurrentDictionary<TensorShapeKey, ConcurrentBag<TensorBase>>(
                 Environment.ProcessorCount, capacityHint);

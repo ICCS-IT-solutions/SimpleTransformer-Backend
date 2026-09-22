@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using Serilog;
+using SimpleTransformer.AccelerationEngine;
 using SimpleTransformer.Api.Endpoints.Services;
 using SimpleTransformer.Model.Extensions;
 using SimpleTransformer.Model.Extensions.Numerics;
@@ -16,11 +17,18 @@ namespace SimpleTransformer.Model
         private EmbeddingLayer _embedding = null!;
         private ILinearLayer _outputProjection = null!;
         private PositionalEncodingLayer _position = null!;
-        private TensorWorkspace _workspace = null!; 
+        private TensorWorkspace _workspace = null!;
+        //The acceleration backend that drives all tensor math for this model instance
+        //(SIMD, pure managed reference, or GPU backends plugged into IAccelerationBackend).
+        private IAccelerationBackend _backend = null!;
         //Set this to true whenever training is underway. It can be defaulted to false if necessary.
         private bool _isTraining;
         public bool IsTraining => _isTraining;
         public bool CanInfer => !_isTraining;
+        /// <summary>
+        /// The acceleration backend currently driving this model's training and prediction math.
+        /// </summary>
+        public IAccelerationBackend Backend => _workspace.Backend;
         public IEnumerable<TrainableParameter> Parameters
         {
             get
@@ -90,11 +98,14 @@ namespace SimpleTransformer.Model
         private readonly List<ILayer> _layers = new();
         public TransformerConfig Config { get; }
         public TrainingConfig TrainingConfig { get; }
-        public TransformerModel(Guid modelId, TransformerConfig? config = null, TrainingConfig? trainingConfig = null, bool useQLora = true)
+        public TransformerModel(Guid modelId, TransformerConfig? config = null, TrainingConfig? trainingConfig = null, bool useQLora = true, BackendSelector.BackendType backendType = BackendSelector.BackendType.Auto)
         {
             TransformerModelId = modelId;
             Config = config ?? DefaultConfig;
             TrainingConfig = trainingConfig ?? new TrainingConfig();
+            //Select the acceleration backend (Auto probes hardware; defaults to CpuSimd/CpuReference).
+            _backend = BackendSelector.SelectBackend(backendType);
+            Log.Information("Acceleration backend selected: {BackendName}.", _backend.Name);
             //Second pass configuration validation to ensure nothing accidentally slips through first-pass validation in the config class.
             ValidateConfig();
             Log.Information("Configuration is valid. Proceeding...");
@@ -176,11 +187,12 @@ namespace SimpleTransformer.Model
             // 1. Run forward pass
             var (logits, hiddenState) = Forward(input);
 
-            // 2. Softmax logits to get probabilities
-            var probabilities = TensorUtilitiesSimd.SoftmaxRows((Tensor)logits);
+            // 2. Softmax logits to get probabilities (routed through the acceleration backend)
+            TensorBase probabilities = logits.Clone();
+            _workspace.Backend.SoftmaxInPlace(probabilities);
 
             // 3. Get predicted token IDs for all positions
-            int[] allTokenIds = TokenizationUtilities.ToTokenIds(probabilities);
+            int[] allTokenIds = TokenizationUtilities.ToTokenIds((Tensor)probabilities);
 
             // 4. The actual NEXT token is the ArgMax of the LAST row
             int nextTokenId = allTokenIds[allTokenIds.Length - 1];
@@ -656,7 +668,7 @@ namespace SimpleTransformer.Model
             _outputProjection = useQLora 
             ? new QLoraLinearLayer(Config.EmbeddingSize, Config.VocabSize, useBias: false, name: "lm_head")
             : new LinearLayer(Config.EmbeddingSize, Config.VocabSize, useBias: false, name: "lm_head");
-            _workspace = new TensorWorkspace();
+            _workspace = new TensorWorkspace(_backend);
 
             _loss = new CrossEntropyLoss();
             _optimizer = TrainingConfig.Optimizer switch

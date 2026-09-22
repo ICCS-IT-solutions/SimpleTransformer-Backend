@@ -33,8 +33,10 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             float[] scoresBuffer = scores.Buffer; int scoresOffset = scores.Offset;
             float[] maskBuffer = mask.Buffer; int maskOffset = mask.Offset;
 
-            // Use float.NegativeInfinity for strict masking
-            var vMaskValue = new Vector<float>(float.NegativeInfinity);
+            // Use -1e9f for masking (matches MaskUtilities and the IAccelerationBackend
+            // contract; softmax(exp(-1e9 - max)) underflows to exactly 0 either way,
+            // but finite sentinels keep downstream logits finite for diagnostics).
+            var vMaskValue = new Vector<float>(-1e9f);
 
             Parallel.For(0, rows, r =>
             {
@@ -63,7 +65,7 @@ namespace SimpleTransformer.Model.Extensions.Numerics
                 {
                     if (Unsafe.Add(ref pMaskRow, c) == 0f)
                     {
-                        Unsafe.Add(ref pScoresRow, c) = float.NegativeInfinity;
+                        Unsafe.Add(ref pScoresRow, c) = -1e9f;
                     }
                 }
             });

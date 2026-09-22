@@ -118,7 +118,7 @@ namespace SimpleTransformer.Model
             float limit = MathF.Sqrt(6.0f / (_inputSize + _rank));
             Random random = new Random();
             TensorUtilitiesSimd.FillRandom(_loraA, random, -limit, limit);
-            TensorUtilitiesSimd.Fill(_loraB, 0.0f);
+            Array.Fill(_loraB.Data, 0.0f);
 
             if (_useBias)
             {
@@ -156,14 +156,14 @@ namespace SimpleTransformer.Model
             DequantizeBaseWeights(dequantW);
 
             // Step 2: Frozen Base Pass -> Output = Input * W0^T
-            TensorMathSimd.MatrixMultiplyRightTransposedInto(input, dequantW, output);
+            workspace.Backend.MatMul(input, dequantW, output, transposeB: true);
 
             // Step 3: LoRA Branch -> loraAOut = Input * A^T
-            TensorMathSimd.MatrixMultiplyRightTransposedInto(input, _loraA, loraAOut);
+            workspace.Backend.MatMul(input, _loraA, loraAOut, transposeB: true);
 
             // Temp buffer for B^T multiplication: loraBOut = loraAOut * B^T
             TensorBase loraBOut = workspace.Borrow(rows, _outputSize, shape => new Tensor(shape[0], shape[1]));
-            TensorMathSimd.MatrixMultiplyRightTransposedInto(loraAOut, _loraB, loraBOut);
+            workspace.Backend.MatMul(loraAOut, _loraB, loraBOut, transposeB: true);
 
             // Step 4: Scale and accumulate LoRA branch output into base output
             ScaleAndAccumulate(loraBOut, output, _loraScale);
@@ -200,14 +200,14 @@ namespace SimpleTransformer.Model
                 TensorBase loraAOutSlice = TensorUtilitiesSimd.GetLayer(loraAOut, b);
 
                 // Base pass
-                TensorMathSimd.MatrixMultiplyRightTransposedInto(inputSlice, dequantW, outputSlice);
+                workspace.Backend.MatMul(inputSlice, dequantW, outputSlice, transposeB: true);
 
                 // LoRA pass
-                TensorMathSimd.MatrixMultiplyRightTransposedInto(inputSlice, _loraA, loraAOutSlice);
+                workspace.Backend.MatMul(inputSlice, _loraA, loraAOutSlice, transposeB: true);
 
                 // Slice scratch buffer for LoRA B product
                 Tensor loraBOutSlice = new Tensor(rows, _outputSize);
-                TensorMathSimd.MatrixMultiplyRightTransposedInto(loraAOutSlice, _loraB, loraBOutSlice);
+                workspace.Backend.MatMul(loraAOutSlice, _loraB, loraBOutSlice, transposeB: true);
 
                 ScaleAndAccumulate(loraBOutSlice, outputSlice, _loraScale);
 
@@ -251,24 +251,23 @@ namespace SimpleTransformer.Model
 
             // 1. BASE PATH: dX_base = Gradient * W0
             DequantizeBaseWeights(dequantW);
-            TensorMathSimd.MatrixMultiplyInto(gradient, dequantW, inputGradient);
-
+            workspace.Backend.MatMul(gradient, dequantW, inputGradient);
             // 2. LORA ADAPTER GRADIENTS:
             // dB += scale * (Gradient^T * loraAOut)
             TensorBase dBAccumulator = workspace.Borrow(_outputSize, _rank, shape => new Tensor(shape[0], shape[1]));
-            TensorMathSimd.MatrixMultiplyLeftTransposedInto(gradient, loraAOut, dBAccumulator);
+            workspace.Backend.MatMul(gradient, loraAOut, dBAccumulator, transposeA: true);
             ScaleAndAccumulate(dBAccumulator, _loraBGradient, _loraScale);
 
             // dLoraAOut = Gradient * B
-            TensorMathSimd.MatrixMultiplyInto(gradient, _loraB, dLoraAOut);
+            workspace.Backend.MatMul(gradient, _loraB, dLoraAOut);
 
             // dA += scale * (dLoraAOut^T * Input)
             TensorBase dAAccumulator = workspace.Borrow(_rank, _inputSize, shape => new Tensor(shape[0], shape[1]));
-            TensorMathSimd.MatrixMultiplyLeftTransposedInto(dLoraAOut, input, dAAccumulator);
+            workspace.Backend.MatMul(dLoraAOut, input, dAAccumulator, transposeA: true);
             ScaleAndAccumulate(dAAccumulator, _loraAGradient, _loraScale);
 
             // dX_adapter = scale * (dLoraAOut * A)
-            TensorMathSimd.MatrixMultiplyInto(dLoraAOut, _loraA, dInputAdapter);
+            workspace.Backend.MatMul(dLoraAOut, _loraA, dInputAdapter);
 
             // Total Input Gradient: dX = dX_base + scale * dX_adapter
             ScaleAndAccumulate(dInputAdapter, inputGradient, _loraScale);
@@ -297,13 +296,13 @@ namespace SimpleTransformer.Model
             DequantizeBaseWeights(dequantW);
 
             // Reset thread-local gradient buffers
-            foreach (var localDA in _threadLocalDA.Values) TensorUtilitiesSimd.Fill(localDA, 0f);
-            foreach (var localDB in _threadLocalDB.Values) TensorUtilitiesSimd.Fill(localDB, 0f);
+            foreach (var localDA in _threadLocalDA.Values) workspace.Backend.Fill(localDA, 0f);
+            foreach (var localDB in _threadLocalDB.Values) workspace.Backend.Fill(localDB, 0f);
             if (_useBias)
             {
                 foreach (var localDBias in _threadLocalDBias.Values)
                 {
-                    if (localDBias != null) TensorUtilitiesSimd.Fill(localDBias, 0f);
+                    if (localDBias != null) workspace.Backend.Fill(localDBias, 0f);
                 }
             }
 
@@ -318,21 +317,21 @@ namespace SimpleTransformer.Model
                 Tensor localDB = _threadLocalDB.Value!;
 
                 // 1. Base Gradient: dX_base = Gradient * W0
-                TensorMathSimd.MatrixMultiplyInto(gradSlice, dequantW, dInputSlice);
+                workspace.Backend.MatMul(gradSlice, dequantW, dInputSlice);
 
                 // 2. LoRA B Gradient: localDB += Grad^T * loraAOut
-                TensorMathSimd.MatrixMultiplyLeftTransposedAccumulateInto(gradSlice, loraAOutSlice, localDB);
+                workspace.Backend.MatMulAccumulate(gradSlice, loraAOutSlice, localDB, transposeA: true);
 
                 // 3. dLoraAOut = Grad * B
                 Tensor dLoraAOutSlice = new Tensor(rows, _rank);
-                TensorMathSimd.MatrixMultiplyInto(gradSlice, _loraB, dLoraAOutSlice);
+                workspace.Backend.MatMul(gradSlice, _loraB, dLoraAOutSlice);
 
                 // 4. LoRA A Gradient: localDA += dLoraAOut^T * Input
-                TensorMathSimd.MatrixMultiplyLeftTransposedAccumulateInto(dLoraAOutSlice, inputSlice, localDA);
+                workspace.Backend.MatMulAccumulate(dLoraAOutSlice, inputSlice, localDA, transposeA: true);
 
                 // 5. Adapter Input Gradient: dX_adapter = dLoraAOut * A
                 Tensor dInputAdapterSlice = new Tensor(rows, _inputSize);
-                TensorMathSimd.MatrixMultiplyInto(dLoraAOutSlice, _loraA, dInputAdapterSlice);
+                workspace.Backend.MatMul(dLoraAOutSlice, _loraA, dInputAdapterSlice);
 
                 // Accumulate adapter contribution into dInput
                 ScaleAndAccumulate(dInputAdapterSlice, dInputSlice, _loraScale);
@@ -357,7 +356,7 @@ namespace SimpleTransformer.Model
                 foreach (var localDBias in _threadLocalDBias.Values)
                 {
                     if (localDBias != null)
-                        TensorMathSimd.ElementWiseAddInPlace(_biasGradient!, localDBias);
+                        workspace.Backend.ElementWiseAddInPlace(_biasGradient!, localDBias);
                 }
             }
 
@@ -368,11 +367,11 @@ namespace SimpleTransformer.Model
 
         public void ZeroGradients()
         {
-            TensorUtilitiesSimd.Fill(_loraAGradient, 0f);
-            TensorUtilitiesSimd.Fill(_loraBGradient, 0f);
+            Array.Fill(_loraAGradient.Data, 0f);
+            Array.Fill(_loraBGradient.Data, 0f);
             if (_useBias)
             {
-                TensorUtilitiesSimd.Fill(_biasGradient!, 0f);
+                Array.Fill(_biasGradient!.Data, 0f);
             }
         }
 
@@ -417,7 +416,12 @@ namespace SimpleTransformer.Model
             {
                 int rowOffset = target.Offset + (r * target.Stride);
                 Span<float> rowSpan = targetSpan.Slice(rowOffset, cols);
-                TensorMathSimd.AddSpanInPlace(rowSpan, biasSpan);
+
+                // Pure managed broadcast add (bias-sized rows are memory-bound)
+                for (int j = 0; j < cols; j++)
+                {
+                    rowSpan[j] += biasSpan[j];
+                }
             }
         }
 
@@ -432,7 +436,12 @@ namespace SimpleTransformer.Model
             {
                 int rowOffset = gradient.Offset + (r * gradient.Stride);
                 ReadOnlySpan<float> rowSpan = gradData.Slice(rowOffset, cols);
-                TensorMathSimd.AddSpanInPlace(biasGradSpan, rowSpan);
+
+                // Pure managed row-sum accumulation
+                for (int j = 0; j < cols; j++)
+                {
+                    biasGradSpan[j] += rowSpan[j];
+                }
             }
         }
 

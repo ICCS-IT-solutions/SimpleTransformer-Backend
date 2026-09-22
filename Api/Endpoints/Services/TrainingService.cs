@@ -100,70 +100,6 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             //Register the job.
             await RegisterJob(job);
-           /* 
-            //Move this to the StartTrainingJob method.
-            int startEpoch = 0;
-            var control = _jobManager.GetOrCreate(job.EntryId);
-
-            // 1. Resume from checkpoint using TransformerModel's load logic
-            if (!string.IsNullOrWhiteSpace(req.PreviousCheckpoint) && File.Exists(req.PreviousCheckpoint))
-            {
-                await UpdateJob(job.EntryId, job =>
-                {
-                    job.Message = "Loading previous checkpoint...";
-                });
-
-                Log.Information("Loading training state from checkpoint: {Path}", req.PreviousCheckpoint);
-                
-                await using var stream = File.OpenRead(req.PreviousCheckpoint);
-                var (savedEpoch, savedLoss) = TransformerModel.LoadCheckpoint(stream, model);
-                
-                startEpoch = savedEpoch + 1; // Resume on the next epoch
-
-                await UpdateJob(job.EntryId, job =>
-                {
-                    job.Message = $"Resuming training from epoch {startEpoch}.";
-                    job.CurrentEpoch = startEpoch;
-                    job.CurrentLoss = savedLoss;
-                });
-                Log.Information("Resuming training from Epoch {Epoch} (Last Loss: {Loss:F6})", startEpoch + 1, savedLoss);
-            }
-
-            TrainingConfig config;
-
-            try
-            {
-                config = db.TrainingConfigs.FirstOrDefault(x => x.EntryId == modelEntry.TrainingConfigId)?.Config ?? throw new InvalidOperationException("Training config not found.");
-            }
-            catch (Exception ex)
-            {
-                return new ApiResponse<TrainingResponse>
-                {
-                    Message = $"Invalid training config: {ex.Message}",
-                    Status = ResponseStatus.Failure,
-                    StatusCode = 400
-                };
-            }
-
-            await TrainingJobExtensions.RunTrainingLoop(
-                inputText: req.InputText, 
-                model: model,
-                job: job,
-                startEpoch: startEpoch,
-                config: config,
-                control: control,
-                modelEntry: modelEntry,
-                dbFactory: _dbFactory,
-                tokenizer: _tokenizer,
-                jobManager: _jobManager
-            );
-            return new ApiResponse<TrainingResponse>
-            {
-                Message = "Model trained successfully",
-                Status = ResponseStatus.Success,
-                StatusCode = 200,
-            };
-            */
 
             return new ApiResponse<TrainingResponse>
             {
@@ -178,25 +114,106 @@ namespace SimpleTransformer.Api.Endpoints.Services
             };
         }
 
-        public async Task<ApiResponse<TrainingResponse>> CreateJobFromFile(TrainingFileRequest req)
+        public async Task<ApiResponse<TrainingResponse>> CreateJobFromFile(
+            TrainingFileRequest req)
         {
-            using var reader = new StreamReader(req.TextFile.OpenReadStream());
-
-            string fileText = await reader.ReadToEndAsync();
-
-            // Map to TrainingRequest
-            var request = new TrainingRequest
+            if (req.TextFile == null || req.TextFile.Length == 0)
             {
-                InputText = fileText,
-                TransformerModelId = req.TransformerModelId,
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "Training file must not be empty.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            await using var db = await _dbFactory.CreateDbContextAsync();
+
+            var modelEntry = await db.TransformerModels
+                .FirstOrDefaultAsync(x => x.EntryId == req.TransformerModelId);
+
+            if (modelEntry == null)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "Model not found.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 404
+                };
+            }
+
+            if (!modelEntry.IsLoaded)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "Model not loaded.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            var model = await _modelManager.LoadModelAsync(modelEntry.EntryId);
+
+            if (model == null)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "Model not found.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 404
+                };
+            }
+
+            var jobId = Guid.NewGuid();
+
+            var extension = Path.GetExtension(req.TextFile.FileName);
+            var fileName = $"training-data{extension}";
+
+            var jobDirectory = Path.Combine(
+                "training-data",
+                jobId.ToString());
+
+            Directory.CreateDirectory(jobDirectory);
+
+            var filePath = Path.Combine(
+                jobDirectory,
+                fileName);
+
+            await using (var fileStream = File.Create(filePath))
+            {
+                await req.TextFile.CopyToAsync(fileStream);
+            }
+
+            var job = new TrainingJobEntry
+            {
+                EntryId = jobId,
+                Name = $"Training job {DateTime.UtcNow}",
+                Status = TrainingJobStatus.Pending,
+
+                TransformerConfigId = modelEntry.TransformerConfigId,
+                TrainingConfigId = modelEntry.TrainingConfigId,
                 VocabularyId = req.VocabularyId,
 
-                PreviousCheckpoint = req.PreviousCheckpoint,
-                PreviousCheckpointId = req.PreviousCheckpointId
+                InputText = null,
+                InputFilePath = filePath,
 
+                PreviousCheckpointId = req.PreviousCheckpointId,
+
+                Message = "Training job created.",
+                DateUpdated = DateTime.UtcNow
             };
 
-            return await CreateJob(request);
+            await db.TrainingJobs.AddAsync(job);
+            await db.SaveChangesAsync();
+
+            var control = _jobManager.GetOrCreate(job.EntryId);
+
+            return new ApiResponse<TrainingResponse>
+            {
+                Message = "Training job created successfully.",
+                Status = ResponseStatus.Success,
+                StatusCode = 200
+            };
         }
 
         public async Task<ApiResponse<TrainingProgressResponse>> PauseTrainingJob(Guid jobId)
@@ -354,38 +371,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
         public async Task<ApiResponse<TrainingProgressResponse>> StartTrainingJob(Guid jobId)
         {
             await using var db = await _dbFactory.CreateDbContextAsync();
-            var job = db.TrainingJobs.FirstOrDefault(x => x.EntryId == jobId);
+
+            var job = await db.TrainingJobs
+                .FirstOrDefaultAsync(x => x.EntryId == jobId);
 
             if (job == null)
-            return new ApiResponse<TrainingProgressResponse>
-            {
-                Message = "Training job not found.",
-                Status = ResponseStatus.Failure,
-                StatusCode = 404
-            };
-
-            //Reconstruct the request using the training job entry from the db
-            var jobEntry = await db.TrainingJobs.FirstOrDefaultAsync(x => x.EntryId == jobId);
-            var modelEntry = await db.TransformerModels.FirstOrDefaultAsync(x => x.TransformerConfigId == job.TransformerConfigId);
-            if (modelEntry == null)
-            return new ApiResponse<TrainingProgressResponse>
-            {
-                Message = "Model definition not found.",
-                Status = ResponseStatus.Failure,
-                StatusCode = 404
-            };
-
-            var model = await _modelManager.LoadModelAsync(modelEntry.EntryId);
-
-            if (model == null)
-            return new ApiResponse<TrainingProgressResponse>
-            {
-                Message = "Could not load model.",
-                Status = ResponseStatus.Failure,
-                StatusCode = 404
-            };
-
-            if(string.IsNullOrEmpty(job.InputText))
             {
                 return new ApiResponse<TrainingProgressResponse>
                 {
@@ -393,65 +383,172 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     Status = ResponseStatus.Failure,
                     StatusCode = 404
                 };
-            } 
-
-            //Reconstruct the request.   
-            var req = new TrainingRequest
-            {
-                InputText = job.InputText,
-                TransformerModelId = modelEntry.EntryId,
-                VocabularyId = job.VocabularyId,
-                PreviousCheckpointId = job.PreviousCheckpointId
-            };
-
-            //Move this to the StartTrainingJob method.
-            int startEpoch = 0;
-            var control = _jobManager.GetOrCreate(job.EntryId);
-
-            // 1. Resume from checkpoint using TransformerModel's load logic
-            if (!string.IsNullOrWhiteSpace(req.PreviousCheckpoint) && File.Exists(req.PreviousCheckpoint))
-            {
-                await UpdateJob(job.EntryId, job =>
-                {
-                    job.Message = "Loading previous checkpoint...";
-                });
-
-                Log.Information("Loading training state from checkpoint: {Path}", req.PreviousCheckpoint);
-                
-                await using var stream = File.OpenRead(req.PreviousCheckpoint);
-                var (savedEpoch, savedLoss) = TransformerModel.LoadCheckpoint(stream, model);
-                
-                startEpoch = savedEpoch + 1; // Resume on the next epoch
-
-                await UpdateJob(job.EntryId, job =>
-                {
-                    job.Message = $"Resuming training from epoch {startEpoch}.";
-                    job.CurrentEpoch = startEpoch;
-                    job.CurrentLoss = savedLoss;
-                });
-                Log.Information("Resuming training from Epoch {Epoch} (Last Loss: {Loss:F6})", startEpoch + 1, savedLoss);
             }
 
-            TrainingConfig config;
-
-            try
-            {
-                config = db.TrainingConfigs.FirstOrDefault(x => x.EntryId == modelEntry.TrainingConfigId)?.Config ?? throw new InvalidOperationException("Training config not found.");
-            }
-            catch (Exception ex)
+            // Don't start a job that is already running.
+            if (job.Status == TrainingJobStatus.Running ||
+                job.Status == TrainingJobStatus.Started)
             {
                 return new ApiResponse<TrainingProgressResponse>
                 {
-                    Message = $"Invalid training config: {ex.Message}",
+                    Message = "Training job is already running.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
+            // A model must be associated with the job.
+            var modelEntry = await db.TransformerModels
+                .FirstOrDefaultAsync(x =>
+                    x.TransformerConfigId == job.TransformerConfigId);
+
+            if (modelEntry == null)
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Model definition not found.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 404
+                };
+            }
+
+            if (!modelEntry.IsLoaded)
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Model is not loaded.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
+            var model = await _modelManager.LoadModelAsync(modelEntry.EntryId);
+
+            if (model == null)
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Could not load model.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 404
+                };
+            }
+
+            // Validate the training source.
+            if (string.IsNullOrWhiteSpace(job.InputText) &&
+                string.IsNullOrWhiteSpace(job.InputFilePath))
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training job has no training source.",
                     Status = ResponseStatus.Failure,
                     StatusCode = 400
                 };
             }
 
+            if (!string.IsNullOrWhiteSpace(job.InputFilePath) &&
+                !File.Exists(job.InputFilePath))
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training source file could not be found.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 404
+                };
+            }
+
+            // Load the training configuration.
+            var configEntry = await db.TrainingConfigs
+                .FirstOrDefaultAsync(x => x.EntryId == job.TrainingConfigId);
+
+            if (configEntry == null)
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training config not found.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            var config = configEntry.Config;
+
+            int startEpoch = 0;
+
+            var control = _jobManager.GetOrCreate(job.EntryId);
+
+            // Resume from the job's previous checkpoint.
+            if (job.PreviousCheckpointId.HasValue)
+            {
+                var checkpoint = await db.TrainingCheckpoints
+                    .FirstOrDefaultAsync(x =>
+                        x.EntryId == job.PreviousCheckpointId.Value);
+
+                if (checkpoint == null)
+                {
+                    return new ApiResponse<TrainingProgressResponse>
+                    {
+                        Message = "Previous training checkpoint not found.",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 404
+                    };
+                }
+
+                if (!File.Exists(
+                        Path.Combine(checkpoint.Filepath, checkpoint.Filename)))
+                {
+                    return new ApiResponse<TrainingProgressResponse>
+                    {
+                        Message = "Previous training checkpoint file could not be found.",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 404
+                    };
+                }
+
+                var checkpointPath =
+                    Path.Combine(checkpoint.Filepath, checkpoint.Filename);
+
+                await UpdateJob(job.EntryId, job =>
+                {
+                    job.Message = "Loading previous checkpoint...";
+                    job.PreviousCheckpointId = checkpoint.EntryId;
+                });
+
+                Log.Information(
+                    "Loading training state from checkpoint: {Path}",
+                    checkpointPath);
+
+                await using var stream = File.OpenRead(checkpointPath);
+
+                var (savedEpoch, savedLoss) =
+                    TransformerModel.LoadCheckpoint(stream, model);
+
+                startEpoch = savedEpoch + 1;
+
+                await UpdateJob(job.EntryId, job =>
+                {
+                    job.Message =
+                        $"Resuming training from epoch {startEpoch}.";
+                    job.CurrentEpoch = startEpoch;
+                    job.CurrentLoss = savedLoss;
+                });
+
+                Log.Information(
+                    "Resuming training from Epoch {Epoch} (Last Loss: {Loss:F6})",
+                    startEpoch,
+                    savedLoss);
+            }
+
+            await UpdateJob(job.EntryId, job =>
+            {
+                job.Status = TrainingJobStatus.Started;
+                job.DateStarted ??= DateTime.UtcNow;
+                job.Message = "Training job starting...";
+            });
+
             await TrainingJobExtensions.RunTrainingLoop(
-                inputText: req.InputText, 
-                model: model,
                 job: job,
+                model: model,
                 startEpoch: startEpoch,
                 config: config,
                 control: control,
@@ -461,8 +558,6 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 jobManager: _jobManager
             );
 
-            job.Status = TrainingJobStatus.Running;
-            
             return new ApiResponse<TrainingProgressResponse>
             {
                 Message = "Training job started successfully.",

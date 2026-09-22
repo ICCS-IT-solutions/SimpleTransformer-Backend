@@ -112,8 +112,11 @@ namespace SimpleTransformer.Model
                 ReadOnlySpan<float> incomingGradRow = gradData.Slice(i * _embeddingSize, _embeddingSize);
                 Span<float> targetGradRow = embGradData.Slice(tokenId * _embeddingSize, _embeddingSize);
 
-                // SIMD accelerated vector addition for gradient accumulation
-                TensorMathSimd.AddInPlace(targetGradRow, incomingGradRow);
+                // Accumulate gradient row into the embedding parameter gradient table
+                for (int e = 0; e < _embeddingSize; e++)
+                {
+                    targetGradRow[e] += incomingGradRow[e];
+                }
             }
 
             // Borrow dummy input gradient from workspace to match ITrainableLayer interface contract
@@ -122,7 +125,7 @@ namespace SimpleTransformer.Model
                 : workspace.Borrow2D(_lastInput.Rows, _lastInput.Cols);
 
             // Clear buffer in case workspace handed us recycled memory
-            TensorUtilitiesSimd.Fill(dummyInputGradient, 0f);
+            workspace.Backend.Fill(dummyInputGradient, 0f);
 
             return dummyInputGradient;
         }
@@ -150,7 +153,7 @@ namespace SimpleTransformer.Model
 
         public void ZeroGradients()
         {
-            TensorUtilitiesSimd.Fill(_embeddingGradient, 0f);
+            Array.Fill(_embeddingGradient.Data, 0f);
         }
 
         public void Dispose()

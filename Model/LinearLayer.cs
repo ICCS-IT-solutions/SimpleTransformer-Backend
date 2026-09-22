@@ -111,7 +111,7 @@ namespace SimpleTransformer.Model
                 shape => new Tensor(shape[0], shape[1])
             );
 
-            TensorMathSimd.MatrixMultiplyRightTransposedInto(input, _weights, output);
+            workspace.Backend.MatMul(input, _weights, output, transposeB: true);
 
             if (_useBias)
             {
@@ -141,7 +141,7 @@ namespace SimpleTransformer.Model
                 TensorBase inputSlice = TensorUtilitiesSimd.GetLayer(input, b);
                 TensorBase outputSlice = TensorUtilitiesSimd.GetLayer(output, b);
 
-                TensorMathSimd.MatrixMultiplyRightTransposedInto(inputSlice, _weights, outputSlice);
+                workspace.Backend.MatMul(inputSlice, _weights, outputSlice, transposeB: true);
 
                 if (_useBias)
                 {
@@ -170,7 +170,7 @@ namespace SimpleTransformer.Model
             TensorBase input = _lastInput;
 
             // 1. dW = G^T * X
-            TensorMathSimd.MatrixMultiplyLeftTransposedInto(gradient, input, _weightGradient);
+            workspace.Backend.MatMul(gradient, input, _weightGradient, transposeA: true);
 
             // 2. dBias = sum(G, axis=0)
             if (_useBias)
@@ -184,7 +184,7 @@ namespace SimpleTransformer.Model
                 shape => new Tensor(shape[0], shape[1])
             );
 
-            TensorMathSimd.MatrixMultiplyInto(gradient, _weights, inputGradient);
+            workspace.Backend.MatMul(gradient, _weights, inputGradient);
 
             return inputGradient;
         }
@@ -206,14 +206,14 @@ namespace SimpleTransformer.Model
             // 1. Clear thread-local gradient buffers across participating threads
             foreach (var localBuffer in _threadLocalDW.Values)
             {
-                TensorUtilitiesSimd.Fill(localBuffer, 0f);
+                workspace.Backend.Fill(localBuffer, 0f);
             }
             if (_useBias)
             {
                 foreach (var localBuffer in _threadLocalDB.Values)
                 {
                     if (localBuffer != null)
-                        TensorUtilitiesSimd.Fill(localBuffer, 0f);
+                        workspace.Backend.Fill(localBuffer, 0f);
                 }
             }
 
@@ -226,8 +226,8 @@ namespace SimpleTransformer.Model
 
                 Tensor localDW = _threadLocalDW.Value!;
 
-                TensorMathSimd.MatrixMultiplyLeftTransposedAccumulateInto(gradSlice, inputSlice, localDW);
-                TensorMathSimd.MatrixMultiplyInto(gradSlice, _weights, dInputSlice);
+                workspace.Backend.MatMulAccumulate(gradSlice, inputSlice, localDW, transposeA: true);
+                workspace.Backend.MatMul(gradSlice, _weights, dInputSlice);
 
                 if (_useBias)
                 {
@@ -239,7 +239,7 @@ namespace SimpleTransformer.Model
             // 3. Reduce thread-local gradients into main weight gradient
             foreach (var localDW in _threadLocalDW.Values)
             {
-                TensorMathSimd.ElementWiseAddInPlace(_weightGradient, localDW);
+                workspace.Backend.ElementWiseAddInPlace(_weightGradient, localDW);
             }
 
             if (_useBias)
@@ -247,7 +247,7 @@ namespace SimpleTransformer.Model
                 foreach (var localDB in _threadLocalDB.Values)
                 {
                     if (localDB != null)
-                        TensorMathSimd.ElementWiseAddInPlace(_biasGradient!, localDB);
+                        workspace.Backend.ElementWiseAddInPlace(_biasGradient!, localDB);
                 }
             }
 
@@ -256,10 +256,11 @@ namespace SimpleTransformer.Model
 
         public void ZeroGradients()
         {
-            TensorUtilitiesSimd.Fill(_weightGradient, 0f);
+            // Zero weight gradient (pure managed - gradients are plain owned buffers)
+            Array.Fill(_weightGradient.Data, 0f);
             if (_useBias)
             {
-                TensorUtilitiesSimd.Fill(_biasGradient!, 0f);
+                Array.Fill(_biasGradient!.Data, 0f);
             }
         }
 
@@ -276,9 +277,12 @@ namespace SimpleTransformer.Model
             {
                 int rowOffset = target.Offset + (r * target.Stride);
                 Span<float> rowSpan = targetSpan.Slice(rowOffset, cols);
-                
-                // Uses SIMD vector addition under the hood if available
-                TensorMathSimd.AddSpanInPlace(rowSpan, biasSpan);
+
+                // Pure managed broadcast add (bias-sized rows are memory-bound, SIMD adds little here)
+                for (int j = 0; j < cols; j++)
+                {
+                    rowSpan[j] += biasSpan[j];
+                }
             }
         }
 
@@ -294,8 +298,11 @@ namespace SimpleTransformer.Model
                 int rowOffset = gradient.Offset + (r * gradient.Stride);
                 ReadOnlySpan<float> rowSpan = gradData.Slice(rowOffset, cols);
 
-                // Uses SIMD vector addition under the hood if available
-                TensorMathSimd.AddSpanInPlace(biasGradSpan, rowSpan);
+                // Pure managed row-sum accumulation
+                for (int j = 0; j < cols; j++)
+                {
+                    biasGradSpan[j] += rowSpan[j];
+                }
             }
         }
         public void Dispose()

@@ -8,6 +8,20 @@ namespace SimpleTransformer
     {
         static void Main(string[] args)
         {
+            // Backend parity self-test (no server start): dotnet run -- --backend-selftest
+            if (args.Contains("--backend-selftest"))
+            {
+                bool ok = SimpleTransformer.AccelerationEngine.BackendSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // End-to-end pipeline smoke test (no server start): dotnet run -- --pipeline-smoketest
+            if (args.Contains("--pipeline-smoketest"))
+            {
+                bool ok = SimpleTransformer.AccelerationEngine.PipelineSmokeTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
             Log.Logger = new LoggerConfiguration()
                 .MinimumLevel.Information()
                 .WriteTo.Console()

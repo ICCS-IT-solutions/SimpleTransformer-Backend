@@ -56,30 +56,30 @@ namespace SimpleTransformer.Model
             TensorBase scores = workspace.Borrow2D(q.Rows, k.Rows);
 
             // 1. Q * K^T
-            TensorUtilitiesSimd.TransposeInto(k, kTransposed);
-            TensorMathSimd.MatrixMultiplyInto(q, kTransposed, scores);
+            workspace.Backend.TransposeInto(k, kTransposed);
+            workspace.Backend.MatMul(q, kTransposed, scores);
             workspace.Release(kTransposed);
 
             // 2. Scale scores: 1 / sqrt(d_k)
-            TensorMathSimd.ScaleInPlace(scores, 1.0f / MathF.Sqrt(_headSize));
+            workspace.Backend.ScaleInPlace(scores, 1.0f / MathF.Sqrt(_headSize));
 
             // 3. Apply mask if provided (-1e9f before softmax)
             if (mask != null)
             {
-                MaskUtilitiesSimd.ApplyMaskInPlace(scores, mask);
+                workspace.Backend.ApplyMaskInPlace(scores, mask);
             }
 
             // 4. Softmax computation
-            TensorUtilitiesSimd.SoftmaxRowsInPlace((Tensor)scores);
+            workspace.Backend.SoftmaxInPlace(scores);
 
             // 5. Cache softmax weights PER BATCH ITEM for backprop (persist until Backward completes)
             Tensor currentWeights = new Tensor(scores.Rows, scores.Cols);
-            TensorUtilitiesSimd.CopyTensor(scores, currentWeights);
+            workspace.Backend.CopyInto(scores, currentWeights);
             _lastWeights.Add(currentWeights);
 
             // 6. Output = SoftmaxWeights * V
             TensorBase output = workspace.Borrow2D(scores.Rows, v.Cols);
-            TensorMathSimd.MatrixMultiplyInto(scores, v, output);
+            workspace.Backend.MatMul(scores, v, output);
 
             workspace.Release(scores);
 
@@ -133,38 +133,38 @@ namespace SimpleTransformer.Model
         {
             // dV = SoftmaxWeights^T * outputGradient
             TensorBase weightsTransposed = workspace.Borrow2D(savedWeights.Cols, savedWeights.Rows);
-            TensorUtilitiesSimd.TransposeInto(savedWeights, weightsTransposed);
+            workspace.Backend.TransposeInto(savedWeights, weightsTransposed);
 
             TensorBase dV = workspace.Borrow2D(v.Rows, v.Cols);
-            TensorMathSimd.MatrixMultiplyInto(weightsTransposed, outputGradient, dV);
+            workspace.Backend.MatMul(weightsTransposed, outputGradient, dV);
             workspace.Release(weightsTransposed);
 
             // dWeights = outputGradient * V^T
             TensorBase vTransposed = workspace.Borrow2D(v.Cols, v.Rows);
-            TensorUtilitiesSimd.TransposeInto(v, vTransposed);
+            workspace.Backend.TransposeInto(v, vTransposed);
 
             TensorBase dWeights = workspace.Borrow2D(outputGradient.Rows, vTransposed.Cols);
-            TensorMathSimd.MatrixMultiplyInto(outputGradient, vTransposed, dWeights);
+            workspace.Backend.MatMul(outputGradient, vTransposed, dWeights);
             workspace.Release(vTransposed);
 
             // dScores = SoftmaxBackward(dWeights, SoftmaxWeights)
             TensorBase dScores = workspace.Borrow2D(dWeights.Rows, dWeights.Cols);
-            TensorUtilitiesSimd.SoftmaxBackwardInto((Tensor)dWeights, (Tensor)savedWeights, (Tensor)dScores);
+            workspace.Backend.SoftmaxBackwardInto(savedWeights, dWeights, dScores);
             workspace.Release(dWeights);
 
             // Scale dScores back by 1 / Sqrt(headSize)
-            TensorMathSimd.ScaleInPlace(dScores, 1.0f / MathF.Sqrt(_headSize));
+            workspace.Backend.ScaleInPlace(dScores, 1.0f / MathF.Sqrt(_headSize));
 
             // dQ = dScores * K
             TensorBase dQ = workspace.Borrow2D(q.Rows, q.Cols);
-            TensorMathSimd.MatrixMultiplyInto(dScores, k, dQ);
+            workspace.Backend.MatMul(dScores, k, dQ);
 
             // dK = dScores^T * Q
             TensorBase dScoresTransposed = workspace.Borrow2D(dScores.Cols, dScores.Rows);
-            TensorUtilitiesSimd.TransposeInto(dScores, dScoresTransposed);
+            workspace.Backend.TransposeInto(dScores, dScoresTransposed);
 
             TensorBase dK = workspace.Borrow2D(k.Rows, k.Cols);
-            TensorMathSimd.MatrixMultiplyInto(dScoresTransposed, q, dK);
+            workspace.Backend.MatMul(dScoresTransposed, q, dK);
 
             // Clean up temporary workspace buffers
             workspace.Release(dScores);

@@ -66,7 +66,7 @@ namespace SimpleTransformer.Model
             TensorBase attention = _multiHeadAttention.Forward(input, workspace);
 
             TensorBase residual1 = workspace.BorrowLike(input);
-            TensorMathSimd.ElementWiseAddInto(attention, input, residual1);
+            workspace.Backend.ElementWiseAddInto(attention, input, residual1);
             workspace.Release(attention);
 
             TensorBase norm1 = _layerNorm1.Forward(residual1, workspace);
@@ -76,7 +76,7 @@ namespace SimpleTransformer.Model
             TensorBase ff = _feedForward.Forward(norm1, workspace);
 
             TensorBase residual2 = workspace.BorrowLike(norm1);
-            TensorMathSimd.ElementWiseAddInto(ff, norm1, residual2);
+            workspace.Backend.ElementWiseAddInto(ff, norm1, residual2);
             workspace.Release(ff);
             workspace.Release(norm1);
 
@@ -146,7 +146,7 @@ namespace SimpleTransformer.Model
 
             // 3. Split gradient at Residual 2 (FFN path + skip connection)
             TensorBase dNorm1 = workspace.BorrowLike(dFf);
-            TensorMathSimd.ElementWiseAddInto(dFf, dResidual2, dNorm1);
+            workspace.Backend.ElementWiseAddInto(dFf, dResidual2, dNorm1);
             workspace.Release(dFf);
             workspace.Release(dResidual2);
 
@@ -159,7 +159,7 @@ namespace SimpleTransformer.Model
 
             // 6. Split gradient at Residual 1 (Attention path + skip connection)
             TensorBase dInput = workspace.BorrowLike(dAttention);
-            TensorMathSimd.ElementWiseAddInto(dAttention, dResidual1, dInput);
+            workspace.Backend.ElementWiseAddInto(dAttention, dResidual1, dInput);
             workspace.Release(dAttention);
             workspace.Release(dResidual1);
 
@@ -178,7 +178,7 @@ namespace SimpleTransformer.Model
 
             // 3. Split gradient at Residual 2
             TensorBase dNorm1 = workspace.BorrowLike(dFf);
-            TensorMathSimd.ElementWiseAddInto(dFf, dFfResidual, dNorm1);
+            workspace.Backend.ElementWiseAddInto(dFf, dFfResidual, dNorm1);
             workspace.Release(dFf);
             workspace.Release(dFfResidual);
 
@@ -191,7 +191,7 @@ namespace SimpleTransformer.Model
 
             // 6. Split gradient at Residual 1
             TensorBase dInput = workspace.BorrowLike(dAttention);
-            TensorMathSimd.ElementWiseAddInto(dAttention, dAttnResidual, dInput);
+            workspace.Backend.ElementWiseAddInto(dAttention, dAttnResidual, dInput);
             workspace.Release(dAttention);
             workspace.Release(dAttnResidual);
 

@@ -116,8 +116,9 @@ namespace SimpleTransformer.Model
             // 3. Borrow destination tensor for accumulated input gradient
             TensorBase dInput = workspace.Borrow2D(dInputQ.Rows, dInputQ.Cols);
 
-            // SIMD-accelerated 3-way elementwise addition: output = dInputQ + dInputK + dInputV
-            TensorMathSimd.AddThreeTensors(dInputQ, dInputK, dInputV, dInput);
+            // 3-way elementwise addition through the backend: dInput = dInputQ + dInputK + dInputV
+            workspace.Backend.ElementWiseAddInto(dInputQ, dInputK, dInput);
+            workspace.Backend.ElementWiseAddInPlace(dInput, dInputV);
 
             // 4. Release all intermediate gradient buffers back to workspace pool
             workspace.Release(dQ);
@@ -143,7 +144,8 @@ namespace SimpleTransformer.Model
 
             TensorBase dInput = workspace.Borrow3D(dInputQ.Layers, dInputQ.Rows, dInputQ.Cols);
 
-            TensorMathSimd.AddThreeTensors(dInputQ, dInputK, dInputV, dInput);
+            workspace.Backend.ElementWiseAddInto(dInputQ, dInputK, dInput);
+            workspace.Backend.ElementWiseAddInPlace(dInput, dInputV);
 
             workspace.Release(dQ);
             workspace.Release(dK);

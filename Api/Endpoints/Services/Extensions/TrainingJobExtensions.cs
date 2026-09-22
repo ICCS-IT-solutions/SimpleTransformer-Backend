@@ -10,7 +10,6 @@ using SimpleTransformer.Model.Tokenizer;
 public static class TrainingJobExtensions
 {
     public static async Task RunTrainingLoop(
-        string inputText,
         TrainingJobEntry job,
         TransformerModel model,
         int startEpoch,
@@ -23,6 +22,20 @@ public static class TrainingJobExtensions
     )
     {
         using var db = await dbFactory.CreateDbContextAsync();
+        string inputText;
+
+        if(job.InputText != null)
+        {
+            inputText = job.InputText;
+        }
+        else if(job.InputFilePath != null)
+        {
+            inputText = await File.ReadAllTextAsync(job.InputFilePath);
+        }
+        else
+        {
+            throw new ArgumentException("Input text or file path must be provided.");
+        }
 
         var samples = TrainingDataExtensions.CreateTrainingSamples(model, tokenizer, inputText);
         var miniBatches = TrainingDataExtensions.CreateMiniBatches(model, samples);

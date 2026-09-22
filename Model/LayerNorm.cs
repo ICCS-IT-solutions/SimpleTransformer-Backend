@@ -55,10 +55,11 @@ namespace SimpleTransformer.Model
 
         private void InitParameters()
         {
-            TensorUtilitiesSimd.Fill(_gamma, 1.0f);
-            TensorUtilitiesSimd.Fill(_beta, 0.0f);
-            TensorUtilitiesSimd.Fill(_gradientGamma, 0.0f);
-            TensorUtilitiesSimd.Fill(_gradientBeta, 0.0f);
+            // Pure managed init - these are owned, contiguous parameter buffers
+            Array.Fill(_gamma.Data, 1.0f);
+            Array.Fill(_beta.Data, 0.0f);
+            Array.Fill(_gradientGamma.Data, 0.0f);
+            Array.Fill(_gradientBeta.Data, 0.0f);
         }
 
         public TensorBase Forward(TensorBase input, TensorWorkspace workspace)
@@ -298,7 +299,7 @@ namespace SimpleTransformer.Model
             }
             else
             {
-                TensorUtilitiesSimd.Fill(_lastNormalized, 0f);
+                workspace.Backend.Fill(_lastNormalized!, 0f);
             }
         }
 
@@ -314,8 +315,8 @@ namespace SimpleTransformer.Model
 
         public void ZeroGradients()
         {
-            TensorUtilitiesSimd.Fill(_gradientGamma, 0f);
-            TensorUtilitiesSimd.Fill(_gradientBeta, 0f);
+            Array.Fill(_gradientGamma.Data, 0f);
+            Array.Fill(_gradientBeta.Data, 0f);
         }
 
         /// <summary>
