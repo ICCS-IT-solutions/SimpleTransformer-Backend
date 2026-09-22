@@ -11,13 +11,27 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         AddInPlace,
         AddInto,
         MulInPlace,
-        MulInto
+        MulInto,
+        MatMul,
+        MatMulAccumulate
     }
 
     internal struct PushConstants
     {
         public uint N;
         public float Alpha;
+    }
+
+    internal struct MatMulPushConstants
+    {
+        public uint M;
+        public uint N;
+        public uint K;
+        public uint Batch;
+        public uint TransposeA;
+        public uint TransposeB;
+        public uint Accumulate;
+        public uint Pad;
     }
 
     internal static class VulkanShaders
@@ -87,6 +101,73 @@ void main() {
     if (i >= p.n) return;
     r[i] = a[i] * b[i];
 }";
+
+        // Tiled GEMM: 16x16 workgroup, 32-byte push constants.
+        // Inputs must be packed dense row-major per batch layer.
+        // A: batch * aRows x aCols, B: batch * bRows x bCols, R: batch * m x n.
+        public const string MatMul = @"#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) buffer ABuf { float a[]; };
+layout(set = 0, binding = 1) buffer BBuf { float b[]; };
+layout(set = 0, binding = 2) buffer RBuf { float r[]; };
+layout(push_constant) uniform Push {
+    uint m; uint n; uint k; uint batch;
+    uint transposeA; uint transposeB; uint accumulate; uint _pad;
+} p;
+shared float tileA[16][16];
+shared float tileB[16][16];
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint lidY = gl_LocalInvocationID.y;
+    uint lidX = gl_LocalInvocationID.x;
+    uint batch = gl_WorkGroupID.z;
+    if (batch >= p.batch) return;
+
+    uint aRows = p.transposeA != 0 ? p.k : p.m;
+    uint aCols = p.transposeA != 0 ? p.m : p.k;
+    uint bRows = p.transposeB != 0 ? p.n : p.k;
+    uint bCols = p.transposeB != 0 ? p.k : p.n;
+
+    uint aBase = batch * aRows * aCols;
+    uint bBase = batch * bRows * bCols;
+    uint rBase = batch * p.m * p.n;
+
+    float sum = 0.0;
+    uint tiles = (p.k + 15u) / 16u;
+    for (uint t = 0u; t < tiles; t++) {
+        uint aRow = row;
+        uint aCol = t * 16u + lidX;
+        float av = 0.0;
+        if (aRow < p.m && aCol < p.k) {
+            uint ai = p.transposeA != 0 ? aCol * aCols + aRow : aRow * aCols + aCol;
+            av = a[aBase + ai];
+        }
+        tileA[lidY][lidX] = av;
+
+        uint bRow = t * 16u + lidY;
+        uint bCol = col;
+        float bv = 0.0;
+        if (bRow < p.k && bCol < p.n) {
+            uint bi = p.transposeB != 0 ? bCol * bCols + bRow : bRow * bCols + bCol;
+            bv = b[bBase + bi];
+        }
+        tileB[lidY][lidX] = bv;
+
+        barrier();
+
+        for (uint e = 0u; e < 16u; e++) {
+            sum += tileA[lidY][e] * tileB[e][lidX];
+        }
+
+        barrier();
+    }
+
+    if (row < p.m && col < p.n) {
+        uint ri = rBase + row * p.n + col;
+        r[ri] = p.accumulate != 0 ? r[ri] + sum : sum;
+    }
+}";
     }
 
     internal sealed unsafe class VulkanKernelLauncher : IDisposable
@@ -101,12 +182,14 @@ void main() {
         public VulkanKernelLauncher(VulkanContext ctx, VulkanShaderCompiler compiler)
         {
             _ctx = ctx;
-            Register(VulkanKernel.Scale, compiler, VulkanShaders.Scale, 1);
-            Register(VulkanKernel.Fill, compiler, VulkanShaders.Fill, 1);
-            Register(VulkanKernel.AddInPlace, compiler, VulkanShaders.AddInPlace, 2);
-            Register(VulkanKernel.AddInto, compiler, VulkanShaders.AddInto, 3);
-            Register(VulkanKernel.MulInPlace, compiler, VulkanShaders.MulInPlace, 2);
-            Register(VulkanKernel.MulInto, compiler, VulkanShaders.MulInto, 3);
+            Register(VulkanKernel.Scale, compiler, VulkanShaders.Scale, 1, 8);
+            Register(VulkanKernel.Fill, compiler, VulkanShaders.Fill, 1, 8);
+            Register(VulkanKernel.AddInPlace, compiler, VulkanShaders.AddInPlace, 2, 8);
+            Register(VulkanKernel.AddInto, compiler, VulkanShaders.AddInto, 3, 8);
+            Register(VulkanKernel.MulInPlace, compiler, VulkanShaders.MulInPlace, 2, 8);
+            Register(VulkanKernel.MulInto, compiler, VulkanShaders.MulInto, 3, 8);
+            Register(VulkanKernel.MatMul, compiler, VulkanShaders.MatMul, 3, 32);
+            Register(VulkanKernel.MatMulAccumulate, compiler, VulkanShaders.MatMul, 3, 32);
 
             var poolSize = new DescriptorPoolSize
             {
@@ -129,7 +212,8 @@ void main() {
             VulkanKernel kernel,
             VulkanShaderCompiler compiler,
             string glsl,
-            int bindings)
+            int bindings,
+            uint pushSize)
         {
             var vk = _ctx.Vk;
             byte[] spirv = compiler.CompileCompute(glsl, kernel.ToString());
@@ -149,7 +233,7 @@ void main() {
 
                 try
                 {
-                    RegisterPipeline(kernel, bindings, module);
+                    RegisterPipeline(kernel, bindings, module, pushSize);
                 }
                 finally
                 {
@@ -158,7 +242,7 @@ void main() {
             }
         }
 
-        private void RegisterPipeline(VulkanKernel kernel, int bindings, ShaderModule module)
+        private void RegisterPipeline(VulkanKernel kernel, int bindings, ShaderModule module, uint pushSize)
         {
             var vk = _ctx.Vk;
             using var entryMem = Silk.NET.Core.Native.SilkMarshal.StringToMemory("main", Silk.NET.Core.Native.NativeStringEncoding.UTF8);
@@ -203,7 +287,7 @@ void main() {
                 {
                     StageFlags = ShaderStageFlags.ComputeBit,
                     Offset = 0,
-                    Size = 8
+                    Size = pushSize
                 };
                 var pipeLayoutInfo = new PipelineLayoutCreateInfo
                 {
@@ -242,6 +326,76 @@ void main() {
             var setLayout = _setLayouts[kernel];
             var pipeline = _pipelines[kernel];
 
+            DescriptorSet set = AllocateAndBind(buffers, setLayout);
+            CommandBuffer cmd = BeginOneTime();
+            try
+            {
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new PushConstants { N = n, Alpha = alpha };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 8, &push);
+                uint groups = (n + 255) / 256;
+                vk.CmdDispatch(cmd, groups, 1, 1);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
+            finally
+            {
+                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
+            }
+
+            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+        }
+
+        public void DispatchMatMul(
+            VulkanKernel kernel,
+            VulkanBuffer a,
+            VulkanBuffer b,
+            VulkanBuffer r,
+            uint m,
+            uint n,
+            uint k,
+            uint batch,
+            bool transposeA,
+            bool transposeB,
+            bool accumulate)
+        {
+            var vk = _ctx.Vk;
+            var layout = _layouts[kernel];
+            var setLayout = _setLayouts[kernel];
+            var pipeline = _pipelines[kernel];
+
+            DescriptorSet set = AllocateAndBind(new[] { a, b, r }, setLayout);
+            CommandBuffer cmd = BeginOneTime();
+            try
+            {
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new MatMulPushConstants
+                {
+                    M = m, N = n, K = k, Batch = batch,
+                    TransposeA = transposeA ? 1u : 0u,
+                    TransposeB = transposeB ? 1u : 0u,
+                    Accumulate = accumulate ? 1u : 0u,
+                    Pad = 0
+                };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 32, &push);
+                uint gx = (n + 15) / 16;
+                uint gy = (m + 15) / 16;
+                vk.CmdDispatch(cmd, gx, gy, batch);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
+            finally
+            {
+                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
+            }
+            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
+        }
+
+        private DescriptorSet AllocateAndBind(VulkanBuffer[] buffers, DescriptorSetLayout setLayout)
+        {
+            var vk = _ctx.Vk;
             var allocInfo = new DescriptorSetAllocateInfo
             {
                 SType = StructureType.DescriptorSetAllocateInfo,
@@ -281,7 +435,11 @@ void main() {
                     vk.UpdateDescriptorSets(_ctx.Device, (uint)writes.Length, w, 0, null);
                 }
             }
+            return set;
+        }
 
+        private CommandBuffer BeginOneTime()
+        {
             var cmdAlloc = new CommandBufferAllocateInfo
             {
                 SType = StructureType.CommandBufferAllocateInfo,
@@ -289,50 +447,37 @@ void main() {
                 Level = CommandBufferLevel.Primary,
                 CommandBufferCount = 1
             };
-            vk.AllocateCommandBuffers(_ctx.Device, cmdAlloc, out CommandBuffer cmd);
+            _ctx.Vk.AllocateCommandBuffers(_ctx.Device, cmdAlloc, out CommandBuffer cmd);
+            var begin = new CommandBufferBeginInfo
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit
+            };
+            _ctx.Vk.BeginCommandBuffer(cmd, begin);
+            return cmd;
+        }
 
+        private void SubmitAndWait(CommandBuffer cmd)
+        {
+            var vk = _ctx.Vk;
+            var submit = new SubmitInfo
+            {
+                SType = StructureType.SubmitInfo,
+                CommandBufferCount = 1,
+                PCommandBuffers = &cmd
+            };
+            var fenceInfo = new FenceCreateInfo { SType = StructureType.FenceCreateInfo };
+            vk.CreateFence(_ctx.Device, fenceInfo, null, out Fence fence);
             try
             {
-                var begin = new CommandBufferBeginInfo
-                {
-                    SType = StructureType.CommandBufferBeginInfo,
-                    Flags = CommandBufferUsageFlags.CommandBufferUsageOneTimeSubmitBit
-                };
-                vk.BeginCommandBuffer(cmd, begin);
-                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-                var push = new PushConstants { N = n, Alpha = alpha };
-                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 8, &push);
-                uint groups = (n + 255) / 256;
-                vk.CmdDispatch(cmd, groups, 1, 1);
-                vk.EndCommandBuffer(cmd);
-
-                var submit = new SubmitInfo
-                {
-                    SType = StructureType.SubmitInfo,
-                    CommandBufferCount = 1,
-                    PCommandBuffers = &cmd
-                };
-
-                var fenceInfo = new FenceCreateInfo { SType = StructureType.FenceCreateInfo };
-                vk.CreateFence(_ctx.Device, fenceInfo, null, out Fence fence);
-                try
-                {
-                    vk.QueueSubmit(_ctx.Queue, 1, submit, fence);
-                    vk.WaitForFences(_ctx.Device, 1, fence, true, 10_000_000_000);
-                    vk.ResetFences(_ctx.Device, 1, fence);
-                }
-                finally
-                {
-                    vk.DestroyFence(_ctx.Device, fence, null);
-                }
+                vk.QueueSubmit(_ctx.Queue, 1, submit, fence);
+                vk.WaitForFences(_ctx.Device, 1, fence, true, 10_000_000_000);
+                vk.ResetFences(_ctx.Device, 1, fence);
             }
             finally
             {
-                vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, cmd);
+                vk.DestroyFence(_ctx.Device, fence, null);
             }
-
-            vk.FreeDescriptorSets(_ctx.Device, _pool, 1, set);
         }
 
         public void Dispose()

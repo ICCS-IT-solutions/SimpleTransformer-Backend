@@ -158,6 +158,53 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             Unpack(fr, result);
         }
 
+        private void RunMatMul(TensorBase a, TensorBase b, TensorBase result, bool transposeA, bool transposeB, bool accumulate)
+        {
+            int batch = a.Rank == 3 ? a.Layers : 1;
+            int m = transposeA ? a.Cols : a.Rows;
+            int kA = transposeA ? a.Rows : a.Cols;
+            int kB = transposeB ? b.Cols : b.Rows;
+            int n = transposeB ? b.Rows : b.Cols;
+            if (kA != kB)
+                throw new ArgumentException($"MatMul inner dims mismatch ({kA} vs {kB}).");
+            if (result.Rank == 3)
+            {
+                if (result.Layers != batch || result.Rows != m || result.Cols != n)
+                    throw new ArgumentException("MatMul result shape mismatch.");
+            }
+            else if (result.Rows != m || result.Cols != n)
+            {
+                throw new ArgumentException("MatMul result shape mismatch.");
+            }
+
+            if (_launcher == null)
+            {
+                if (accumulate) _fallback.MatMulAccumulate(a, b, result, transposeA, transposeB);
+                else _fallback.MatMul(a, b, result, transposeA, transposeB);
+                return;
+            }
+
+            float[] fa = Pack(a);
+            float[] fb = Pack(b);
+            int k = kA;
+            float[] fr = new float[batch * m * n];
+            if (accumulate)
+                Pack(result).CopyTo(fr, 0);
+
+            using var ba = new VulkanBuffer(_ctx!, (ulong)(fa.Length * 4));
+            using var bb = new VulkanBuffer(_ctx!, (ulong)(fb.Length * 4));
+            using var br = new VulkanBuffer(_ctx!, (ulong)(fr.Length * 4));
+            ba.Upload(fa);
+            bb.Upload(fb);
+            br.Upload(fr);
+            _launcher.DispatchMatMul(
+                accumulate ? VulkanKernel.MatMulAccumulate : VulkanKernel.MatMul,
+                ba, bb, br, (uint)m, (uint)n, (uint)k, (uint)batch,
+                transposeA, transposeB, accumulate);
+            br.Download(fr);
+            Unpack(fr, result);
+        }
+
         public void ScaleInPlace(TensorBase tensor, float scalar)
             => RunUnary(VulkanKernel.Scale, tensor, scalar);
 
@@ -198,10 +245,10 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             => _fallback.SoftmaxBackwardInto(softmaxOutput, outputGradient, inputGradient);
 
         public void MatMul(TensorBase a, TensorBase b, TensorBase result, bool transposeA = false, bool transposeB = false)
-            => _fallback.MatMul(a, b, result, transposeA, transposeB);
+            => RunMatMul(a, b, result, transposeA, transposeB, false);
 
         public void MatMulAccumulate(TensorBase a, TensorBase b, TensorBase result, bool transposeA = false, bool transposeB = false)
-            => _fallback.MatMulAccumulate(a, b, result, transposeA, transposeB);
+            => RunMatMul(a, b, result, transposeA, transposeB, true);
 
         public void ApplyMaskInPlace(TensorBase scores, TensorBase mask)
             => _fallback.ApplyMaskInPlace(scores, mask);
