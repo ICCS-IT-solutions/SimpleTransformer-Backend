@@ -39,6 +39,26 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
             return await _transformerModelService.LoadModel(modelId);
         }
 
+        [HttpPost("api/v1/models/{modelId}/unload")]
+        public async Task<ApiResponse<TransformerModelResponse>> UnloadModel([FromRoute] Guid modelId)
+        {
+            return await _transformerModelService.UnloadModel(modelId);
+        }
+
+        //The runtime model currently held in memory by the ModelManager (if any),
+        //including the acceleration backend that was actually resolved at load time.
+        [HttpGet("api/v1/models/active")]
+        public async Task<ApiResponse<TransformerModelResponse>> GetActiveModel()
+        {
+            return await _transformerModelService.GetActiveModel();
+        }
+
+        [HttpPost("api/v1/models/{modelId}/update")]
+        public async Task<ApiResponse<TransformerModelResponse>> UpdateTransformerModel([FromRoute] Guid modelId, [FromBody] CreateTransformerModelRequest req)
+        {
+            return await _transformerModelService.UpdateTransformerModel(modelId, req);
+        }
+
         //Whether I will need this endpoint, I don't yet know, but it does help for testing to see if the backend can trigger a model load from a GUID.
         [HttpPost("api/v1/models/{modelId}/create-runtime-model")]
         public async Task<ApiResponse<TransformerModel?>> CreateRuntimeModel([FromRoute] Guid modelId)

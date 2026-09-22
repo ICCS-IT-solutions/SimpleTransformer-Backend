@@ -47,18 +47,42 @@ namespace SimpleTransformer.AccelerationEngine
             {
                 if (_default == null)
                 {
-                    // Auto strategy (CPU-only for now):
-                    //  - Prefer the SIMD backend when the JIT reports hardware vector support.
-                    //  - Fall back to the pure managed reference backend otherwise.
-                    // Note: CpuAvx2/CpuAvx512/GpuVulkan are intentionally NOT auto-selected
-                    // until their implementations are complete.
-                    _default = Vector.IsHardwareAccelerated
-                        ? (IAccelerationBackend)new CpuSimd.CpuSimdBackend()
-                        : new CpuReference.CpuReferenceBackend();
+                    // Auto strategy:
+                    //  - Prefer the GPU (Vulkan) backend when a device is available.
+                    //  - Otherwise prefer the SIMD backend when the JIT reports hardware
+                    //    vector support, falling back to the pure managed reference backend.
+                    // Note: CpuAvx2/CpuAvx512 are stubs and are never auto-selected.
+                    _default = TryCreate(BackendType.GpuVulkan)
+                        ?? (Vector.IsHardwareAccelerated
+                            ? (IAccelerationBackend)new CpuSimd.CpuSimdBackend()
+                            : new CpuReference.CpuReferenceBackend());
                 }
 
                 return _default;
             }
+        }
+
+        /// <summary>
+        /// Probes a backend type by constructing it and checking
+        /// <see cref="IAccelerationBackend.IsAvailable"/>. Returns null when
+        /// construction throws or the backend reports itself unavailable.
+        /// </summary>
+        private static IAccelerationBackend? TryCreate(BackendType type)
+        {
+            try
+            {
+                var backend = SelectBackend(type);
+                if (backend.IsAvailable)
+                    return backend;
+
+                backend.Dispose();
+            }
+            catch
+            {
+                // Probe failure — fall through to the next Auto candidate.
+            }
+
+            return null;
         }
 
         /// <summary>
