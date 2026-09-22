@@ -88,6 +88,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 Status = TrainingJobStatus.Pending,
                 TrainingConfigId = modelEntry.TrainingConfigId,
                 TransformerConfigId = modelEntry.TransformerConfigId,
+                TransformerModelId = modelEntry.EntryId,
                 Message = "Training job created.",
                 DateUpdated = DateTime.UtcNow,
                 InputText = req.InputText,
@@ -192,6 +193,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
                 TransformerConfigId = modelEntry.TransformerConfigId,
                 TrainingConfigId = modelEntry.TrainingConfigId,
+                TransformerModelId = modelEntry.EntryId,
                 VocabularyId = req.VocabularyId,
 
                 InputText = null,
@@ -655,6 +657,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 });
             }
 
+            //Resolve the model name for the active response payload.
+            var model = await db.TransformerModels
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x => x.EntryId == job.TransformerModelId);
+
             return await Task.FromResult(new ApiResponse<TrainingProgressResponse>
             {
                 Message = job.Message,
@@ -664,6 +671,8 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 {
                     JobId = job.EntryId.ToString(),
                     Name =  job.Name,
+                    TransformerModelId = job.TransformerModelId.ToString(),
+                    TransformerModelName = model?.Name ?? string.Empty,
                     Status = job.Status,
                     CurrentEpoch = job.CurrentEpoch,
                     TotalEpochs = job.TotalEpochs,
@@ -682,16 +691,24 @@ namespace SimpleTransformer.Api.Endpoints.Services
         public async Task<ApiResponse<List<TrainingProgressResponse>>> GetTrainingJobs()
         {
             await using var _db = await _dbFactory.CreateDbContextAsync();
+            var modelNames = _db.TransformerModels
+                .AsNoTracking()
+                .ToDictionary(x => x.EntryId, x => x.Name);
+
             return new ApiResponse<List<TrainingProgressResponse>>
             {
                 Message = "Training jobs found.",
                 Status = ResponseStatus.Success,
                 StatusCode = 200,
-                Data = _db.TrainingJobs.Select(x => new TrainingProgressResponse
-                {
-                    JobId = x.EntryId.ToString(),
-                    Name = x.Name,
-                    Status = x.Status,
+                Data = _db.TrainingJobs
+                    .ToList()
+                    .Select(x => new TrainingProgressResponse
+                    {
+                        JobId = x.EntryId.ToString(),
+                        Name = x.Name,
+                        TransformerModelId = x.TransformerModelId.ToString(),
+                        TransformerModelName = modelNames.GetValueOrDefault(x.TransformerModelId, string.Empty),
+                        Status = x.Status,
                     CurrentEpoch = x.CurrentEpoch,
                     TotalEpochs = x.TotalEpochs,
                     CurrentBatch = x.CurrentBatch,

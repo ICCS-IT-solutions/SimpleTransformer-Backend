@@ -10,12 +10,17 @@ namespace SimpleTransformer.AppDb
         public Guid EntryId { get; set; } = Guid.NewGuid();
         public required string Name { get; set; }
         public string Message { get; set; } = string.Empty;
+        //The model this job trains. Kept alongside the config ids so a job can be
+        //resolved back to the exact model definition it targeted, not just the
+        //configs that were in effect when it was created.
+        public Guid TransformerModelId { get; set; }
         //Associated model, training and vocabulary
         public Guid TransformerConfigId { get; set; }
         public Guid TrainingConfigId { get; set; }
         public Guid VocabularyId { get; set; }
 
         //Associated model, training and vocabulary
+        public TransformerModelEntry? TransformerModel { get; set; }
         public TransformerConfigEntry? TransformerConfig { get; set; }
         public TrainingConfigEntry? TrainingConfig { get; set; }
         public VocabularyEntry? Vocabulary { get; set; }
@@ -66,6 +71,7 @@ namespace SimpleTransformer.AppDb
         name: string;
         message: string;
         transformerConfigId: string;
+        transformerModelId: string;
         trainingConfigId: string;
         vocabularyId: string;
         inputText?: string;

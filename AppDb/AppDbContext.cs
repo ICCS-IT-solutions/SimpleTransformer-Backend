@@ -86,6 +86,9 @@ namespace SimpleTransformer.AppDb
                 .IsUnique();
 
             modelBuilder.Entity<TrainingJobEntry>()
+                .HasIndex(x => x.TransformerModelId);
+
+            modelBuilder.Entity<TrainingJobEntry>()
                 .HasIndex(x => x.TransformerConfigId);
 
             modelBuilder.Entity<TrainingJobEntry>()
@@ -100,6 +103,12 @@ namespace SimpleTransformer.AppDb
             // ---------------------------------------------------------------------
             // Relationships
             // ---------------------------------------------------------------------
+
+            modelBuilder.Entity<TrainingJobEntry>()
+                .HasOne(x => x.TransformerModel)
+                .WithMany()
+                .HasForeignKey(x => x.TransformerModelId)
+                .OnDelete(DeleteBehavior.Restrict);
 
             modelBuilder.Entity<TrainingJobEntry>()
                 .HasOne(x => x.TransformerConfig)

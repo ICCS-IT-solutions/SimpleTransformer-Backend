@@ -4,6 +4,10 @@ namespace SimpleTransformer.Api.Responses
     {
         public string JobId { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
+        //The model this job targets (id + name) so the frontend can show and
+        //resolve the exact model definition the job belongs to.
+        public string TransformerModelId { get; set; } = string.Empty;
+        public string TransformerModelName { get; set; } = string.Empty;
         public TrainingJobStatus Status { get; set; }
         public int CurrentEpoch { get; set; }
         public int TotalEpochs { get; set; }
