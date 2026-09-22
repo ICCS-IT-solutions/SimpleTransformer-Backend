@@ -399,10 +399,10 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            // A model must be associated with the job.
+            // Resolve the exact model this job targets (by id, not config id —
+            // multiple models can share a transformer config).
             var modelEntry = await db.TransformerModels
-                .FirstOrDefaultAsync(x =>
-                    x.TransformerConfigId == job.TransformerConfigId);
+                .FirstOrDefaultAsync(x => x.EntryId == job.TransformerModelId);
 
             if (modelEntry == null)
             {
