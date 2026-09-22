@@ -22,6 +22,13 @@ namespace SimpleTransformer
                 Environment.Exit(ok ? 0 : 1);
             }
 
+            // Vulkan backend bring-up (no server start): dotnet run -- --vulkan-selftest
+            if (args.Contains("--vulkan-selftest"))
+            {
+                bool ok = SimpleTransformer.AccelerationEngine.GpuVulkan.VulkanSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
             Log.Logger = new LoggerConfiguration()
                 .MinimumLevel.Information()
                 .WriteTo.Console()
