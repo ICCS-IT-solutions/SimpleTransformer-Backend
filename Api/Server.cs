@@ -35,9 +35,8 @@ namespace SimpleTransformer.Api
                 builder.Services.AddSingleton<ConfigManager>(_configManager); 
 
                 // 1. Database Contexts
+                // NOTE: Only the factory is registered here.
                 builder.Services.AddDbContextFactory<AppDbContext>(options =>
-                    DbContextConfiguration.ConfigureDbContext(options, _configManager));
-                builder.Services.AddDbContext<AppDbContext>(options =>
                     DbContextConfiguration.ConfigureDbContext(options, _configManager));
 
                 // 2. Factories and Core Components (Scoped / Transient)
@@ -92,10 +91,10 @@ namespace SimpleTransformer.Api
 
                 var app = builder.Build();
 
-                // 7. Safe Initialization via explicit Scope
-                using (var scope = app.Services.CreateScope())
+                // 7. Safe Initialization via the singleton DbContext factory
+                var dbFactory = app.Services.GetRequiredService<IDbContextFactory<AppDbContext>>();
+                using (var dbContext = dbFactory.CreateDbContext())
                 {
-                    var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                     DbContextConfiguration.InitializeDatabase(dbContext);
                 }
 
