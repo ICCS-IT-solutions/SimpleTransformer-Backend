@@ -8,7 +8,7 @@
             "name": "Launch (external console)",
             "type": "coreclr",
             "preLaunchTask": "build",
-            "program": "${workspaceFolder}/bin/Debug/net9.0/SimpleTransformer.dll",
+            "program": "${workspaceFolder}/bin/Debug/net9.0/SimpleTransformer-Backend.dll",
             "cwd": "${workspaceFolder}",
             "console": "externalTerminal",
             "request": "launch"
@@ -17,7 +17,7 @@
             "name": "Launch (internal console)",
             "type": "coreclr",
             "preLaunchTask": "build",
-            "program": "${workspaceFolder}/bin/Debug/net9.0/SimpleTransformer.dll",
+            "program": "${workspaceFolder}/bin/Debug/net9.0/SimpleTransformer-Backend.dll",
             "cwd": "${workspaceFolder}",
             "console": "internalConsole",
             "request": "launch"
@@ -33,7 +33,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "preLaunchTask": "build-aot",
-            "program": "${workspaceFolder}/bin/Debug/net9.0/win-x64/publish/SimpleTransformer.exe",
+            "program": "${workspaceFolder}/bin/Debug/net9.0/win-x64/publish/SimpleTransformer-Backend.exe",
             "cwd": "${workspaceFolder}",
             "console": "externalTerminal"
         }
