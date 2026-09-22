@@ -8,6 +8,11 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         public required string Description { get; set; }
         public required TransformerConfigEntry TransformerConfig { get; set; }
         public required TrainingConfigEntry TrainingConfig { get; set; }
+
+        /// <summary>
+        /// Acceleration backend name (BackendSelector.BackendType). "Auto" by default.
+        /// </summary>
+        public string AccelerationBackend { get; set; } = "Auto";
     }
 
     /*
@@ -16,6 +21,7 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         description: string;
         transformerConfig: TransformerConfigEntry;
         trainingConfig: TrainingConfigEntry;
+        accelerationBackend: string;
     }
     */
 }

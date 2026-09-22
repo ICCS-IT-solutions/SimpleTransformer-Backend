@@ -11,10 +11,10 @@ using SimpleTransformer.Api.ManagementEngine;
 
 namespace SimpleTransformer.Api
 {
-    //This will be where I create a rest API backend server
     public class Server
     {
         private static ConfigManager _configManager = new ConfigManager();
+
         public void Start()
         {
             try
@@ -34,42 +34,39 @@ namespace SimpleTransformer.Api
 
                 builder.Services.AddSingleton<ConfigManager>(_configManager); 
 
-                var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();
+                // 1. Database Contexts
+                builder.Services.AddDbContextFactory<AppDbContext>(options =>
+                    DbContextConfiguration.ConfigureDbContext(options, _configManager));
+                builder.Services.AddDbContext<AppDbContext>(options =>
+                    DbContextConfiguration.ConfigureDbContext(options, _configManager));
 
-                DbContextConfiguration.ConfigureDbContext(optionsBuilder, _configManager);
+                // 2. Factories and Core Components (Scoped / Transient)
+                builder.Services.AddSingleton<ITransformerModelFactory, TransformerModelFactory>();
+                builder.Services.AddSingleton<ModelManager>();
 
-                builder.Services.AddDbContextFactory<AppDbContext>(options =>  DbContextConfiguration.ConfigureDbContext(options, _configManager));
-                builder.Services.AddScoped<ITransformerModelFactory, TransformerModelFactory>();
-                builder.Services.AddDbContext<AppDbContext>(options => DbContextConfiguration.ConfigureDbContext(options, _configManager));
-                // Add services to the container.
+                // 3. MVC & Open API
                 builder.Services.AddControllers();
+                builder.Services.AddEndpointsApiExplorer();
+                builder.Services.AddSwaggerGen();
 
                 builder.Services.AddCors(options =>
                 {
                     options.AddDefaultPolicy(policy =>
                     {
-                        policy.AllowAnyOrigin();
-                        policy.AllowAnyMethod();
-                        policy.AllowAnyHeader();
+                        policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader();
                     });
                     options.AddPolicy("Frontend", pol =>
                     {
-                        pol.WithOrigins("http://localhost:5173");
-                        pol.AllowAnyMethod();
-                        pol.AllowAnyHeader();
+                        pol.WithOrigins("http://localhost:5173").AllowAnyMethod().AllowAnyHeader();
                     });
                 });
-                
-                builder.Services.AddEndpointsApiExplorer();
 
-                builder.Services.AddSwaggerGen();
-                //Add services to the container.
+                // 4. Tokenizer & Vocab (Singletons)
                 builder.Services.AddSingleton<Vocabulary>(provider =>
                 {
                     const string vocabularyFile = "vocabulary.json";
-
-                    //Check that the vocab file actually exists:
-                    if(!File.Exists(vocabularyFile)) throw new FileNotFoundException("Vocabulary file not found.", vocabularyFile);
+                    if (!File.Exists(vocabularyFile)) 
+                        throw new FileNotFoundException("Vocabulary file not found.", vocabularyFile);
 
                     var loader = new JsonVocabularyLoader();
                     return loader.LoadFromFile(vocabularyFile);
@@ -77,30 +74,25 @@ namespace SimpleTransformer.Api
 
                 builder.Services.AddSingleton<IVocabularyCompiler, SentencePieceVocabularyCompiler>();
 
-                
-                builder.Services.AddScoped<VocabularyService>();
-                //Will replace this with a proper transient or loaded vocab from a json file once I have one.
-
                 builder.Services.AddSingleton<ITokenizer>(provider =>
                 {
                     var vocab = provider.GetRequiredService<Vocabulary>();
                     return new SentencePieceTokenizer(vocab);
                 });
 
-                builder.Services.AddSingleton<ModelManager>();
+                // 5. Stateful Managers (Must be Singletons)
                 builder.Services.AddSingleton<TrainingJobManager>();
-                
-                //Services using the model should be created after the model is ready.
-                builder.Services.AddSingleton<TrainingService>();
-                builder.Services.AddSingleton<InferenceService>();
-                builder.Services.AddSingleton<TransformerModelService>();
-                builder.Services.AddSingleton<ConfigService>();
 
-                
+                // 6. Request API Services (Should be Scoped)
+                builder.Services.AddScoped<VocabularyService>();
+                builder.Services.AddScoped<TrainingService>();
+                builder.Services.AddScoped<InferenceService>();
+                builder.Services.AddScoped<TransformerModelService>();
+                builder.Services.AddScoped<ConfigService>();
 
                 var app = builder.Build();
 
-                //Finetune the database before handling requests
+                // 7. Safe Initialization via explicit Scope
                 using (var scope = app.Services.CreateScope())
                 {
                     var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -109,7 +101,7 @@ namespace SimpleTransformer.Api
 
                 app.UseCors("Frontend");
 
-                if(app.Environment.IsDevelopment())
+                if (app.Environment.IsDevelopment())
                 {
                     app.UseSwagger();
                     app.UseSwaggerUI();
@@ -119,7 +111,6 @@ namespace SimpleTransformer.Api
                 Log.Information("Listening for requests...");
 
                 app.MapControllers();
-
                 app.Run();    
             }
             catch (Exception ex)
@@ -128,25 +119,18 @@ namespace SimpleTransformer.Api
             }
         }
 
-        public class AppDbContextFactory
-            : IDesignTimeDbContextFactory<AppDbContext>
+        public class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>
         {
+            // Change return type from IDesignTimeDbContextFactory<AppDbContext> to AppDbContext
             public AppDbContext CreateDbContext(string[] args)
             {
                 var configManager = new ConfigManager();
+                var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();
 
-                var optionsBuilder =
-                    new DbContextOptionsBuilder<AppDbContext>();
-
-                DbContextConfiguration.ConfigureDbContext(
-                    optionsBuilder,
-                    configManager);
-
+                DbContextConfiguration.ConfigureDbContext(optionsBuilder, configManager);
+                
                 return new AppDbContext(optionsBuilder.Options);
             }
         }
-
-        //Determine the db engine to use based on the app configuration.
-
     }
 }

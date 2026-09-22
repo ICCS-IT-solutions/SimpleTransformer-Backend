@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using SimpleTransformer.AccelerationEngine;
 using SimpleTransformer.AppDb;
 using SimpleTransformer.Model;
 
@@ -43,7 +44,21 @@ namespace SimpleTransformer.Api.Endpoints.Factories
                 throw new InvalidOperationException($"Training config with id {model.TrainingConfigId} not found in database.");
             }
 
-            return new TransformerModel(modelId, transformerConfig.Config, trainingConfig.Config, useQLora);
+            return new TransformerModel(modelId, transformerConfig.Config, trainingConfig.Config, useQLora,
+                ParseBackendType(model.AccelerationBackend));
+        }
+
+        /// <summary>
+        /// Parses the stored backend name; falls back to Auto for unknown or legacy values.
+        /// </summary>
+        private static BackendSelector.BackendType ParseBackendType(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return BackendSelector.BackendType.Auto;
+
+            return Enum.TryParse<BackendSelector.BackendType>(name, ignoreCase: true, out var type)
+                ? type
+                : BackendSelector.BackendType.Auto;
         }
     }
 }

@@ -25,6 +25,7 @@ namespace SimpleTransformer.AccelerationEngine.CpuReference
 
         public string Name => "CpuReference (pure managed scalar)";
         public bool IsGpuAccelerated => false;
+        public bool IsAvailable => true;
 
         #region Shared helpers
 

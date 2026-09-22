@@ -76,6 +76,16 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             Console.WriteLine();
 
+            // Warm-up must cover the exact op mix being measured, including the
+            // small gamma/beta vectors (256 floats) LayerNorm needs. Otherwise
+            // the first measured batch pays first-touch bucket creation and the
+            // steady-state proof fails on pool misses, not on reuse bugs.
+            // Two batches: the pool's LIFO stacks alternate physical buffer
+            // handles between batches, so the pool state (and therefore the
+            // descriptor-set cache keys) only converges after the second one.
+            RunMixedBatch(cpu, gpu);
+            RunMixedBatch(cpu, gpu);
+
             long buffersBefore = GpuVulkanBackend.BuffersCreated;
             long dispatchesBefore = gpu.DispatchCount;
             int setsBefore = gpu.CachedDescriptorSetCount;

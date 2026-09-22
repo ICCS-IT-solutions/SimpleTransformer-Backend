@@ -7,6 +7,9 @@ namespace SimpleTransformer.AccelerationEngine
 
         bool IsGpuAccelerated { get; }
 
+        /// <summary>True when the backend initialized successfully and can execute ops.</summary>
+        bool IsAvailable { get; }
+
         // Element-wise operations
         void ScaleInPlace(
             TensorBase tensor,

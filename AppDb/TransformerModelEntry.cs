@@ -12,6 +12,14 @@ namespace SimpleTransformer.AppDb
         public bool IsLoaded { get; set; }
         public required Guid TransformerConfigId { get; set; }
         public required Guid TrainingConfigId { get; set; }
+
+        /// <summary>
+        /// Acceleration backend used by this model. One of the
+        /// <see cref="AccelerationEngine.BackendSelector.BackendType"/> names.
+        /// Defaults to "Auto" (best available at load time).
+        /// </summary>
+        public string AccelerationBackend { get; set; } = "Auto";
+
         public DateTime DateCreated { get; set; } = DateTime.UtcNow;
         public DateTime? DateUpdated { get; set; }
     }
@@ -21,8 +29,10 @@ namespace SimpleTransformer.AppDb
         entryId: string;
         name: string;
         description: string;
+        isLoaded: boolean;
         transformerConfigId: string;
         trainingConfigId: string;
+        accelerationBackend: string;
         dateCreated: Date;
         dateUpdated?: Date;
     }

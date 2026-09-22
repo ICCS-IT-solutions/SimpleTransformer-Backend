@@ -1,17 +1,69 @@
 using Microsoft.AspNetCore.Mvc;
 using SimpleTransformer.Api.Responses;
 using SimpleTransformer.Model;
+using SimpleTransformer.AccelerationEngine;
 
 namespace SimpleTransformer.Api.Endpoints.Services
 {
     [ApiController]
     [Route("")]
-    public class ConfigController : ControllerBase  
+    public class ConfigController : ControllerBase
     {
         private readonly ConfigService _configService;
         public ConfigController(ConfigService configService)
         {
             _configService = configService;
+        }
+
+        /// <summary>
+        /// Lists the acceleration backends the frontend can offer for model creation,
+        /// with live availability (probes each backend without starting the server flow).
+        /// </summary>
+        [HttpGet("api/v1/backends")]
+        public ApiResponse<object> GetBackends()
+        {
+            var backends = Enum.GetNames<BackendSelector.BackendType>()
+                .Where(n => n != nameof(BackendSelector.BackendType.Auto))
+                .Select(n =>
+                {
+                    bool available;
+                    string description;
+                    try
+                    {
+                        using var backend = BackendSelector.SelectBackend(Enum.Parse<BackendSelector.BackendType>(n));
+                        available = backend.IsAvailable;
+                        description = backend.Name;
+                    }
+                    catch
+                    {
+                        available = false;
+                        description = "Unavailable (initialization failed)";
+                    }
+
+                    return new
+                    {
+                        name = n,
+                        available,
+                        description
+                    };
+                })
+                .ToList();
+
+            // Auto is always offered; it resolves to the best available backend at model load time.
+            backends.Insert(0, new
+            {
+                name = nameof(BackendSelector.BackendType.Auto),
+                available = true,
+                description = "Automatically select the best available backend"
+            });
+
+            return new ApiResponse<object>
+            {
+                Message = "Acceleration backends fetched successfully.",
+                Status = ResponseStatus.Success,
+                StatusCode = 200,
+                Data = backends
+            };
         }
 
         //Existing configurations

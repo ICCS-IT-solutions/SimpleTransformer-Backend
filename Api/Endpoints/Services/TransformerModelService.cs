@@ -87,7 +87,8 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 Name = req.Name,
                 Description = req.Description,
                 TransformerConfigId = req.TransformerConfig.EntryId,
-                TrainingConfigId = req.TrainingConfig.EntryId
+                TrainingConfigId = req.TrainingConfig.EntryId,
+                AccelerationBackend = req.AccelerationBackend
             };
 
             await db.TransformerModels.AddAsync(model);

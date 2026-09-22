@@ -9,6 +9,8 @@ namespace SimpleTransformer.AccelerationEngine.CpuAvx2
 
         public bool IsGpuAccelerated => throw new NotImplementedException();
 
+        public bool IsAvailable => false;
+
         public void ApplyMaskInPlace(TensorBase scores, TensorBase mask)
         {
             throw new NotImplementedException();

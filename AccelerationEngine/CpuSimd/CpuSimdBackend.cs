@@ -16,6 +16,7 @@ namespace SimpleTransformer.AccelerationEngine.CpuSimd
     {
         public string Name => "CpuSimd (System.Numerics.Vector)";
         public bool IsGpuAccelerated => false;
+        public bool IsAvailable => true;
 
         #region Element-wise operations
 
