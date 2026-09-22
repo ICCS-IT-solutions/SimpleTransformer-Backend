@@ -36,11 +36,17 @@ namespace SimpleTransformer.Model
             switch (Rank)
             {
                 case 1:
+                    // Rank-1/2 tensors are a single "layer": report Layers = 1 so
+                    // plain Tensors match TensorView (which always sets _layers = 1
+                    // for rank < 3). Leaving this 0 made Layers-based shape checks
+                    // reject valid Tensor + TensorView pairs (e.g. MHA backward).
+                    _layers = 1;
                     _cols = shape[0];
                     _stride = _cols;
                     break;
 
                 case 2:
+                    _layers = 1;
                     _rows = shape[0];
                     _cols = shape[1];
                     _stride = _cols;

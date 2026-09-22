@@ -372,6 +372,13 @@ void main() {
         private Fence _fence;
         private CommandBuffer _cmd;
         private bool _disposed;
+        // The launcher owns process-wide Vulkan state that must not be touched
+        // concurrently: a single reusable command buffer + fence, the command
+        // pool, the descriptor pool/cache and the device queue. Callers like
+        // QLoRA's Parallel.For batches dispatch from multiple threads, so every
+        // dispatch path is serialized on this gate. SubmitAndWait blocks on a
+        // fence anyway, so no GPU-side parallelism is lost by this.
+        private readonly object _dispatchGate = new();
 
         /// <summary>Distinct descriptor sets currently held by the cache.</summary>
         public int CachedDescriptorSetCount
@@ -571,24 +578,27 @@ void main() {
 
         public void Dispatch(VulkanKernel kernel, VulkanBuffer[] buffers, uint n, float alpha)
         {
-            DispatchCount++;
-            var vk = _ctx.Vk;
-            var layout = _layouts[kernel];
-            var setLayout = _setLayouts[kernel];
-            var pipeline = _pipelines[kernel];
+            lock (_dispatchGate)
+            {
+                DispatchCount++;
+                var vk = _ctx.Vk;
+                var layout = _layouts[kernel];
+                var setLayout = _setLayouts[kernel];
+                var pipeline = _pipelines[kernel];
 
-            DescriptorSet set = AllocateAndBind(buffers, setLayout);
-            // Phase 4: one persistent command buffer, reset+re-recorded per
-            // dispatch instead of vkAllocate/vkFreeCommandBuffers every op.
-            CommandBuffer cmd = BeginRecording();
-            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-            var push = new PushConstants { N = n, Alpha = alpha };
-            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 8, &push);
-            uint groups = (n + 255) / 256;
-            vk.CmdDispatch(cmd, groups, 1, 1);
-            vk.EndCommandBuffer(cmd);
-            SubmitAndWait(cmd);
+                DescriptorSet set = AllocateAndBind(buffers, setLayout);
+                // Phase 4: one persistent command buffer, reset+re-recorded per
+                // dispatch instead of vkAllocate/vkFreeCommandBuffers every op.
+                CommandBuffer cmd = BeginRecording();
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new PushConstants { N = n, Alpha = alpha };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 8, &push);
+                uint groups = (n + 255) / 256;
+                vk.CmdDispatch(cmd, groups, 1, 1);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
         }
 
         public void DispatchMatMul(
@@ -604,30 +614,33 @@ void main() {
             bool transposeB,
             bool accumulate)
         {
-            DispatchCount++;
-            var vk = _ctx.Vk;
-            var layout = _layouts[kernel];
-            var setLayout = _setLayouts[kernel];
-            var pipeline = _pipelines[kernel];
-
-            DescriptorSet set = AllocateAndBind(new[] { a, b, r }, setLayout);
-            CommandBuffer cmd = BeginRecording();
-            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-            var push = new MatMulPushConstants
+            lock (_dispatchGate)
             {
-                M = m, N = n, K = k, Batch = batch,
-                TransposeA = transposeA ? 1u : 0u,
-                TransposeB = transposeB ? 1u : 0u,
-                Accumulate = accumulate ? 1u : 0u,
-                Pad = 0
-            };
-            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 32, &push);
-            uint gx = (n + 15) / 16;
-            uint gy = (m + 15) / 16;
-            vk.CmdDispatch(cmd, gx, gy, batch);
-            vk.EndCommandBuffer(cmd);
-            SubmitAndWait(cmd);
+                DispatchCount++;
+                var vk = _ctx.Vk;
+                var layout = _layouts[kernel];
+                var setLayout = _setLayouts[kernel];
+                var pipeline = _pipelines[kernel];
+
+                DescriptorSet set = AllocateAndBind(new[] { a, b, r }, setLayout);
+                CommandBuffer cmd = BeginRecording();
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new MatMulPushConstants
+                {
+                    M = m, N = n, K = k, Batch = batch,
+                    TransposeA = transposeA ? 1u : 0u,
+                    TransposeB = transposeB ? 1u : 0u,
+                    Accumulate = accumulate ? 1u : 0u,
+                    Pad = 0
+                };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 32, &push);
+                uint gx = (n + 15) / 16;
+                uint gy = (m + 15) / 16;
+                vk.CmdDispatch(cmd, gx, gy, batch);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
         }
 
         public void DispatchRowwise(
@@ -638,22 +651,25 @@ void main() {
             float epsilon = 0f,
             uint flags = 0)
         {
-            DispatchCount++;
-            var vk = _ctx.Vk;
-            var layout = _layouts[kernel];
-            var setLayout = _setLayouts[kernel];
-            var pipeline = _pipelines[kernel];
+            lock (_dispatchGate)
+            {
+                DispatchCount++;
+                var vk = _ctx.Vk;
+                var layout = _layouts[kernel];
+                var setLayout = _setLayouts[kernel];
+                var pipeline = _pipelines[kernel];
 
-            DescriptorSet set = AllocateAndBind(buffers, setLayout);
-            CommandBuffer cmd = BeginRecording();
-            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-            var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = epsilon, Flags = flags };
-            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
-            uint groups = (rows + 255) / 256;
-            vk.CmdDispatch(cmd, groups, 1, 1);
-            vk.EndCommandBuffer(cmd);
-            SubmitAndWait(cmd);
+                DescriptorSet set = AllocateAndBind(buffers, setLayout);
+                CommandBuffer cmd = BeginRecording();
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = epsilon, Flags = flags };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
+                uint groups = (rows + 255) / 256;
+                vk.CmdDispatch(cmd, groups, 1, 1);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
         }
 
         public void DispatchTranspose(
@@ -662,21 +678,24 @@ void main() {
             uint rows,
             uint cols)
         {
-            DispatchCount++;
-            var vk = _ctx.Vk;
-            var layout = _layouts[VulkanKernel.Transpose];
-            var setLayout = _setLayouts[VulkanKernel.Transpose];
-            var pipeline = _pipelines[VulkanKernel.Transpose];
+            lock (_dispatchGate)
+            {
+                DispatchCount++;
+                var vk = _ctx.Vk;
+                var layout = _layouts[VulkanKernel.Transpose];
+                var setLayout = _setLayouts[VulkanKernel.Transpose];
+                var pipeline = _pipelines[VulkanKernel.Transpose];
 
-            DescriptorSet set = AllocateAndBind(new[] { src, dst }, setLayout);
-            CommandBuffer cmd = BeginRecording();
-            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
-            var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = 0f, Flags = 0 };
-            vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
-            vk.CmdDispatch(cmd, (cols + 15) / 16, (rows + 15) / 16, 1);
-            vk.EndCommandBuffer(cmd);
-            SubmitAndWait(cmd);
+                DescriptorSet set = AllocateAndBind(new[] { src, dst }, setLayout);
+                CommandBuffer cmd = BeginRecording();
+                vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = 0f, Flags = 0 };
+                vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
+                vk.CmdDispatch(cmd, (cols + 15) / 16, (rows + 15) / 16, 1);
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
         }
 
         private DescriptorSet AllocateAndBind(VulkanBuffer[] buffers, DescriptorSetLayout setLayout)

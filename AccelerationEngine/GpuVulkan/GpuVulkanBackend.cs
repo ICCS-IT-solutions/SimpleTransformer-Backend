@@ -1,4 +1,5 @@
 using System;
+using SimpleTransformer.AccelerationEngine.Common;
 using SimpleTransformer.AccelerationEngine.CpuReference;
 using SimpleTransformer.Model;
 
@@ -307,7 +308,9 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         {
             if (target.Rank != source.Rank || target.Layers != source.Layers ||
                 target.Rows != source.Rows || target.Cols != source.Cols)
-                throw new ArgumentException("Shape mismatch.");
+                throw new ArgumentException(
+                    $"RunBinaryInPlace shape mismatch: target {TensorValidation.DescribeShape(target)}" +
+                    $" vs source {TensorValidation.DescribeShape(source)}.");
 
             if (_launcher == null)
             {
@@ -345,7 +348,10 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (a.Rank != b.Rank || a.Layers != b.Layers || a.Rows != b.Rows || a.Cols != b.Cols ||
                 a.Rank != result.Rank || a.Layers != result.Layers ||
                 a.Rows != result.Rows || a.Cols != result.Cols)
-                throw new ArgumentException("Shape mismatch.");
+                throw new ArgumentException(
+                    $"RunBinaryInto shape mismatch: a {TensorValidation.DescribeShape(a)}," +
+                    $" b {TensorValidation.DescribeShape(b)}," +
+                    $" result {TensorValidation.DescribeShape(result)}.");
 
             if (_launcher == null)
             {
@@ -768,7 +774,8 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         private static void ValidateSame(TensorBase a, TensorBase b, string op)
         {
             if (a.Rank != b.Rank || a.Layers != b.Layers || a.Rows != b.Rows || a.Cols != b.Cols)
-                throw new ArgumentException($"{op}: shape mismatch.");
+                throw new ArgumentException(
+                    $"{op}: shape mismatch ({TensorValidation.DescribeShape(a)} vs {TensorValidation.DescribeShape(b)}).");
         }
 
         private static void ValidateNorm(TensorBase t, TensorBase gamma, TensorBase beta, string op)
