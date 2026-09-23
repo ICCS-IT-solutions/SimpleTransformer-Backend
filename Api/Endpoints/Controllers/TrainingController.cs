@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using SimpleTransformer.Api.Endpoints.Services;
 using SimpleTransformer.Api.Requests;
 using SimpleTransformer.Api.Responses;
+using SimpleTransformer.AppDb;
 using SimpleTransformer.Model;
 using SimpleTransformer.Model.Tokenizer;
 
@@ -48,6 +49,13 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         public async Task<ApiResponse<List<TrainingProgressResponse>>> GetTrainingJobs()
         {
             return await _trainingService.GetTrainingJobs();
+        }
+
+        //Available checkpoints for the "previous checkpoint" picker in the frontend.
+        [HttpGet("api/v1/train/checkpoints")]
+        public async Task<ApiResponse<List<TrainingCheckpointEntry>>> GetCheckpoints()
+        {
+            return await _trainingService.GetCheckpoints();
         }
 
         //Pause, resume and cancel jobs

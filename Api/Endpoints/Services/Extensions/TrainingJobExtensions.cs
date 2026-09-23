@@ -152,28 +152,30 @@ public static class TrainingJobExtensions
                         var transformerModelName = await GetModelNameFromId(dbFactory, modelEntry.EntryId);
                         var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-temp.bin";
                         var checkpointDirname = $"checkpoints/{transformerModelName}";
-                        var checkpointEntry = new TrainingCheckpointEntry
-                        {
-                            Epoch = epoch + 1,
-                            Loss = epochLoss,
-                            Filename = checkpointFilename,
-                            Filepath = $"checkpoints/{transformerModelName}/"
-                        };
+                        Directory.CreateDirectory(checkpointDirname);
 
-                        await db.TrainingCheckpoints.AddAsync(checkpointEntry);
-                        await db.SaveChangesAsync();
-                    
                         string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
 
-                        if (!Directory.Exists(checkpointDirname))
+                        await using (var stream = File.Create(checkpointFilepath))
                         {
-                            Directory.CreateDirectory(checkpointDirname);
+                            model.SaveCheckpoint(stream, epoch, epochLoss);
                         }
 
-                        await using var stream = File.Create(checkpointFilepath);
+                        //The temp checkpoint file is overwritten in place, so upsert a single
+                        //DB record per file instead of inserting a new row after every batch.
+                        var checkpointEntry = await UpsertCheckpointAsync(
+                            db,
+                            $"checkpoints/{transformerModelName}/",
+                            checkpointFilename,
+                            epoch + 1,
+                            epochLoss,
+                            new FileInfo(checkpointFilepath).Length);
 
-                        model.SaveCheckpoint(stream, epoch, epochLoss);
-                        await UpdateJob(dbFactory, job.EntryId, job => {job.CheckpointFilename = checkpointFilepath; job.TrainingCheckpointId = checkpointEntry.EntryId;});
+                        await UpdateJob(dbFactory, job.EntryId, job =>
+                        {
+                            job.CheckpointFilename = checkpointFilepath;
+                            job.TrainingCheckpointId = checkpointEntry.EntryId;
+                        });
                     }
                 }
                 else
@@ -235,22 +237,25 @@ public static class TrainingJobExtensions
                     var transformerModelName = await GetModelNameFromId(dbFactory, modelEntry.EntryId);
                     var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-loss-{epochLoss:F6}.bin";
                     var checkpointDirname = $"checkpoints/{transformerModelName}";
-                    var checkpointEntry = new TrainingCheckpointEntry
-                    {
-                        Epoch = epoch + 1,
-                        Loss = epochLoss,
-                        Filename = checkpointFilename,
-                        Filepath = $"checkpoints/{transformerModelName}/"
-                    };
+                    Directory.CreateDirectory(checkpointDirname);
 
-                    await db.TrainingCheckpoints.AddAsync(checkpointEntry);
-                    await db.SaveChangesAsync();
-                    
                     string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
-                    
-                    await using var stream = File.Create(checkpointFilepath);
-                    model.SaveCheckpoint(stream, epoch, epochLoss);
-                    
+
+                    await using (var stream = File.Create(checkpointFilepath))
+                    {
+                        model.SaveCheckpoint(stream, epoch, epochLoss);
+                    }
+
+                    //Filenames are deterministic, so upsert to guarantee one record per file
+                    //(a resumed run can recreate the same epoch/loss filename).
+                    var checkpointEntry = await UpsertCheckpointAsync(
+                        db,
+                        $"checkpoints/{transformerModelName}/",
+                        checkpointFilename,
+                        epoch + 1,
+                        epochLoss,
+                        new FileInfo(checkpointFilepath).Length);
+
                     await UpdateJob(dbFactory, job.EntryId, job =>
                     {
                         job.CheckpointFilename = checkpointFilepath;
@@ -310,6 +315,40 @@ public static class TrainingJobExtensions
 
         await db.TrainingJobs.AddAsync(jobEntry);
         await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Ensures exactly one TrainingCheckpointEntry exists per checkpoint file:
+    /// the record is looked up by (Filepath, Filename) and updated in place,
+    /// or created when the file is seen for the first time.
+    /// </summary>
+    private static async Task<TrainingCheckpointEntry> UpsertCheckpointAsync(
+        AppDbContext db,
+        string filepath,
+        string filename,
+        int epoch,
+        float loss,
+        long fileSize)
+    {
+        var entry = await db.TrainingCheckpoints
+            .FirstOrDefaultAsync(x => x.Filepath == filepath && x.Filename == filename);
+
+        if (entry == null)
+        {
+            entry = new TrainingCheckpointEntry
+            {
+                Filename = filename,
+                Filepath = filepath
+            };
+            await db.TrainingCheckpoints.AddAsync(entry);
+        }
+
+        entry.Epoch = epoch;
+        entry.Loss = loss;
+        entry.FileSize = fileSize;
+
+        await db.SaveChangesAsync();
+        return entry;
     }
 
     public static async Task UpdateJob(

@@ -30,6 +30,12 @@ namespace SimpleTransformer.AppDb
             modelBuilder.Entity<TrainingConfigEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TransformerConfigEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TrainingCheckpointEntry>().HasKey(x => x.EntryId);
+
+            //One record per checkpoint file on disk: the temp checkpoint is
+            //overwritten in place, so (Filepath, Filename) must be unique.
+            modelBuilder.Entity<TrainingCheckpointEntry>()
+                .HasIndex(x => new { x.Filepath, x.Filename })
+                .IsUnique();
             modelBuilder.Entity<VocabularyEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TrainingConfigPresetEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TransformerConfigPresetEntry>().HasKey(x => x.EntryId);

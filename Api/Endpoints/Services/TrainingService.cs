@@ -692,6 +692,30 @@ namespace SimpleTransformer.Api.Endpoints.Services
             });
         }
 
+        //Checkpoints for the frontend "previous checkpoint" list box. Only
+        //entries whose file still exists on disk are returned, newest first.
+        public async Task<ApiResponse<List<TrainingCheckpointEntry>>> GetCheckpoints()
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync();
+
+            var entries = await db.TrainingCheckpoints
+                .AsNoTracking()
+                .OrderByDescending(x => x.DateCreated)
+                .ToListAsync();
+
+            entries = entries
+                .Where(x => File.Exists(Path.Combine(x.Filepath, x.Filename)))
+                .ToList();
+
+            return new ApiResponse<List<TrainingCheckpointEntry>>
+            {
+                Message = "Checkpoints found.",
+                Status = ResponseStatus.Success,
+                StatusCode = 200,
+                Data = entries
+            };
+        }
+
         public async Task<ApiResponse<List<TrainingProgressResponse>>> GetTrainingJobs()
         {
             await using var _db = await _dbFactory.CreateDbContextAsync();
