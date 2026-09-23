@@ -25,6 +25,34 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public bool IsAvailable { get; private set; }
 
         private bool _disposed;
+        private bool _supportsProperties2;
+        private bool _memoryBudgetEnabled;
+
+        //VK_API_VERSION_1_1 = (major << 22) | (minor << 12)
+        private const uint ApiVersion11 = (1u << 22) | (1u << 12);
+
+        private const string MemoryBudgetExtensionName = "VK_EXT_memory_budget";
+
+        /// <summary>
+        /// Largest DEVICE_LOCAL heap of the chosen device - the card's VRAM
+        /// (8 GiB on an RX 5700 XT). 0 when the device reports none.
+        /// </summary>
+        public ulong DeviceLocalHeapSizeBytes { get; private set; }
+
+        /// <summary>Heap index the VRAM figures refer to; uint.MaxValue when none.</summary>
+        public uint DeviceLocalHeapIndex { get; private set; } = uint.MaxValue;
+
+        /// <summary>True when the driver's live budget (VK_EXT_memory_budget) is enabled.</summary>
+        public bool MemoryBudgetSupported => _memoryBudgetEnabled;
+
+        /// <summary>
+        /// Driver budget for this process on the VRAM heap (0 = unknown). Can sit
+        /// below the heap size when other apps or the OS hold memory.
+        /// </summary>
+        public ulong DeviceLocalBudgetBytes { get; private set; }
+
+        /// <summary>Bytes this process currently holds on the VRAM heap (0 = unknown).</summary>
+        public ulong DeviceLocalUsageBytes { get; private set; }
 
         public bool TryInitialize()
         {
@@ -35,6 +63,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     return false;
                 CreateLogicalDevice();
                 CreateCommandPool();
+                DetectDeviceMemory();
                 IsAvailable = true;
                 return true;
             }
@@ -58,7 +87,9 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 ApplicationVersion = Vk.Version10,
                 PEngineName = (byte*)engineName.AsPtr<byte>(),
                 EngineVersion = Vk.Version10,
-                ApiVersion = Vk.Version10
+                //Vulkan 1.1 unlocks vkGetPhysicalDeviceMemoryProperties2, which is
+                //how the live VRAM budget (VK_EXT_memory_budget) is queried.
+                ApiVersion = ApiVersion11
             };
 
             var createInfo = new InstanceCreateInfo
@@ -68,6 +99,18 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             };
 
             Result result = Vk.CreateInstance(in createInfo, null, out Instance);
+            if (result == Result.Success)
+            {
+                _supportsProperties2 = true;
+            }
+            else
+            {
+                //A 1.0-only driver is still useful: the fixed heap size (total VRAM)
+                //stays detectable, only the live budget query is lost.
+                appInfo.ApiVersion = Vk.Version10;
+                result = Vk.CreateInstance(in createInfo, null, out Instance);
+            }
+
             if (result != Result.Success)
                 throw new InvalidOperationException($"vkCreateInstance failed: {result}");
             Vk.CurrentInstance = Instance;
@@ -170,12 +213,121 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PQueueCreateInfos = &queueInfo
             };
 
-            Result result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
+            //VK_EXT_memory_budget exposes the driver's live per-heap budget/usage
+            //(what is actually free right now) instead of only the fixed heap size.
+            //It is a device extension, so it must be requested here.
+            bool budgetRequested = false;
+            Result result;
+
+            if (_supportsProperties2 && DeviceSupportsExtension(MemoryBudgetExtensionName))
+            {
+                using var extName = SilkMarshal.StringToMemory(MemoryBudgetExtensionName);
+                byte** extList = stackalloc byte*[1];
+                extList[0] = (byte*)extName.AsPtr<byte>();
+
+                createInfo.EnabledExtensionCount = 1;
+                createInfo.PpEnabledExtensionNames = extList;
+                budgetRequested = true;
+
+                result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
+            }
+            else
+            {
+                result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
+            }
+
+            if (result != Result.Success && budgetRequested)
+            {
+                //The driver listed the extension but refused the device with it
+                //enabled; retry without it rather than losing the GPU entirely.
+                createInfo.EnabledExtensionCount = 0;
+                createInfo.PpEnabledExtensionNames = null;
+                budgetRequested = false;
+                result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
+            }
+
             if (result != Result.Success)
                 throw new InvalidOperationException($"vkCreateDevice failed: {result}");
 
+            _memoryBudgetEnabled = budgetRequested;
+
             Vk.CurrentDevice = Device;
             Vk.GetDeviceQueue(Device, QueueFamilyIndex, 0, out Queue);
+        }
+
+        /// <summary>True when the chosen device reports the named extension.</summary>
+        private bool DeviceSupportsExtension(string extensionName)
+        {
+            uint count = 0;
+            //Explicit byte* casts: Silk also offers string-marshalling overloads
+            //and a bare null would be ambiguous between the two.
+            if (Vk.EnumerateDeviceExtensionProperties(PhysicalDevice, (byte*)null, &count, (ExtensionProperties*)null) != Result.Success ||
+                count == 0)
+                return false;
+
+            var extensions = new ExtensionProperties[count];
+            fixed (ExtensionProperties* ptr = extensions)
+            {
+                if (Vk.EnumerateDeviceExtensionProperties(PhysicalDevice, (byte*)null, &count, ptr) != Result.Success)
+                    return false;
+
+                for (uint i = 0; i < count; i++)
+                {
+                    //ExtensionName is the first field of ExtensionProperties
+                    //(char[VK_MAX_EXTENSION_NAME_SIZE] in vk.xml), so the struct's
+                    //address is the string's address.
+                    var name = SilkMarshal.PtrToString((nint)(&ptr[i]), NativeStringEncoding.UTF8);
+                    if (name == extensionName)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Detects the device-local (VRAM) heap size and, when VK_EXT_memory_budget
+        /// is enabled, the driver's live budget and this process's usage on it.
+        /// Called once during initialization after the device is created.
+        /// </summary>
+        private void DetectDeviceMemory()
+        {
+            Vk.GetPhysicalDeviceMemoryProperties(PhysicalDevice, out PhysicalDeviceMemoryProperties props);
+
+            ulong bestSize = 0;
+            uint bestIndex = uint.MaxValue;
+            for (uint i = 0; i < props.MemoryHeapCount; i++)
+            {
+                var heap = props.MemoryHeaps[(int)i];
+                if (heap.Flags.HasFlag(MemoryHeapFlags.DeviceLocalBit) && heap.Size > bestSize)
+                {
+                    bestSize = heap.Size;
+                    bestIndex = i;
+                }
+            }
+
+            DeviceLocalHeapSizeBytes = bestSize;
+            DeviceLocalHeapIndex = bestIndex;
+
+            if (!_memoryBudgetEnabled || bestIndex == uint.MaxValue)
+                return;
+
+            //VK_EXT_memory_budget: budget/usage are fixed ulong[VK_MAX_MEMORY_HEAPS]
+            //arrays inside the extension struct, filled by the chained query.
+            var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT
+            {
+                SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt
+            };
+            var info = new PhysicalDeviceMemoryProperties2
+            {
+                SType = StructureType.PhysicalDeviceMemoryProperties2,
+                PNext = &budget
+            };
+
+            Vk.GetPhysicalDeviceMemoryProperties2(PhysicalDevice, &info);
+
+            DeviceLocalBudgetBytes = budget.HeapBudget[(int)bestIndex];
+            DeviceLocalUsageBytes = budget.HeapUsage[(int)bestIndex];
         }
 
         private void CreateCommandPool()
@@ -322,6 +474,12 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     : "host        ";
                 Console.WriteLine($"    heap {i}: {kind} {heap.Size / 1024.0 / 1024.0,8:F0} MiB");
             }
+
+            Console.WriteLine($"  VRAM: {DeviceLocalHeapSizeBytes / 1024.0 / 1024.0:F0} MiB" +
+                (MemoryBudgetSupported
+                    ? $", driver budget {DeviceLocalBudgetBytes / 1024.0 / 1024.0:F0} MiB" +
+                      $", used by this process {DeviceLocalUsageBytes / 1024.0 / 1024.0:F0} MiB"
+                    : " (live budget unavailable: VK_EXT_memory_budget not enabled)"));
 
             Console.WriteLine($"  memory types ({props.MemoryTypeCount}):");
             for (uint i = 0; i < props.MemoryTypeCount; i++)

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using SimpleTransformer.Api.Responses;
 using SimpleTransformer.Model;
 using SimpleTransformer.AccelerationEngine;
+using SimpleTransformer.AccelerationEngine.GpuVulkan;
 
 namespace SimpleTransformer.Api.Endpoints.Services
 {
@@ -33,6 +34,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
                         using var backend = BackendSelector.SelectBackend(Enum.Parse<BackendSelector.BackendType>(n));
                         available = backend.IsAvailable;
                         description = backend.Name;
+
+                        //Surface the detected VRAM/budget so the frontend shows
+                        //how much GPU memory this machine actually has.
+                        if (backend is GpuVulkanBackend gpu && gpu.IsAvailable)
+                            description = $"{backend.Name} | {gpu.GpuMemoryInfo} | {gpu.HostStagingInfo}";
                     }
                     catch
                     {

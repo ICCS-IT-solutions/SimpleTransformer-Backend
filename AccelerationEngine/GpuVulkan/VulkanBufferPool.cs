@@ -18,11 +18,28 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         private readonly Dictionary<int, Stack<VulkanBuffer>> _buckets = new();
         private readonly List<VulkanBuffer> _all = new();
         private readonly object _gate = new();
+        private readonly ulong _deviceLocalBudgetBytes;
+        private readonly ulong _hostBudgetBytes;
+        private ulong _deviceLocalRetainedBytes;
+        private ulong _hostRetainedBytes;
         private bool _disposed;
 
-        public VulkanBufferPool(VulkanContext ctx)
+        /// <param name="ctx">Vulkan context the buffers live in.</param>
+        /// <param name="deviceLocalBudgetBytes">
+        /// Cap on retained DEVICE_LOCAL (VRAM) bytes (0 = unlimited). Idle VRAM
+        /// buffers are evicted to stay under it; rented ones are never touched.
+        /// </param>
+        /// <param name="hostBudgetBytes">
+        /// Cap on retained host-visible (system RAM) bytes (0 = unlimited).
+        /// Without this the pool - every size bucket ever created, kept until
+        /// process exit - is the one unmanaged consumer that could grow into the
+        /// rest of the machine's RAM over a long training run.
+        /// </param>
+        public VulkanBufferPool(VulkanContext ctx, ulong deviceLocalBudgetBytes = 0, ulong hostBudgetBytes = 0)
         {
             _ctx = ctx;
+            _deviceLocalBudgetBytes = deviceLocalBudgetBytes;
+            _hostBudgetBytes = hostBudgetBytes;
         }
 
         public VulkanBuffer Rent(int floatCount)
@@ -35,10 +52,84 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
                 var buffer = new VulkanBuffer(_ctx, (ulong)(bucket * 4));
                 if (buffer.IsDeviceLocal)
+                {
                     AnyDeviceLocal = true;
+                    _deviceLocalRetainedBytes += buffer.SizeBytes;
+
+                    //Keep retained VRAM under the detected/configured budget by
+                    //dropping idle buffers first (this new one is not pooled yet).
+                    if (_deviceLocalBudgetBytes > 0 &&
+                        _deviceLocalRetainedBytes > _deviceLocalBudgetBytes)
+                        EvictIdleOverBudget(deviceLocalTier: true);
+                }
+                else
+                {
+                    _hostRetainedBytes += buffer.SizeBytes;
+
+                    //Same guard for system RAM: the host tier is where every
+                    //per-op staging buffer lands today, and it used to be unbounded.
+                    if (_hostBudgetBytes > 0 &&
+                        _hostRetainedBytes > _hostBudgetBytes)
+                        EvictIdleOverBudget(deviceLocalTier: false);
+                }
                 WorkingMemoryTypeIndex ??= buffer.ChosenMemoryTypeIndex;
                 _all.Add(buffer);
                 return buffer;
+            }
+        }
+
+        /// <summary>Live retained bytes for one tier. Callers hold _gate.</summary>
+        private ulong RetainedBytes(bool deviceLocalTier) =>
+            deviceLocalTier ? _deviceLocalRetainedBytes : _hostRetainedBytes;
+
+        private void RemoveLiveLocked(VulkanBuffer buffer)
+        {
+            _all.Remove(buffer);
+            if (buffer.IsDeviceLocal)
+                _deviceLocalRetainedBytes -= buffer.SizeBytes;
+            else
+                _hostRetainedBytes -= buffer.SizeBytes;
+        }
+
+        /// <summary>
+        /// Frees idle buffers of one tier until its retained bytes fit the budget.
+        /// Must be called with _gate held; only buffers sitting in the buckets
+        /// (i.e. not currently rented) are candidates, and the other tier's
+        /// buckets keep their LIFO order.
+        /// </summary>
+        private void EvictIdleOverBudget(bool deviceLocalTier)
+        {
+            ulong budget = deviceLocalTier ? _deviceLocalBudgetBytes : _hostBudgetBytes;
+            if (budget == 0)
+                return;
+
+            foreach (var stack in _buckets.Values)
+            {
+                if (RetainedBytes(deviceLocalTier) <= budget)
+                    break;
+
+                if (stack.Count == 0)
+                    continue;
+
+                //Drain the bucket, disposing only the tier that is over budget,
+                //then push the survivors back with their order intact.
+                var keep = new List<VulkanBuffer>(stack.Count);
+                while (stack.Count > 0 && RetainedBytes(deviceLocalTier) > budget)
+                {
+                    var candidate = stack.Pop();
+                    if (candidate.IsDeviceLocal == deviceLocalTier)
+                    {
+                        RemoveLiveLocked(candidate);
+                        candidate.Dispose();
+                    }
+                    else
+                    {
+                        keep.Add(candidate);
+                    }
+                }
+
+                for (int i = keep.Count - 1; i >= 0; i--)
+                    stack.Push(keep[i]);
             }
         }
 

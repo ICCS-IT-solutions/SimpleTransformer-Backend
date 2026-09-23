@@ -21,6 +21,14 @@ namespace SimpleTransformer.Api
             {
                 _configManager.LoadFromFile("config/config.ini");
 
+                //GPU (VRAM) budget for the Vulkan backend: 0/absent = auto-detect
+                //from the driver when the first backend is constructed. The host
+                //staging budget guards system RAM the same way.
+                AccelerationEngine.GpuVulkan.VulkanMemorySettings.BudgetBytesOverride =
+                    _configManager.GetAs<long>("memory_budget_mb", 0, "Vulkan") * 1024L * 1024L;
+                AccelerationEngine.GpuVulkan.VulkanMemorySettings.HostBudgetBytesOverride =
+                    _configManager.GetAs<long>("host_memory_budget_mb", 0, "Vulkan") * 1024L * 1024L;
+
                 SQLitePCL.Batteries.Init();
 
                 var builder = WebApplication.CreateBuilder();

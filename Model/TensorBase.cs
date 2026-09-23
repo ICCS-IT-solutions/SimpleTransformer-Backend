@@ -1,5 +1,3 @@
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-
 namespace SimpleTransformer.Model
 {
     public abstract class TensorBase : IDisposable

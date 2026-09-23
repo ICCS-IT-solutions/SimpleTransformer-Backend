@@ -39,6 +39,22 @@ namespace SimpleTransformer
             // Vulkan heap/memory-type diagnostic: dotnet run -c Release -- --vulkan-meminfo
             if (args.Contains("--vulkan-meminfo"))
             {
+                //Apply the same config override the server would, so the probe
+                //reports the effective budget in real use.
+                try
+                {
+                    var cfg = new Config.ConfigManager();
+                    cfg.LoadFromFile("config/config.ini");
+                    AccelerationEngine.GpuVulkan.VulkanMemorySettings.BudgetBytesOverride =
+                        cfg.GetAs<long>("memory_budget_mb", 0, "Vulkan") * 1024L * 1024L;
+                    AccelerationEngine.GpuVulkan.VulkanMemorySettings.HostBudgetBytesOverride =
+                        cfg.GetAs<long>("host_memory_budget_mb", 0, "Vulkan") * 1024L * 1024L;
+                }
+                catch
+                {
+                    //No config available - auto-detect.
+                }
+
                 using var probe = new SimpleTransformer.AccelerationEngine.GpuVulkan.GpuVulkanBackend();
                 probe.LogMemoryInfo();
                 Environment.Exit(0);

@@ -21,6 +21,106 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
         private bool _disposed;
 
+        private static int _memoryInfoLogged;
+
+        /// <summary>
+        /// Detected VRAM facts plus the cap actually in force, e.g.
+        /// "VRAM 8192 MiB, driver budget 7900 MiB, used by us 140 MiB, effective cap 7900 MiB".
+        /// "n/a" when no Vulkan device was initialised.
+        /// </summary>
+        public string GpuMemoryInfo { get; private set; } = "n/a";
+
+        /// <summary>
+        /// Effective cap in bytes for DEVICE_LOCAL (VRAM) allocations: the config
+        /// override when set, else the driver's live budget, else the heap size.
+        /// The buffer pool keeps retained VRAM under this.
+        /// </summary>
+        public ulong GpuMemoryBudgetBytes { get; private set; }
+
+        /// <summary>
+        /// Effective cap in bytes for host-visible staging buffers (system RAM):
+        /// the config override when set, else a quarter of physical RAM clamped
+        /// to [1 GiB, 8 GiB]. The pool keeps retained host buffers under this,
+        /// so Vulkan staging can never exhaust system memory.
+        /// </summary>
+        public ulong HostStagingBudgetBytes { get; private set; }
+
+        /// <summary>Human-readable host-staging budget, e.g. "host staging cap 8192 MiB of 32768 MiB system RAM (auto)".</summary>
+        public string HostStagingInfo { get; private set; } = "n/a";
+
+        /// <summary>
+        /// Auto policy for the host (system RAM) staging pool: a quarter of
+        /// physical RAM clamped to [1 GiB, 8 GiB]. On a 32 GiB machine that is
+        /// 8 GiB - a hard ceiling that leaves 24 GiB for the OS, the Vulkan
+        /// driver and the GC heap holding the model and optimizer state, so the
+        /// unmanaged pool can never exhaust system RAM no matter how long a run
+        /// gets or how many distinct tensor sizes it touches.
+        /// </summary>
+        private static ulong ComputeHostStagingBudget()
+        {
+            long overrideBytes = VulkanMemorySettings.HostBudgetBytesOverride;
+            if (overrideBytes > 0)
+                return (ulong)overrideBytes;
+
+            long totalRam = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            if (totalRam <= 0)
+                return 1UL << 30;
+
+            return Math.Clamp((ulong)totalRam / 4UL, 1UL << 30, 8UL << 30);
+        }
+
+        private static string DescribeHostStaging(ulong budget)
+        {
+            const double mib = 1024.0 * 1024.0;
+            long totalRam = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            bool overridden = VulkanMemorySettings.HostBudgetBytesOverride > 0;
+            return $"host staging cap {budget / mib:F0} MiB of {totalRam / mib:F0} MiB system RAM" +
+                (overridden ? " (config override)" : " (auto)");
+        }
+
+        /// <summary>
+        /// Effective VRAM cap for one context: an explicit override is clamped to
+        /// what the hardware/driver actually offers; auto uses the live driver
+        /// budget when present, otherwise the fixed device-local heap size.
+        /// </summary>
+        private static ulong ComputeVramBudget(VulkanContext ctx)
+        {
+            ulong available = ctx.MemoryBudgetSupported && ctx.DeviceLocalBudgetBytes > 0
+                ? ctx.DeviceLocalBudgetBytes
+                : ctx.DeviceLocalHeapSizeBytes;
+
+            long overrideBytes = VulkanMemorySettings.BudgetBytesOverride;
+            if (overrideBytes <= 0)
+                return available;
+
+            //The override is a cap, never a licence to exceed the hardware: clamp
+            //it to the heap (and to the driver budget when that is tighter).
+            ulong cap = Math.Min((ulong)overrideBytes, ctx.DeviceLocalHeapSizeBytes);
+            if (ctx.MemoryBudgetSupported && ctx.DeviceLocalBudgetBytes > 0)
+                cap = Math.Min(cap, ctx.DeviceLocalBudgetBytes);
+            return cap;
+        }
+
+        private static string DescribeGpuMemory(VulkanContext ctx, ulong effectiveBudget)
+        {
+            const double mib = 1024.0 * 1024.0;
+            string description = $"VRAM {ctx.DeviceLocalHeapSizeBytes / mib:F0} MiB";
+
+            if (ctx.MemoryBudgetSupported)
+            {
+                description +=
+                    $", driver budget {ctx.DeviceLocalBudgetBytes / mib:F0} MiB" +
+                    $", used by us {ctx.DeviceLocalUsageBytes / mib:F0} MiB";
+            }
+            else
+            {
+                description += ", live budget unavailable (VK_EXT_memory_budget not enabled)";
+            }
+
+            return $"{description}, effective cap {effectiveBudget / mib:F0} MiB" +
+                (VulkanMemorySettings.BudgetBytesOverride > 0 ? " (config override)" : " (auto)");
+        }
+
         public GpuVulkanBackend()
         {
             var ctx = new VulkanContext();
@@ -37,7 +137,18 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 _ctx = ctx;
                 _compiler = compiler;
                 _launcher = launcher;
-                _pool = new VulkanBufferPool(ctx);
+
+                GpuMemoryBudgetBytes = ComputeVramBudget(ctx);
+                GpuMemoryInfo = DescribeGpuMemory(ctx, GpuMemoryBudgetBytes);
+                HostStagingBudgetBytes = ComputeHostStagingBudget();
+                HostStagingInfo = DescribeHostStaging(HostStagingBudgetBytes);
+                _pool = new VulkanBufferPool(ctx, GpuMemoryBudgetBytes, HostStagingBudgetBytes);
+
+                //One line per process so repeated backend probes (the /backends
+                //endpoint constructs one) do not spam the log.
+                if (Interlocked.Exchange(ref _memoryInfoLogged, 1) == 0)
+                    Console.WriteLine(
+                        $"[GpuVulkan] {ctx.DeviceName}: {GpuMemoryInfo} | {HostStagingInfo}");
             }
             catch (Exception ex)
             {
@@ -119,6 +230,11 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             Console.WriteLine($"Device: {_ctx.DeviceName}");
             _ctx.LogMemoryProperties();
+            Console.WriteLine($"VRAM budget: {GpuMemoryInfo}");
+            Console.WriteLine($"System RAM: {HostStagingInfo}");
+            Console.WriteLine(
+                $"Effective cap for VRAM allocations: {GpuMemoryBudgetBytes / 1024.0 / 1024.0:F0} MiB " +
+                $"(memory_budget_mb={(VulkanMemorySettings.BudgetBytesOverride > 0 ? (VulkanMemorySettings.BudgetBytesOverride / 1024 / 1024).ToString() : "0 = auto")})");
             Console.WriteLine();
 
             // The per-op cost is dominated by the host<->device round trip, so
