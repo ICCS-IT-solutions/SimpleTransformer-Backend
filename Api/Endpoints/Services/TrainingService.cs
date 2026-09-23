@@ -208,8 +208,6 @@ namespace SimpleTransformer.Api.Endpoints.Services
             await db.TrainingJobs.AddAsync(job);
             await db.SaveChangesAsync();
 
-            var control = _jobManager.GetOrCreate(job.EntryId);
-
             return new ApiResponse<TrainingResponse>
             {
                 Message = "Training job created successfully.",
@@ -235,17 +233,29 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            if (!_jobManager.TryGet(jobId, out var control))
+            if (TrainingJobExtensions.IsTerminalStatus(job.Status))
             {
                 return new ApiResponse<TrainingProgressResponse>
                 {
-                    Message = "Training job is not currently running.",
+                    Message = $"Training job is {job.Status} and cannot be paused.",
                     Status = ResponseStatus.Failure,
                     StatusCode = 409
                 };
             }
 
-            control!.Pause();
+            if (!_jobManager.TryGet(jobId, out var control) ||
+                control is null ||
+                !control.HasLiveLoop)
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training job is not currently running in this process.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
+            control.Pause();
 
             job.Status = TrainingJobStatus.Paused;
             job.Message = "Training job paused.";
@@ -278,30 +288,43 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            if (!_jobManager.TryGet(jobId, out var control))
+            //Fast path: the loop is still alive in this process (an ordinary pause),
+            //so resuming is just releasing the pause latch.
+            if (_jobManager.TryGet(jobId, out var control) &&
+                control is { IsStopped: false } &&
+                !control.Cancellation.IsCancellationRequested &&
+                control.HasLiveLoop)
+            {
+                control.Resume();
+
+                job.Status = TrainingJobStatus.Running;
+                job.Message = "Training job resumed.";
+                job.DateUpdated = DateTime.UtcNow;
+
+                await db.SaveChangesAsync();
+
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training job resumed successfully.",
+                    Status = ResponseStatus.Success,
+                    StatusCode = 200
+                };
+            }
+
+            //No loop survives a process restart (nor a stop or cancel), so the run
+            //has to be rebuilt: that is exactly what starting the job does, and it
+            //reloads the latest checkpoint, so both paths share one implementation.
+            if (TrainingJobExtensions.IsTerminalStatus(job.Status))
             {
                 return new ApiResponse<TrainingProgressResponse>
                 {
-                    Message = "Training job is not currently running.",
+                    Message = $"Training job is {job.Status} and cannot be resumed. Use Start to run it again from its latest checkpoint.",
                     Status = ResponseStatus.Failure,
                     StatusCode = 409
                 };
             }
 
-            control!.Resume();
-
-            job.Status = TrainingJobStatus.Running;
-            job.Message = "Training job resumed.";
-            job.DateUpdated = DateTime.UtcNow;
-
-            await db.SaveChangesAsync();
-
-            return new ApiResponse<TrainingProgressResponse>
-            {
-                Message = "Training job resumed successfully.",
-                Status = ResponseStatus.Success,
-                StatusCode = 200
-            };
+            return await StartTrainingJob(jobId);
         }
 
         public async Task<ApiResponse<TrainingProgressResponse>> StopTrainingJob(Guid jobId)
@@ -321,32 +344,30 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            if (!_jobManager.TryGet(jobId, out var control))
+            //Stop in memory only stops a live loop. When the backend restarted (or
+            //the loop already wound down) there is nothing to signal, so the row is
+            //still marked Stopped instead of 409ing a no-op.
+            if (_jobManager.TryGet(jobId, out var control) &&
+                control is { } &&
+                control.HasLiveLoop)
             {
-                return new ApiResponse<TrainingProgressResponse>
-                {
-                    Message = "Training job is not currently running.",
-                    Status = ResponseStatus.Failure,
-                    StatusCode = 409
-                };
+                control.Stop();
             }
 
-            control!.Stop();
-
             job.Status = TrainingJobStatus.Stopped;
-            job.Message = "Training job stopping...";
+            job.Message = "Training job stopped. It can be resumed from its latest checkpoint.";
+            job.DateCompleted = DateTime.UtcNow;
             job.DateUpdated = DateTime.UtcNow;
 
             await db.SaveChangesAsync();
 
             return new ApiResponse<TrainingProgressResponse>
             {
-                Message = "Training job stop requested.",
+                Message = "Training job stopped.",
                 Status = ResponseStatus.Success,
                 StatusCode = 200
             };
         }
-
 
         public async Task<ApiResponse<TrainingProgressResponse>> CancelTrainingJob(Guid jobId)
         {
@@ -361,7 +382,20 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     StatusCode = 404
                 };
 
+            if (_jobManager.TryGet(jobId, out var control) && control != null)
+            {
+                control.Stop();
+                _jobManager.Remove(jobId);
+            }
+
+            //Stop in memory only stops the loop; the status in the database has
+            //to follow or the job keeps reading as running forever.
             job.Status = TrainingJobStatus.Cancelled;
+            job.Message = "Training job cancelled.";
+            job.DateCompleted = DateTime.UtcNow;
+            job.DateUpdated = DateTime.UtcNow;
+            await db.SaveChangesAsync();
+
             return new ApiResponse<TrainingProgressResponse>
             {
                 Message = "Training job cancelled successfully.",
@@ -387,9 +421,13 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            // Don't start a job that is already running.
-            if (job.Status == TrainingJobStatus.Running ||
-                job.Status == TrainingJobStatus.Started)
+            // Don't start a job whose loop is still alive in this process. A stale
+            // database row (e.g. Running left behind by a restart) must not block
+            // the relaunch because the reconciliation moves such rows to Paused.
+            if (_jobManager.TryGet(job.EntryId, out var existingControl) &&
+                existingControl is { IsStopped: false } &&
+                !existingControl.Cancellation.IsCancellationRequested &&
+                existingControl.HasLiveLoop)
             {
                 return new ApiResponse<TrainingProgressResponse>
                 {
@@ -414,7 +452,47 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            if (!modelEntry.IsLoaded)
+            if (!modelEntry.IsLoaded && _modelManager.LoadedModelId != modelEntry.EntryId)
+            {
+                try
+                {
+                    await _modelManager.LoadModelAsync(modelEntry.EntryId);
+                }
+                catch (Exception ex)
+                {
+                    return new ApiResponse<TrainingProgressResponse>
+                    {
+                        Message = $"Failed to load model {modelEntry.Name}: {ex.Message}",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 500
+                    };
+                }
+
+                await using var loadDb = await _dbFactory.CreateDbContextAsync();
+                var loadedEntry = await loadDb.TransformerModels
+                    .FirstOrDefaultAsync(x => x.EntryId == modelEntry.EntryId);
+
+                if (loadedEntry != null)
+                {
+                    var stale = await loadDb.TransformerModels
+                        .Where(x => x.IsLoaded && x.EntryId != loadedEntry.EntryId)
+                        .ToListAsync();
+
+                    foreach (var entry in stale)
+                    {
+                        entry.IsLoaded = false;
+                    }
+
+                    loadedEntry.IsLoaded = true;
+                    loadedEntry.DateUpdated = DateTime.UtcNow;
+                    await loadDb.SaveChangesAsync();
+                }
+
+                //Refresh the tracked row above so the guards below see the load.
+                await db.Entry(modelEntry).ReloadAsync();
+            }
+
+            if (!modelEntry.IsLoaded && _modelManager.LoadedModelId != modelEntry.EntryId)
             {
                 return new ApiResponse<TrainingProgressResponse>
                 {
@@ -477,68 +555,93 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             int startEpoch = 0;
 
-            var control = _jobManager.GetOrCreate(job.EntryId);
+            //Resume shares the launch with Start. Reloads (or a duplicate click)
+            //can otherwise hand the new loop yesterday's cancelled token, so the
+            //run always starts on a fresh guard.
+            var control = _jobManager.Reset(job.EntryId);
 
-            // Resume from the job's previous checkpoint.
-            if (job.PreviousCheckpointId.HasValue)
+            //Resume from the job's known checkpoint, falling back to the newest
+            //surviving checkpoint file when the old pointer no longer resolves.
+            var resumeCheckpoint =
+                await TrainingJobExtensions.ResolveResumeCheckpointAsync(
+                    db, job.EntryId, job.TransformerModelId);
+
+            if (resumeCheckpoint != null)
             {
-                var checkpoint = await db.TrainingCheckpoints
-                    .FirstOrDefaultAsync(x =>
-                        x.EntryId == job.PreviousCheckpointId.Value);
-
-                if (checkpoint == null)
-                {
-                    return new ApiResponse<TrainingProgressResponse>
-                    {
-                        Message = "Previous training checkpoint not found.",
-                        Status = ResponseStatus.Failure,
-                        StatusCode = 404
-                    };
-                }
-
-                if (!File.Exists(
-                        Path.Combine(checkpoint.Filepath, checkpoint.Filename)))
-                {
-                    return new ApiResponse<TrainingProgressResponse>
-                    {
-                        Message = "Previous training checkpoint file could not be found.",
-                        Status = ResponseStatus.Failure,
-                        StatusCode = 404
-                    };
-                }
-
                 var checkpointPath =
-                    Path.Combine(checkpoint.Filepath, checkpoint.Filename);
+                    Path.Combine(resumeCheckpoint.Filepath, resumeCheckpoint.Filename);
 
                 await UpdateJob(job.EntryId, job =>
                 {
                     job.Message = "Loading previous checkpoint...";
-                    job.PreviousCheckpointId = checkpoint.EntryId;
+                    job.PreviousCheckpointId = resumeCheckpoint.EntryId;
+                    job.DateUpdated = DateTime.UtcNow;
                 });
 
                 Log.Information(
                     "Loading training state from checkpoint: {Path}",
                     checkpointPath);
 
-                await using var stream = File.OpenRead(checkpointPath);
-
-                var (savedEpoch, savedLoss) =
-                    TransformerModel.LoadCheckpoint(stream, model);
-
-                startEpoch = savedEpoch + 1;
-
-                await UpdateJob(job.EntryId, job =>
+                try
                 {
-                    job.Message =
-                        $"Resuming training from epoch {startEpoch}.";
-                    job.CurrentEpoch = startEpoch;
-                    job.CurrentLoss = savedLoss;
-                });
+                    await using var stream = File.OpenRead(checkpointPath);
 
-                Log.Information(
-                    "Resuming training from Epoch {Epoch} (Last Loss: {Loss:F6})",
-                    startEpoch,
-                    savedLoss);
+                    var (savedEpoch, savedLoss) =
+                        TransformerModel.LoadCheckpoint(stream, model);
+
+                    startEpoch = savedEpoch + 1;
+
+                    await UpdateJob(job.EntryId, job =>
+                    {
+                        job.Message =
+                            $"Resuming training from epoch {startEpoch}.";
+                        job.CurrentEpoch = startEpoch;
+                        job.CurrentLoss = savedLoss;
+                        job.DateUpdated = DateTime.UtcNow;
+                    });
+
+                    Log.Information(
+                        "Resuming training from Epoch {Epoch} (Last Loss: {Loss:F6})",
+                        startEpoch,
+                        savedLoss);
+                }
+                catch (Exception ex)
+                {
+                    return new ApiResponse<TrainingProgressResponse>
+                    {
+                        Message = $"Could not load checkpoint {resumeCheckpoint.Filename}: {ex.Message}",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 500
+                    };
+                }
+            }
+            else if (job.PreviousCheckpointId.HasValue)
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Previous training checkpoint could not be found. Pick a different checkpoint or start the job from scratch.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 404
+                };
+            }
+
+            //A duplicate start click can otherwise orphan the current control while
+            //a live loop is still out there, so a real second run always wins with
+            //a 409 and the just-created spare guard is dropped again.
+            if (_jobManager.TryGet(job.EntryId, out var liveControl) &&
+                liveControl is { IsStopped: false } &&
+                !liveControl.Cancellation.IsCancellationRequested &&
+                liveControl.HasLiveLoop &&
+                !ReferenceEquals(liveControl, control))
+            {
+                _jobManager.Remove(job.EntryId);
+
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training job is already running.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
             }
 
             await UpdateJob(job.EntryId, job =>
@@ -546,19 +649,38 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 job.Status = TrainingJobStatus.Started;
                 job.DateStarted ??= DateTime.UtcNow;
                 job.Message = "Training job starting...";
+                job.DateUpdated = DateTime.UtcNow;
             });
 
-            await TrainingJobExtensions.RunTrainingLoop(
-                job: job,
-                model: model,
-                startEpoch: startEpoch,
-                config: config,
-                control: control,
-                modelEntry: modelEntry,
-                dbFactory: _dbFactory,
-                tokenizer: _tokenizer,
-                jobManager: _jobManager
-            );
+            //The loop runs detached so the POST returns immediately; unhandled
+            //faults are logged and the guard is released through the loop itself.
+            var trainingTask = Task.Run(() =>
+                TrainingJobExtensions.RunTrainingLoop(
+                    job: job,
+                    model: model,
+                    startEpoch: startEpoch,
+                    config: config,
+                    control: control,
+                    modelEntry: modelEntry,
+                    dbFactory: _dbFactory,
+                    tokenizer: _tokenizer,
+                    jobManager: _jobManager));
+
+            await trainingTask.ContinueWith(
+                task =>
+                {
+                    if (task.IsFaulted)
+                    {
+                        Log.Error(
+                            task.Exception,
+                            "Training job {JobId} faulted.",
+                            job.EntryId);
+                        _jobManager.Remove(job.EntryId);
+                    }
+                },
+                TaskScheduler.Default);
+
+            control.RunningTask = trainingTask;
 
             return new ApiResponse<TrainingProgressResponse>
             {
@@ -567,6 +689,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 StatusCode = 200
             };
         }
+
         public async Task<ApiResponse<TrainingProgressResponse>> DeleteTrainingJob(Guid jobId)
         {
             await using var db = await _dbFactory.CreateDbContextAsync();
@@ -580,6 +703,14 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     StatusCode = 404
                 };
 
+            //A deleted job must not keep a live loop (or a pause latch) behind,
+            //or its guard would leak into any job created with the same id.
+            if (_jobManager.TryGet(jobId, out var control) && control != null)
+            {
+                control.Stop();
+                _jobManager.Remove(jobId);
+            }
+
             db.TrainingJobs.Remove(job);
             await db.SaveChangesAsync();
             return new ApiResponse<TrainingProgressResponse>
@@ -589,6 +720,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 StatusCode = 200
             };
         }
+
         public async Task<ApiResponse<TrainingProgressResponse>> ResetTrainingJob(Guid jobId)
         {
             await using var db = await _dbFactory.CreateDbContextAsync();
@@ -602,7 +734,41 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     StatusCode = 404
                 };
 
+            if (_jobManager.TryGet(jobId, out var control) && control != null)
+            {
+                control.Stop();
+                _jobManager.Remove(jobId);
+            }
+
+            //Reset returns the row to a pristine Pending job. Without the save and
+            //the cleared counters the frontend kept showing the old progress.
             job.Status = TrainingJobStatus.Pending;
+            job.Message = "Training job reset.";
+            job.Error = string.Empty;
+
+            job.CurrentEpoch = 0;
+            job.EpochsCompleted = 0;
+            job.TotalEpochs = 0;
+
+            job.CurrentBatch = 0;
+            job.BatchesCompleted = 0;
+            job.TotalBatches = 0;
+
+            job.CurrentSubBatch = 0;
+            job.SubBatchesCompleted = 0;
+            job.TotalSubBatches = 0;
+
+            job.CurrentLoss = 0;
+            job.CheckpointFilename = string.Empty;
+            job.TrainingCheckpointId = null;
+            job.PreviousCheckpointId = null;
+
+            job.DateStarted = null;
+            job.DateCompleted = null;
+            job.DateUpdated = DateTime.UtcNow;
+
+            await db.SaveChangesAsync();
+
             return new ApiResponse<TrainingProgressResponse>
             {
                 Message = "Training job reset successfully.",

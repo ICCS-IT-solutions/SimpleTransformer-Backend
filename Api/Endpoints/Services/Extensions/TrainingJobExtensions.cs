@@ -9,6 +9,106 @@ using SimpleTransformer.Model.Tokenizer;
 
 public static class TrainingJobExtensions
 {
+    public static async Task ReconcileDbStateOnStartupAsync(
+        IDbContextFactory<AppDbContext> dbFactory)
+    {
+        Log.Information("Reconciling training runtime state after startup...");
+        await using var db = await dbFactory.CreateDbContextAsync();
+
+        //No runtime model survives a process restart, so any "loaded" flags
+        //left in the database are stale and would block a fresh load.
+        var loadedModels = await db.TransformerModels
+            .Where(x => x.IsLoaded)
+            .ToListAsync();
+        foreach (var modelEntry in loadedModels)
+        {
+            Log.Information(
+                "Clearing stale loaded flag for model {ModelId}.",
+                modelEntry.EntryId);
+            modelEntry.IsLoaded = false;
+            modelEntry.DateUpdated = DateTime.UtcNow;
+        }
+
+        //A job whose background loop is gone from memory is not training. Since
+        //TrainingJobManager is empty on startup, any live-looking state means the
+        //server was interrupted mid-run: return those jobs to Paused so they can
+        //be resumed from their latest checkpoint instead of rotting as
+        //"Running".
+        var interrupted = await db.TrainingJobs
+            .Where(x =>
+                x.Status == TrainingJobStatus.Started ||
+                x.Status == TrainingJobStatus.Running ||
+                x.Status == TrainingJobStatus.Pending)
+            .ToListAsync();
+        foreach (var jobEntry in interrupted)
+        {
+            Log.Information(
+                "Returning interrupted job {JobId} ({Status}) to Paused; no live training task survives a restart.",
+                jobEntry.EntryId, jobEntry.Status);
+            jobEntry.Status = TrainingJobStatus.Paused;
+            jobEntry.Message = "Server restarted while this job was active. It has been returned to Paused; resume it to continue from the latest checkpoint.";
+            jobEntry.DateUpdated = DateTime.UtcNow;
+        }
+
+        await db.SaveChangesAsync();
+    }
+
+    public static bool IsTerminalStatus(TrainingJobStatus status)
+    {
+        return status == TrainingJobStatus.Completed ||
+               status == TrainingJobStatus.Failed ||
+               status == TrainingJobStatus.Cancelled ||
+               status == TrainingJobStatus.Stopped;
+    }
+
+    public static async Task<TrainingCheckpointEntry?> ResolveResumeCheckpointAsync(
+        AppDbContext db,
+        Guid jobId,
+        Guid transformerModelId)
+    {
+        var jobEntry = await db.TrainingJobs
+            .FirstOrDefaultAsync(x => x.EntryId == jobId);
+
+        if (jobEntry == null)
+        {
+            return null;
+        }
+
+        //Prefer the checkpoint the job already points at; if that row is gone,
+        //fall back to the newest record whose file still exists on disk.
+        if (jobEntry.TrainingCheckpointId.HasValue)
+        {
+            var stored = await db.TrainingCheckpoints
+                .FirstOrDefaultAsync(x => x.EntryId == jobEntry.TrainingCheckpointId.Value);
+
+            if (stored != null && File.Exists(Path.Combine(stored.Filepath, stored.Filename)))
+            {
+                return stored;
+            }
+
+            Log.Warning(
+                "Training job {JobId} pointed at checkpoint {CheckpointId}, but the row or file is gone; falling back to the latest surviving checkpoint.",
+                jobId, jobEntry.TrainingCheckpointId);
+        }
+
+        var modelName = await db.TransformerModels
+            .Where(x => x.EntryId == transformerModelId)
+            .Select(x => x.Name)
+            .FirstOrDefaultAsync();
+
+        if (string.IsNullOrWhiteSpace(modelName))
+        {
+            return null;
+        }
+
+        var candidates = await db.TrainingCheckpoints
+            .Where(x => x.Filepath == $"checkpoints/{modelName}/")
+            .OrderByDescending(x => x.DateCreated)
+            .ToListAsync();
+
+        return candidates.FirstOrDefault(x =>
+            File.Exists(Path.Combine(x.Filepath, x.Filename)));
+    }
     public static async Task RunTrainingLoop(
         TrainingJobEntry job,
         TransformerModel model,
@@ -75,6 +175,13 @@ public static class TrainingJobExtensions
                 $"{numBatches} mini-batches ({totalOuterBatches} outer batches).";
         });
 
+        //Cancellation is scoped to this run. Stop and Cancel signal the job's
+        //control, and the loop observes it through this token; the linked source
+        //keeps a relaunch (which gets a fresh control) unaffected by older runs.
+        using var controlTokenSource =
+            CancellationTokenSource.CreateLinkedTokenSource(control.Cancellation.Token);
+        var controlToken = controlTokenSource.Token;
+
         // 1. Begin training. This notifies other endpoint services that the model is busy training and should not be used.
         model.BeginTraining();
         try
@@ -109,17 +216,20 @@ public static class TrainingJobExtensions
 
                     for (int batch = 0; batch < shuffledSubBatches.Count; batch++)
                     {
-                        await control.WaitIfPausedAsync();
+                        //Stop and cancel must break out of the batch loops, so
+                        //each waits/polls the same dedicated token the Stop and
+                        //Cancel endpoints signal.
+                        await control.WaitIfPausedAsync(controlTokenSource.Token);
 
-                        control.Cancellation.Token.ThrowIfCancellationRequested();
+                        controlTokenSource.Token.ThrowIfCancellationRequested();
 
                         var currentSubBatch = shuffledSubBatches[batch];
 
                         for (int subBatch = 0; subBatch < currentSubBatch.Count(); subBatch++)
                         {
-                            await control.WaitIfPausedAsync();
+                            await control.WaitIfPausedAsync(controlTokenSource.Token);
 
-                            control.Cancellation.Token.ThrowIfCancellationRequested();
+                            controlTokenSource.Token.ThrowIfCancellationRequested();
 
                             var item = currentSubBatch[subBatch];
                             epochLoss += model.TrainStep(item.Inputs, item.Targets);
@@ -190,6 +300,12 @@ public static class TrainingJobExtensions
                     });
                     for (int batch = 0; batch < numBatches; batch++)
                     {
+                        //Pause and stop have to be honoured on this path too, or a
+                        //small dataset would ignore both.
+                        await control.WaitIfPausedAsync(controlTokenSource.Token);
+
+                        controlTokenSource.Token.ThrowIfCancellationRequested();
+
                         var item = shuffledMiniBatches[batch];
                         epochLoss += model.TrainStep(item.Inputs, item.Targets);
                         stepsCompleted++;
@@ -268,26 +384,10 @@ public static class TrainingJobExtensions
                 }
             }
 
-            //End training normally
+            //Every epoch ran to completion: record success. Stopped or cancelled
+            //runs never reach this line because they throw out of the loops above.
             model.EndTraining();
-        }
-        catch (OperationCanceledException)
-        {
-            Log.Information(
-                "Training job {JobId} was stopped.",
-                job.EntryId);
 
-            await UpdateJob(dbFactory, job.EntryId, job =>
-            {
-                job.Status = TrainingJobStatus.Stopped;
-                job.Message = "Training job stopped.";
-                job.DateCompleted = DateTime.UtcNow;
-            });
-        }            
-        finally
-        {
-            //If something goes wrong, end training.
-            model.EndTraining();
             await UpdateJob(dbFactory, job.EntryId, job =>
             {
                 job.Status = TrainingJobStatus.Completed;
@@ -296,18 +396,49 @@ public static class TrainingJobExtensions
                 job.Message = "Model training completed successfully.";
                 job.DateCompleted = DateTime.UtcNow;
             });
+        }
+        catch (OperationCanceledException)
+        {
+            Log.Information(
+                "Training job {JobId} was stopped or cancelled.",
+                job.EntryId);
+
+            //Cancel records its own terminal status; a plain stop is recorded as
+            //Stopped. Either way a cancelled run must not be reported as completed.
+            await UpdateJob(dbFactory, job.EntryId, job =>
+            {
+                if (job.Status == TrainingJobStatus.Cancelled)
+                {
+                    job.Message = "Training job cancelled.";
+                    job.DateCompleted ??= DateTime.UtcNow;
+                    return;
+                }
+
+                job.Status = TrainingJobStatus.Stopped;
+                job.Message = "Training job stopped. It can be resumed from its latest checkpoint.";
+                job.DateCompleted = DateTime.UtcNow;
+            });
+        }
+        catch (Exception ex)
+        {
+            //Without this a faulting loop left the job reading as Running forever.
+            Log.Error(ex, "Training job {JobId} failed.", job.EntryId);
+
+            await UpdateJob(dbFactory, job.EntryId, job =>
+            {
+                job.Status = TrainingJobStatus.Failed;
+                job.Message = "Model training failed.";
+                job.Error = ex.Message;
+                job.DateCompleted = DateTime.UtcNow;
+            });
+        }
+        finally
+        {
+            //Training always ends, whatever the outcome, and the in-memory guard is
+            //released so the job can later be resumed (rebuilt from its checkpoint).
+            model.EndTraining();
             jobManager.Remove(job.EntryId);
         }
-
-        //Update the job status
-        await UpdateJob(dbFactory, job.EntryId, job =>
-        {
-            job.Status = TrainingJobStatus.Completed;
-            job.CurrentEpoch = totalEpochs;
-            job.CurrentBatch = job.TotalBatches;
-            job.Message = "Model training completed successfully.";
-            job.DateCompleted = DateTime.UtcNow;
-        });           
     }
     public static async Task RegisterJob(IDbContextFactory<AppDbContext> dbFactory, TrainingJobEntry jobEntry)
     {

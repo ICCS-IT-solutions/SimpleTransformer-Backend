@@ -16,6 +16,13 @@ namespace SimpleTransformer.Api.ManagementEngine
 
     public Task? RunningTask { get; set; }
 
+    /// <summary>
+    /// True while a training loop is still executing for this guard. After a
+    /// restart, a stop or a cancel there is no live loop, so the job has to be
+    /// relaunched (rebuilt from its checkpoint) instead of being un-paused.
+    /// </summary>
+    public bool HasLiveLoop => RunningTask is { IsCompleted: false };
+
     private static TaskCompletionSource<bool> CreateResumeSource()
     {
         return new TaskCompletionSource<bool>(
@@ -64,7 +71,7 @@ namespace SimpleTransformer.Api.ManagementEngine
         }
     }
 
-    public async Task WaitIfPausedAsync()
+    public async Task WaitIfPausedAsync(CancellationToken cancellationToken = default)
     {
         Task waitTask;
 
@@ -76,7 +83,9 @@ namespace SimpleTransformer.Api.ManagementEngine
             waitTask = _resumeSource.Task;
         }
 
-        await waitTask;
+        //Waiting only on the resume signal would leave a paused loop deaf to a
+        //stop or cancel, so cancellation releases the wait as well.
+        await waitTask.WaitAsync(cancellationToken);
     }
 }
 }

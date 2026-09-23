@@ -98,6 +98,12 @@ namespace SimpleTransformer.Api
                     DbContextConfiguration.InitializeDatabase(dbContext);
                 }
 
+                //A process restart loses every in-memory guard (training loops,
+                //loaded model), so move stale rows back to a state the UI can act
+                //on instead of leaving jobs reading Running forever.
+                TrainingJobExtensions.ReconcileDbStateOnStartupAsync(dbFactory)
+                    .GetAwaiter().GetResult();
+
                 app.UseCors("Frontend");
 
                 if (app.Environment.IsDevelopment())
