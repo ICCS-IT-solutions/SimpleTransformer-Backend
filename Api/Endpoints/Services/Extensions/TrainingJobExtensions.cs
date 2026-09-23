@@ -158,7 +158,7 @@ public static class TrainingJobExtensions
         var totalEpochs = startEpoch + (config?.Epochs ?? 10); // Default to 10 epochs if not specified
 
         //Update the job status
-        await UpdateJob(dbFactory, job.EntryId, job =>
+        await UpdateJobIfOwner(job =>
         {
             job.Status = TrainingJobStatus.Started;
             job.CurrentEpoch = startEpoch;
@@ -182,6 +182,22 @@ public static class TrainingJobExtensions
             CancellationTokenSource.CreateLinkedTokenSource(control.Cancellation.Token);
         var controlToken = controlTokenSource.Token;
 
+        //A superseded run (job stopped and relaunched) must not keep writing to the
+        //shared job row, or its terminal status would clobber the newer run's.
+        async Task UpdateJobIfOwner(Action<TrainingJobEntry> update)
+        {
+            if (!jobManager.TryGet(job.EntryId, out var currentControl) ||
+                !ReferenceEquals(currentControl, control))
+            {
+                Log.Information(
+                    "Skipping job {JobId} update: this training run was superseded by a newer one.",
+                    job.EntryId);
+                return;
+            }
+
+            await UpdateJob(dbFactory, job.EntryId, update);
+        }
+
         // 1. Begin training. This notifies other endpoint services that the model is busy training and should not be used.
         model.BeginTraining();
         try
@@ -194,7 +210,7 @@ public static class TrainingJobExtensions
                 // Single Random instance reused across the engine
                 var rng = new Random();
 
-                await UpdateJob(dbFactory, job.EntryId, job =>
+                await UpdateJobIfOwner(job =>
                 {
                     job.Status = TrainingJobStatus.Running;
                     job.CurrentEpoch = epoch + 1;
@@ -240,7 +256,7 @@ public static class TrainingJobExtensions
                             // CurrentLoss is the running mean of per-step loss so it
                             // matches the scale of the epoch-end average.
                             var runningMean = epochLoss / stepsCompleted;
-                            await UpdateJob(dbFactory, job.EntryId, job =>
+                            await UpdateJobIfOwner(job =>
                             {
                                 job.CurrentBatch = batch + 1;
                                 job.CurrentSubBatch = subBatch + 1;
@@ -281,7 +297,7 @@ public static class TrainingJobExtensions
                             epochLoss,
                             new FileInfo(checkpointFilepath).Length);
 
-                        await UpdateJob(dbFactory, job.EntryId, job =>
+                        await UpdateJobIfOwner(job =>
                         {
                             job.CheckpointFilename = checkpointFilepath;
                             job.TrainingCheckpointId = checkpointEntry.EntryId;
@@ -292,7 +308,7 @@ public static class TrainingJobExtensions
                 {   // Number of sub batches here is 1.
                     // Shuffle standard mini-batches ONCE per epoch
                     var shuffledMiniBatches = Shuffle(miniBatches.ToList(), rng);
-                    await UpdateJob(dbFactory, job.EntryId, job =>
+                    await UpdateJobIfOwner(job =>
                     {
                         job.Message = $"Shuffling batches (epoch {epoch + 1}/{totalEpochs}).";
                         job.TotalBatches = shuffledMiniBatches.Count;
@@ -313,7 +329,7 @@ public static class TrainingJobExtensions
                         // Persist after every batch so the frontend stays fresh here too
                         // (CurrentLoss = running mean, same scale as the epoch-end value).
                         var runningMean = epochLoss / stepsCompleted;
-                        await UpdateJob(dbFactory, job.EntryId, job =>
+                        await UpdateJobIfOwner(job =>
                         {
                             job.CurrentBatch = batch + 1;
                             job.CurrentSubBatch = 1;
@@ -335,7 +351,7 @@ public static class TrainingJobExtensions
                 epochLoss /= miniBatches.Count;
 
                 Log.Information($"Epoch {epoch + 1}: Loss={epochLoss:F6}");
-                await UpdateJob(dbFactory, job.EntryId, job =>
+                await UpdateJobIfOwner(job =>
                 {
                     job.CurrentEpoch = epoch + 1;
                     //TotalBatches is the outer-batch count in the >8 path and the
@@ -372,7 +388,7 @@ public static class TrainingJobExtensions
                         epochLoss,
                         new FileInfo(checkpointFilepath).Length);
 
-                    await UpdateJob(dbFactory, job.EntryId, job =>
+                    await UpdateJobIfOwner(job =>
                     {
                         job.CheckpointFilename = checkpointFilepath;
                         job.CurrentLoss = epochLoss;
@@ -388,7 +404,7 @@ public static class TrainingJobExtensions
             //runs never reach this line because they throw out of the loops above.
             model.EndTraining();
 
-            await UpdateJob(dbFactory, job.EntryId, job =>
+            await UpdateJobIfOwner(job =>
             {
                 job.Status = TrainingJobStatus.Completed;
                 job.CurrentEpoch = totalEpochs;
@@ -405,7 +421,7 @@ public static class TrainingJobExtensions
 
             //Cancel records its own terminal status; a plain stop is recorded as
             //Stopped. Either way a cancelled run must not be reported as completed.
-            await UpdateJob(dbFactory, job.EntryId, job =>
+            await UpdateJobIfOwner(job =>
             {
                 if (job.Status == TrainingJobStatus.Cancelled)
                 {
@@ -424,7 +440,7 @@ public static class TrainingJobExtensions
             //Without this a faulting loop left the job reading as Running forever.
             Log.Error(ex, "Training job {JobId} failed.", job.EntryId);
 
-            await UpdateJob(dbFactory, job.EntryId, job =>
+            await UpdateJobIfOwner(job =>
             {
                 job.Status = TrainingJobStatus.Failed;
                 job.Message = "Model training failed.";

@@ -2,3 +2,6 @@
 /bin
 *.bin
 *.log
+*.pid
+*.pid
+*.db-wal

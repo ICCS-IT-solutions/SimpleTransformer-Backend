@@ -421,9 +421,9 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            // Don't start a job whose loop is still alive in this process. A stale
-            // database row (e.g. Running left behind by a restart) must not block
-            // the relaunch because the reconciliation moves such rows to Paused.
+            //Don't start a job whose loop is still alive in this process. A stale
+            //database row (e.g. Running left behind by a restart) must not block the
+            //relaunch because the reconciliation moves such rows to Paused.
             if (_jobManager.TryGet(job.EntryId, out var existingControl) &&
                 existingControl is { IsStopped: false } &&
                 !existingControl.Cancellation.IsCancellationRequested &&
@@ -437,6 +437,37 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
+            //Preparing a run takes tens of seconds (model load + checkpoint read),
+            //and no loop is registered until it finishes. Without this reservation a
+            //duplicate click would start a second preparation and relaunch the job.
+            if (!_jobManager.TryBeginLaunch(job.EntryId))
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training job is already starting up. Wait for it to finish preparing.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
+            try
+            {
+                return await LaunchTrainingRunAsync(db, job);
+            }
+            finally
+            {
+                _jobManager.EndLaunch(job.EntryId);
+            }
+        }
+
+        /// <summary>
+        /// Prepares (model + optional checkpoint) and launches a training run for a
+        /// job that has already been checked and reserved by <see cref="StartTrainingJob"/>.
+        /// </summary>
+        private async Task<ApiResponse<TrainingProgressResponse>> LaunchTrainingRunAsync(
+            AppDbContext db,
+            TrainingJobEntry job)
+        {
             // Resolve the exact model this job targets (by id, not config id —
             // multiple models can share a transformer config).
             var modelEntry = await db.TransformerModels
@@ -451,6 +482,18 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     StatusCode = 404
                 };
             }
+
+            //Tell the UI what is happening before the slow part: loading the model
+            //and reading a checkpoint takes tens of seconds. The status is only
+            //flipped to Started once the run is genuinely about to launch, so a
+            //failed preparation leaves the job's previous status intact.
+            await UpdateJob(job.EntryId, j =>
+            {
+                j.DateStarted ??= DateTime.UtcNow;
+                j.Message = "Preparing training run (loading the model and checkpoint)...";
+                j.Error = string.Empty;
+                j.DateUpdated = DateTime.UtcNow;
+            });
 
             if (!modelEntry.IsLoaded && _modelManager.LoadedModelId != modelEntry.EntryId)
             {
@@ -514,6 +557,19 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
+            //One model instance cannot drive two runs: the tensors and workspace are
+            //shared state, so concurrent TrainStep calls would corrupt each other.
+            //After a stop the previous loop may still be winding down for a moment.
+            if (model.IsTraining)
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = $"Model {modelEntry.Name} is still tied up with another training run. If you just stopped one, wait a few seconds and start again.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
             // Validate the training source.
             if (string.IsNullOrWhiteSpace(job.InputText) &&
                 string.IsNullOrWhiteSpace(job.InputFilePath))
@@ -555,10 +611,18 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             int startEpoch = 0;
 
-            //Resume shares the launch with Start. Reloads (or a duplicate click)
-            //can otherwise hand the new loop yesterday's cancelled token, so the
-            //run always starts on a fresh guard.
-            var control = _jobManager.Reset(job.EntryId);
+            //Resume shares the launch with Start. A guard left over from a stopped
+            //run carries a cancelled token, so the new run gets a clean one; a live
+            //loop is never replaced because two loops would fight over the model.
+            if (!_jobManager.TryGetLaunchControl(job.EntryId, out var control))
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training job is already running.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
 
             //Resume from the job's known checkpoint, falling back to the newest
             //surviving checkpoint file when the old pointer no longer resolves.
@@ -666,7 +730,13 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     tokenizer: _tokenizer,
                     jobManager: _jobManager));
 
-            await trainingTask.ContinueWith(
+            //Register the loop immediately: the pause/resume/start guards all rely on
+            //control.RunningTask, and awaiting it here would block this POST for the
+            //whole training run.
+            control.RunningTask = trainingTask;
+
+            //Fire-and-forget fault logging only (the loop records its own errors).
+            _ = trainingTask.ContinueWith(
                 task =>
                 {
                     if (task.IsFaulted)
@@ -679,8 +749,6 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     }
                 },
                 TaskScheduler.Default);
-
-            control.RunningTask = trainingTask;
 
             return new ApiResponse<TrainingProgressResponse>
             {
