@@ -83,6 +83,7 @@ public static class TrainingJobExtensions
             for (int epoch = startEpoch; epoch < totalEpochs; epoch++)
             {
                 float epochLoss = 0f;
+                int stepsCompleted = 0;
                 // Single Random instance reused across the engine
                 var rng = new Random();
 
@@ -91,6 +92,7 @@ public static class TrainingJobExtensions
                     job.Status = TrainingJobStatus.Running;
                     job.CurrentEpoch = epoch + 1;
                     job.CurrentBatch = 0;
+                    job.CurrentSubBatch = 0;
                     job.CurrentLoss = 0;
                     job.Message = $"Training epoch {epoch + 1} of {totalEpochs}.";
                 });
@@ -111,20 +113,6 @@ public static class TrainingJobExtensions
 
                         control.Cancellation.Token.ThrowIfCancellationRequested();
 
-                        if ((batch + 1) % 5 == 0 ||
-                            batch == 0 ||
-                            batch == numBatches - 1)
-                        {
-                            await UpdateJob(dbFactory, job.EntryId, job =>
-                            {
-                                job.CurrentBatch = batch + 1;
-                                job.CurrentLoss = epochLoss;
-
-                                job.Message =
-                                    $"Epoch {epoch + 1}/{totalEpochs}, " +
-                                    $"batch {batch + 1}/{numBatches}.";
-                            });
-                        }
                         var currentSubBatch = shuffledSubBatches[batch];
 
                         for (int subBatch = 0; subBatch < currentSubBatch.Count(); subBatch++)
@@ -135,11 +123,26 @@ public static class TrainingJobExtensions
 
                             var item = currentSubBatch[subBatch];
                             epochLoss += model.TrainStep(item.Inputs, item.Targets);
+                            stepsCompleted++;
+
+                            // Persist after every sub-batch (one TrainStep) so the
+                            // frontend sees progress as fast as training actually moves.
+                            // CurrentLoss is the running mean of per-step loss so it
+                            // matches the scale of the epoch-end average.
+                            var runningMean = epochLoss / stepsCompleted;
+                            await UpdateJob(dbFactory, job.EntryId, job =>
+                            {
+                                job.CurrentBatch = batch + 1;
+                                job.CurrentSubBatch = subBatch + 1;
+                                job.CurrentLoss = runningMean;
+                                job.Message =
+                                    $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{shuffledSubBatches.Count}, " +
+                                    $"sub-batch {subBatch + 1}/{currentSubBatch.Count()} - loss {runningMean:F6}";
+                            });
 
                             // Correct parenthesis grouping for modulus
                             if ((subBatch + 1) % 4 == 0 || subBatch == 0)
                             {
-                                await UpdateJob(dbFactory, job.EntryId, job => job.CurrentSubBatch = subBatch + 1);
                                 Log.Information($"Epoch {epoch + 1}, Batch {batch + 1}, Sub-Batch {subBatch + 1} training loss: {epochLoss:F6}");
                             }
                         }
@@ -187,6 +190,19 @@ public static class TrainingJobExtensions
                     {
                         var item = shuffledMiniBatches[batch];
                         epochLoss += model.TrainStep(item.Inputs, item.Targets);
+                        stepsCompleted++;
+
+                        // Persist after every batch so the frontend stays fresh here too
+                        // (CurrentLoss = running mean, same scale as the epoch-end value).
+                        var runningMean = epochLoss / stepsCompleted;
+                        await UpdateJob(dbFactory, job.EntryId, job =>
+                        {
+                            job.CurrentBatch = batch + 1;
+                            job.CurrentSubBatch = 1;
+                            job.CurrentLoss = runningMean;
+                            job.Message =
+                                $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{numBatches} - loss {runningMean:F6}";
+                        });
 
                         // Correct parenthesis grouping for modulus
                         if ((batch + 1) % 10 == 0 || batch == 0)
@@ -204,7 +220,10 @@ public static class TrainingJobExtensions
                 await UpdateJob(dbFactory, job.EntryId, job =>
                 {
                     job.CurrentEpoch = epoch + 1;
-                    job.CurrentBatch = numBatches;
+                    //TotalBatches is the outer-batch count in the >8 path and the
+                    //mini-batch count in the small path - never the raw mini-batch
+                    //count here, or the frontend renders e.g. "229 / 29".
+                    job.CurrentBatch = job.TotalBatches;
                     job.CurrentLoss = epochLoss;
                     job.Message =
                         $"Epoch {epoch + 1} of {totalEpochs} completed.";

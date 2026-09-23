@@ -4,6 +4,9 @@ namespace SimpleTransformer.Api.Responses
     {
         public string JobId { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
+        //Live status line for the current update, e.g.
+        //"Epoch 1/20, batch 3/29, sub-batch 2/8 - loss 9.123456".
+        public string Message { get; set; } = string.Empty;
         //The model this job targets (id + name) so the frontend can show and
         //resolve the exact model definition the job belongs to.
         public string TransformerModelId { get; set; } = string.Empty;
