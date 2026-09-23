@@ -64,7 +64,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 SharingMode = SharingMode.Exclusive
             };
 
-            Result r = vk.CreateBuffer(ctx.Device, info, null, out Silk.NET.Vulkan.Buffer probe);
+            Result r = vk.CreateBuffer(ctx.Device, in info, null, out Silk.NET.Vulkan.Buffer probe);
             if (r != Result.Success)
                 throw new InvalidOperationException($"vkCreateBuffer (probe) failed: {r}");
             try
@@ -104,7 +104,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 SharingMode = SharingMode.Exclusive
             };
 
-            Result result = vk.CreateBuffer(ctx.Device, bufferInfo, null, out Handle);
+            Result result = vk.CreateBuffer(ctx.Device, in bufferInfo, null, out Handle);
             if (result != Result.Success)
                 throw new InvalidOperationException($"vkCreateBuffer failed: {result}");
 
@@ -120,7 +120,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 MemoryTypeIndex = memIndex
             };
 
-            result = vk.AllocateMemory(ctx.Device, allocInfo, null, out Memory);
+            result = vk.AllocateMemory(ctx.Device, in allocInfo, null, out Memory);
             if (result != Result.Success && forcedMemoryTypeIndex < 0)
             {
                 // Device-local host-visible heaps can be small (a 256 MiB BAR
@@ -128,7 +128,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 // before giving up.
                 memIndex = ctx.SelectMemoryType(req.MemoryTypeBits, preferHostCached: false);
                 allocInfo.MemoryTypeIndex = memIndex;
-                result = vk.AllocateMemory(ctx.Device, allocInfo, null, out Memory);
+                result = vk.AllocateMemory(ctx.Device, in allocInfo, null, out Memory);
             }
             if (result != Result.Success)
                 throw new InvalidOperationException($"vkAllocateMemory failed: {result}");

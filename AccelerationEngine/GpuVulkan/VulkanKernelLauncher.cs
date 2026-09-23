@@ -460,7 +460,7 @@ void main() {
                 PoolSizeCount = 1,
                 PPoolSizes = &poolSize
             };
-            Result r = _ctx.Vk.CreateDescriptorPool(_ctx.Device, poolInfo, null, out _pool);
+            Result r = _ctx.Vk.CreateDescriptorPool(_ctx.Device,in poolInfo, null, out _pool);
             if (r != Result.Success)
                 throw new InvalidOperationException($"pool failed: {r}");
         }
@@ -484,7 +484,7 @@ void main() {
                     PCode = (uint*)code
                 };
                 Result r = vk.CreateShaderModule(
-                    _ctx.Device, moduleInfo, null, out ShaderModule module);
+                    _ctx.Device, in moduleInfo, null, out ShaderModule module);
                 if (r != Result.Success)
                     throw new InvalidOperationException($"{kernel} module: {r}");
 
@@ -535,7 +535,7 @@ void main() {
                         PBindings = lb
                     };
                     Result r = vk.CreateDescriptorSetLayout(
-                        _ctx.Device, setInfo, null, out setLayout);
+                        _ctx.Device, in setInfo, null, out setLayout);
                     if (r != Result.Success)
                         throw new InvalidOperationException($"{kernel} setlayout: {r}");
                 }
@@ -555,7 +555,7 @@ void main() {
                     PPushConstantRanges = &pushRange
                 };
                 Result rl = vk.CreatePipelineLayout(
-                    _ctx.Device, pipeLayoutInfo, null, out PipelineLayout layout);
+                    _ctx.Device, in pipeLayoutInfo, null, out PipelineLayout layout);
                 if (rl != Result.Success)
                     throw new InvalidOperationException($"{kernel} pipelayout: {rl}");
 
@@ -566,7 +566,7 @@ void main() {
                     Layout = layout
                 };
                 Result rp = vk.CreateComputePipelines(
-                    _ctx.Device, default, 1, pipeInfo, null, out Pipeline pipeline);
+                    _ctx.Device, default, 1, in pipeInfo, null, out Pipeline pipeline);
                 if (rp != Result.Success)
                     throw new InvalidOperationException($"{kernel} pipeline: {rp}");
 
@@ -591,7 +591,7 @@ void main() {
                 // dispatch instead of vkAllocate/vkFreeCommandBuffers every op.
                 CommandBuffer cmd = BeginRecording();
                 vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, in set, 0, null);
                 var push = new PushConstants { N = n, Alpha = alpha };
                 vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 8, &push);
                 uint groups = (n + 255) / 256;
@@ -625,7 +625,7 @@ void main() {
                 DescriptorSet set = AllocateAndBind(new[] { a, b, r }, setLayout);
                 CommandBuffer cmd = BeginRecording();
                 vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, in set, 0, null);
                 var push = new MatMulPushConstants
                 {
                     M = m, N = n, K = k, Batch = batch,
@@ -662,7 +662,7 @@ void main() {
                 DescriptorSet set = AllocateAndBind(buffers, setLayout);
                 CommandBuffer cmd = BeginRecording();
                 vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, in set, 0, null);
                 var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = epsilon, Flags = flags };
                 vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
                 uint groups = (rows + 255) / 256;
@@ -689,7 +689,7 @@ void main() {
                 DescriptorSet set = AllocateAndBind(new[] { src, dst }, setLayout);
                 CommandBuffer cmd = BeginRecording();
                 vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
-                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, set, 0, null);
+                vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, in set, 0, null);
                 var push = new RowPushConstants { Rows = rows, Cols = cols, Epsilon = 0f, Flags = 0 };
                 vk.CmdPushConstants(cmd, layout, ShaderStageFlags.ComputeBit, 0, 16, &push);
                 vk.CmdDispatch(cmd, (cols + 15) / 16, (rows + 15) / 16, 1);
@@ -721,7 +721,7 @@ void main() {
                 DescriptorSetCount = 1,
                 PSetLayouts = &setLayout
             };
-            Result r = vk.AllocateDescriptorSets(_ctx.Device, allocInfo, out DescriptorSet set);
+            Result r = vk.AllocateDescriptorSets(_ctx.Device, in allocInfo, out DescriptorSet set);
             if (r != Result.Success)
             {
                 // Pool exhausted (more distinct binding tuples than MaxSets).
@@ -730,7 +730,7 @@ void main() {
                 vk.ResetDescriptorPool(_ctx.Device, _pool, 0);
                 DescriptorPoolRecycles++;
                 _setCache.Clear();
-                r = vk.AllocateDescriptorSets(_ctx.Device, allocInfo, out set);
+                r = vk.AllocateDescriptorSets(_ctx.Device, in allocInfo, out set);
                 if (r != Result.Success)
                     throw new InvalidOperationException($"alloc set: {r}");
                 UpdateBindings(set, buffers);
@@ -803,7 +803,7 @@ void main() {
                     Level = CommandBufferLevel.Primary,
                     CommandBufferCount = 1
                 };
-                Result r = vk.AllocateCommandBuffers(_ctx.Device, cmdAlloc, out _cmd);
+                Result r = vk.AllocateCommandBuffers(_ctx.Device, in cmdAlloc, out _cmd);
                 if (r != Result.Success)
                     throw new InvalidOperationException($"alloc cmd: {r}");
             }
@@ -817,32 +817,36 @@ void main() {
                 SType = StructureType.CommandBufferBeginInfo,
                 Flags = CommandBufferUsageFlags.OneTimeSubmitBit
             };
-            Result rb = vk.BeginCommandBuffer(_cmd, begin);
+            Result rb = vk.BeginCommandBuffer(_cmd, in begin);
             if (rb != Result.Success)
                 throw new InvalidOperationException($"begin cmd: {rb}");
             return _cmd;
         }
 
-        private void SubmitAndWait(CommandBuffer cmd)
+        private unsafe void SubmitAndWait(CommandBuffer cmd)
         {
             var vk = _ctx.Vk;
+
+            //Address issue with unsafe pointer here.
+            var localCmd = cmd;
+
             var submit = new SubmitInfo
             {
                 SType = StructureType.SubmitInfo,
                 CommandBufferCount = 1,
-                PCommandBuffers = &cmd
+                PCommandBuffers = &localCmd
             };
             if (_fence.Handle == 0)
             {
                 var fenceInfo = new FenceCreateInfo { SType = StructureType.FenceCreateInfo };
-                vk.CreateFence(_ctx.Device, fenceInfo, null, out _fence);
+                vk.CreateFence(_ctx.Device, in fenceInfo, null, out _fence);
             }
             else
             {
-                vk.ResetFences(_ctx.Device, 1, _fence);
+                vk.ResetFences(_ctx.Device, 1, in _fence);
             }
-            vk.QueueSubmit(_ctx.Queue, 1, submit, _fence);
-            vk.WaitForFences(_ctx.Device, 1, _fence, true, 10_000_000_000);
+            vk.QueueSubmit(_ctx.Queue, 1, in submit, _fence);
+            vk.WaitForFences(_ctx.Device, 1, in _fence, true, 10_000_000_000);
         }
 
         public void Dispose()
@@ -852,7 +856,7 @@ void main() {
             _disposed = true;
             if (_cmd.Handle != 0)
             {
-                _ctx.Vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, _cmd);
+                _ctx.Vk.FreeCommandBuffers(_ctx.Device, _ctx.CommandPool, 1, in _cmd);
                 _cmd = default;
             }
             if (_fence.Handle != 0)

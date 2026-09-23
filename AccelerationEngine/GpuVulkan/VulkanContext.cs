@@ -67,7 +67,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PApplicationInfo = &appInfo
             };
 
-            Result result = Vk.CreateInstance(createInfo, null, out Instance);
+            Result result = Vk.CreateInstance(in createInfo, null, out Instance);
             if (result != Result.Success)
                 throw new InvalidOperationException($"vkCreateInstance failed: {result}");
             Vk.CurrentInstance = Instance;
@@ -170,7 +170,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PQueueCreateInfos = &queueInfo
             };
 
-            Result result = Vk.CreateDevice(PhysicalDevice, createInfo, null, out Device);
+            Result result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
             if (result != Result.Success)
                 throw new InvalidOperationException($"vkCreateDevice failed: {result}");
 
@@ -183,11 +183,11 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             var poolInfo = new CommandPoolCreateInfo
             {
                 SType = StructureType.CommandPoolCreateInfo,
-                Flags = CommandPoolCreateFlags.CommandPoolCreateResetCommandBufferBit,
+                Flags = CommandPoolCreateFlags.ResetCommandBufferBit,
                 QueueFamilyIndex = QueueFamilyIndex
             };
 
-            Result result = Vk.CreateCommandPool(Device, poolInfo, null, out CommandPool);
+            Result result = Vk.CreateCommandPool(Device, in poolInfo, null, out CommandPool);
             if (result != Result.Success)
                 throw new InvalidOperationException($"vkCreateCommandPool failed: {result}");
         }
