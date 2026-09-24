@@ -148,6 +148,18 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 }
             }
 
+            //Switching models disposes the outgoing runtime model, so refuse while a
+            //training job owns it rather than corrupting the run.
+            if (_modelManager.IsLoadedModelTraining && runtimeLoadedId != model.EntryId)
+            {
+                return new ApiResponse<TransformerModelResponse>()
+                {
+                    Message = "Another model is in use by a training job. Stop that job and wait for it to finish before loading a different model.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
             // Construct the runtime model first: if construction fails the database
             // is left untouched and any previously loaded runtime model stays intact
             // (ModelManager only swaps after a successful build).
@@ -219,10 +231,20 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
-            //Dispose the runtime model when it is the one being unloaded.
+            //Dispose the runtime model when it is the one being unloaded. A live
+            //training job keeps it alive: unloading then would leave the loop
+            //holding disposed tensors and the job would die mid-step.
             if (_modelManager.LoadedModelId == model.EntryId)
             {
-                _modelManager.UnloadModel();
+                if (!_modelManager.UnloadModel())
+                {
+                    return new ApiResponse<TransformerModelResponse>()
+                    {
+                        Message = "This model is still in use by a training job. Stop the job and wait for it to finish before unloading it.",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 409
+                    };
+                }
             }
 
             model.IsLoaded = false;

@@ -40,6 +40,86 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             var random = new Random(1234);
 
+            // ---- VRAM-resident weights: register once, then run matmuls that
+            // bind the cached device copy instead of re-uploading per call ----
+            {
+                using var b = Rand(17, 13);
+                var referenceW = new Tensor(17, 13);
+                Array.Copy(b.Data, referenceW.Data, b.Data.Length);
+
+                //Weights read transposed live stored as [n, k], so they get
+                //their own resident copy (and exercise the multi-entry cache).
+                using var bT = Rand(13, 17);
+                var referenceWT = new Tensor(13, 17);
+                Array.Copy(bT.Data, referenceWT.Data, bT.Data.Length);
+
+                bool plainRegistered = gpu.TryRegisterResidentWeights(b, "selftest-weights");
+                bool transposedRegistered = gpu.TryRegisterResidentWeights(bT, "selftest-weights-t");
+
+                if (!plainRegistered || !transposedRegistered)
+                {
+                    Console.WriteLine("  [INFO] resident cache unavailable: skipping resident matmul checks.");
+                }
+                else
+                {
+                    void ResidentMatMulCase(string name, int m, bool tB)
+                    {
+                        using var a = Rand(m, 17);
+                        using var exp = new Tensor(m, 13);
+                        using var act = new Tensor(m, 13);
+                        reference.MatMul(a, tB ? referenceWT : referenceW, exp, false, tB);
+                        gpu.MatMul(a, tB ? bT : b, act, false, tB);
+                        Report(name, MaxDiff(exp, act), 2e-3f);
+                    }
+
+                    ResidentMatMulCase("Resident 12x17*17x13", 12, false);
+                    ResidentMatMulCase("Resident 5x17*13^T", 5, true);
+
+                    // A second registration of the same tensor must be a no-op.
+                    if (!gpu.TryRegisterResidentWeights(b, "selftest-weights") ||
+                        !gpu.TryRegisterResidentWeights(bT, "selftest-weights-t"))
+                        Report("Resident idempotent register", 1f, 0f);
+                    else
+                        Report("Resident idempotent register", 0f, 0f);
+
+                    Console.WriteLine(
+                        $"  [INFO] resident cache: {gpu.ResidentWeightCount} tensor(s), " +
+                        $"{gpu.ResidentWeightBytes} B (VRAM budget {gpu.GpuMemoryBudgetBytes} B)");
+
+                    gpu.ClearResidentWeights();
+
+                    if (gpu.ResidentWeightCount != 0 || gpu.ResidentWeightBytes != 0)
+                        Report("Resident clear", 1f, 0f);
+                    else
+                        Report("Resident clear", 0f, 0f);
+
+                    // Releasing one weight must free exactly that copy, and the
+                    // released tensor must fall back to the ordinary path rather
+                    // than binding the buffer that was just destroyed.
+                    if (gpu.TryRegisterResidentWeights(b, "selftest-weights") &&
+                        gpu.TryRegisterResidentWeights(bT, "selftest-weights-t"))
+                    {
+                        long bothBytes = gpu.ResidentWeightBytes;
+                        gpu.ReleaseResidentWeights(b);
+
+                        Report("Resident release one",
+                            gpu.ResidentWeightCount == 1 &&
+                            gpu.ResidentWeightBytes > 0 &&
+                            gpu.ResidentWeightBytes < bothBytes ? 0f : 1f, 0f);
+
+                        ResidentMatMulCase("Post-release 5x17*13^T", 5, true);
+                        ResidentMatMulCase("Post-release 12x17*17x13", 12, false);
+
+                        // Releasing the remainder, then releasing again, must be a
+                        // no-op rather than double-freeing.
+                        gpu.ReleaseResidentWeights(bT);
+                        gpu.ReleaseResidentWeights(bT);
+                        Report("Resident release all",
+                            gpu.ResidentWeightCount == 0 && gpu.ResidentWeightBytes == 0 ? 0f : 1f, 0f);
+                    }
+                }
+            }
+
             Tensor Rand(int rows, int cols)
             {
                 var t = new Tensor(rows, cols);

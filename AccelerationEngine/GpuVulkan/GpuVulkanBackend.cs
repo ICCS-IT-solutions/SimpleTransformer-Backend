@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using SimpleTransformer.AccelerationEngine.Common;
 using SimpleTransformer.AccelerationEngine.CpuReference;
 using SimpleTransformer.Model;
@@ -47,6 +48,212 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
         /// <summary>Human-readable host-staging budget, e.g. "host staging cap 8192 MiB of 32768 MiB system RAM (auto)".</summary>
         public string HostStagingInfo { get; private set; } = "n/a";
+
+        // ---- VRAM-resident weight cache ---------------------------------------
+        // Frozen base weights (the QLoRA matrices) are written once and read on
+        // every step. One device-local copy per backing array is kept so the
+        // matmul path binds VRAM directly instead of packing and re-uploading.
+        //
+        // Each entry holds a strong reference to its backing array, which is what
+        // makes the identity-hash key safe: while the entry exists the array is
+        // alive, so the CLR can never hand that hash to a different array and a
+        // lookup can never bind a stale device buffer to unrelated weights.
+
+        private sealed class ResidentWeight
+        {
+            public required float[] Backing;
+            public required int Offset;
+            public required int ElementCount;
+            public required VulkanBuffer Device;
+        }
+
+        private readonly Dictionary<long, List<ResidentWeight>> _residentWeights = new();
+        private readonly object _residentGate = new();
+        private bool _residentBudgetWarned;
+
+        /// <summary>Bytes of weights currently held in VRAM by the resident cache.</summary>
+        public long ResidentWeightBytes { get; private set; }
+
+        /// <summary>Number of tensors currently held in VRAM by the resident cache.</summary>
+        public int ResidentWeightCount { get; private set; }
+
+        /// <summary>
+        /// Uploads an immutable tensor into VRAM once. Later MatMul calls that use
+        /// the same backing array bind that buffer directly instead of packing and
+        /// uploading it again. Returns false when the tensor cannot be cached (no
+        /// Vulkan device, not a whole contiguous tensor, over the VRAM budget or
+        /// allocation failure); callers then simply pay the ordinary path.
+        /// </summary>
+        public bool TryRegisterResidentWeights(TensorBase tensor, string? name = null)
+        {
+            if (_launcher == null || _ctx == null || _pool == null)
+                return false;
+
+            //Only whole contiguous tensors: a strided view would need exactly the
+            //packing work this cache exists to avoid.
+            if (tensor.Offset != 0 || !tensor.IsContiguous)
+                return false;
+
+            int elementCount = tensor.Size;
+            if (elementCount <= 0)
+                return false;
+
+            long key = RuntimeHelpers.GetHashCode(tensor.Buffer);
+            lock (_residentGate)
+            {
+                if (TryFindResidentLocked(key, tensor.Buffer, tensor.Offset, elementCount, out _))
+                    return true; // already resident
+
+                ulong bytes = (ulong)elementCount * 4UL;
+
+                //Never exceed the detected/configured VRAM budget.
+                if (GpuMemoryBudgetBytes > 0 &&
+                    (ulong)ResidentWeightBytes + bytes > GpuMemoryBudgetBytes)
+                {
+                    WarnResidentBudgetOnce(name, bytes);
+                    return false;
+                }
+
+                var device = VulkanBuffer.TryCreateDeviceResident(_ctx, bytes);
+                if (device == null)
+                    return false;
+
+                VulkanBuffer? staging = null;
+                try
+                {
+                    staging = _pool.Rent(elementCount);
+                    staging.Upload(tensor.ReadOnlySpan[..elementCount]);
+                    _launcher.CopyBuffer(staging, device, bytes);
+                }
+                catch
+                {
+                    if (staging != null) _pool.Return(staging);
+                    device.Dispose();
+                    return false;
+                }
+                _pool.Return(staging);
+
+                if (!_residentWeights.TryGetValue(key, out var list))
+                {
+                    list = new List<ResidentWeight>(1);
+                    _residentWeights[key] = list;
+                }
+                list.Add(new ResidentWeight
+                {
+                    Backing = tensor.Buffer,
+                    Offset = tensor.Offset,
+                    ElementCount = elementCount,
+                    Device = device
+                });
+
+                ResidentWeightBytes += (long)bytes;
+                ResidentWeightCount++;
+
+                Console.WriteLine(
+                    $"[GpuVulkan] resident weights: '{name ?? "tensor"}' " +
+                    $"{elementCount * 4L / 1024.0 / 1024.0:F1} MiB -> VRAM " +
+                    $"(cache: {ResidentWeightBytes / 1024.0 / 1024.0:F0} MiB across {ResidentWeightCount} tensors)");
+                return true;
+            }
+        }
+
+        /// <summary>Drops every VRAM-resident weight copy, freeing the device memory.</summary>
+        public void ClearResidentWeights()
+        {
+            lock (_residentGate)
+            {
+                foreach (var list in _residentWeights.Values)
+                    foreach (var entry in list)
+                        entry.Device.Dispose();
+
+                _residentWeights.Clear();
+                ResidentWeightBytes = 0;
+                ResidentWeightCount = 0;
+            }
+        }
+
+        /// <summary>
+        /// Frees the VRAM copy cached for <paramref name="tensor"/>, if any. A layer
+        /// calls this when it is disposed, so unloading a model actually returns its
+        /// resident weights to the driver instead of holding them until the whole
+        /// backend shuts down. Safe to call for tensors that were never registered.
+        /// </summary>
+        public void ReleaseResidentWeights(TensorBase tensor)
+        {
+            if (tensor == null)
+                return;
+
+            long key = RuntimeHelpers.GetHashCode(tensor.Buffer);
+            lock (_residentGate)
+            {
+                if (!_residentWeights.TryGetValue(key, out var list))
+                    return;
+
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    var entry = list[i];
+                    if (!ReferenceEquals(entry.Backing, tensor.Buffer) ||
+                        entry.Offset != tensor.Offset)
+                        continue;
+
+                    entry.Device.Dispose();
+                    ResidentWeightBytes -= entry.ElementCount * 4L;
+                    ResidentWeightCount--;
+                    list.RemoveAt(i);
+                }
+
+                if (list.Count == 0)
+                    _residentWeights.Remove(key);
+            }
+        }
+
+        private bool TryFindResidentLocked(long key, float[] backing, int offset, int elementCount, out VulkanBuffer buffer)
+        {
+            buffer = null!;
+            if (!_residentWeights.TryGetValue(key, out var list))
+                return false;
+
+            foreach (var entry in list)
+            {
+                if (!ReferenceEquals(entry.Backing, backing) ||
+                    entry.Offset != offset ||
+                    entry.ElementCount != elementCount)
+                    continue;
+
+                //Never bind a released buffer: the kernel would read freed memory.
+                if (entry.Device.IsDisposed)
+                    continue;
+
+                buffer = entry.Device;
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>Resident buffer holding <paramref name="expectedElements"/> floats, if cached.</summary>
+        private bool TryGetResidentBuffer(TensorBase tensor, int expectedElements, out VulkanBuffer buffer)
+        {
+            buffer = null!;
+            if (ResidentWeightCount == 0)
+                return false;
+
+            long key = RuntimeHelpers.GetHashCode(tensor.Buffer);
+            lock (_residentGate)
+                return TryFindResidentLocked(key, tensor.Buffer, tensor.Offset, expectedElements, out buffer);
+        }
+
+        private void WarnResidentBudgetOnce(string? name, ulong bytes)
+        {
+            if (_residentBudgetWarned)
+                return;
+
+            _residentBudgetWarned = true;
+            Console.WriteLine(
+                $"[GpuVulkan] resident weights skipped for '{name}' ({bytes / 1024.0 / 1024.0:F0} MiB): " +
+                $"over the VRAM budget of {GpuMemoryBudgetBytes / 1024.0 / 1024.0:F0} MiB. " +
+                "Raise memory_budget_mb or free VRAM.");
+        }
 
         /// <summary>
         /// Auto policy for the host (system RAM) staging pool: a quarter of
@@ -232,6 +439,8 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             _ctx.LogMemoryProperties();
             Console.WriteLine($"VRAM budget: {GpuMemoryInfo}");
             Console.WriteLine($"System RAM: {HostStagingInfo}");
+            Console.WriteLine(
+                $"VRAM-resident weights: {ResidentWeightBytes / 1024.0 / 1024.0:F0} MiB across {ResidentWeightCount} tensors");
             Console.WriteLine(
                 $"Effective cap for VRAM allocations: {GpuMemoryBudgetBytes / 1024.0 / 1024.0:F0} MiB " +
                 $"(memory_budget_mb={(VulkanMemorySettings.BudgetBytesOverride > 0 ? (VulkanMemorySettings.BudgetBytesOverride / 1024 / 1024).ToString() : "0 = auto")})");
@@ -530,30 +739,44 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 return;
             }
 
-            float[] fa = Pack(a);
-            float[] fb = Pack(b);
             int k = kA;
             int countA = RowCount(a) * a.Cols;
             int countB = RowCount(b) * b.Cols;
             int countR = RowCount(result) * result.Cols;
-            if (countA < fa.Length || countB < fb.Length)
-                throw new ArgumentException("MatMul operand pack size mismatch.");
             if (countR != batch * m * n)
                 throw new ArgumentException("MatMul result pack size mismatch.");
 
-            // Phase 4: pooled scratch + pooled buffers, no per-op allocation.
+            // Resident (VRAM) fast path: a frozen weight uploaded once is bound
+            // straight from VRAM, skipping both the pack and the host upload that
+            // the ordinary path does per call.
+            bool aResident = TryGetResidentBuffer(a, countA, out var residentA);
+            bool bResident = TryGetResidentBuffer(b, countB, out var residentB);
+
+            float[] fa = aResident ? null! : Pack(a);
+            float[] fb = bResident ? null! : Pack(b);
+            if (!aResident && countA < fa.Length)
+                throw new ArgumentException("MatMul operand pack size mismatch.");
+            if (!bResident && countB < fb.Length)
+                throw new ArgumentException("MatMul operand pack size mismatch.");
+
             float[] fr = RentScratch(countR);
-            var ba = RentBuffer(countA);
-            var bb = RentBuffer(countB);
+            var ba = aResident ? residentA : RentBuffer(countA);
+            var bb = bResident ? residentB : RentBuffer(countB);
             var br = RentBuffer(countR);
             try
             {
                 // PackInto handles strided/views; accumulate needs the current
                 // result contents on the device (the kernel reads r[ri]).
-                PackInto(a, fa.AsSpan(0, countA));
-                PackInto(b, fb.AsSpan(0, countB));
-                ba.Upload(fa.AsSpan(0, countA));
-                bb.Upload(fb.AsSpan(0, countB));
+                if (!aResident)
+                {
+                    PackInto(a, fa.AsSpan(0, countA));
+                    ba.Upload(fa.AsSpan(0, countA));
+                }
+                if (!bResident)
+                {
+                    PackInto(b, fb.AsSpan(0, countB));
+                    bb.Upload(fb.AsSpan(0, countB));
+                }
                 if (accumulate)
                 {
                     PackInto(result, fr.AsSpan(0, countR));
@@ -570,11 +793,18 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             }
             finally
             {
-                ReturnBuffer(ba);
-                ReturnBuffer(bb);
+                // Resident buffers are owned by the cache, never returned to the pool.
+                if (!aResident)
+                {
+                    ReturnBuffer(ba);
+                    ReturnScratch(fa);
+                }
+                if (!bResident)
+                {
+                    ReturnBuffer(bb);
+                    ReturnScratch(fb);
+                }
                 ReturnBuffer(br);
-                ReturnScratch(fa);
-                ReturnScratch(fb);
                 ReturnScratch(fr);
             }
         }
@@ -917,6 +1147,8 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_disposed)
                 return;
             _disposed = true;
+            ClearResidentWeights();
+            _pool?.Dispose();
             _launcher?.Dispose();
             _compiler?.Dispose();
             _fallback.Dispose();

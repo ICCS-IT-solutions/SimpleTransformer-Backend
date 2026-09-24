@@ -405,6 +405,47 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             throw new InvalidOperationException("No suitable Vulkan memory type found.");
         }
 
+        /// <summary>
+        /// Memory type for a GPU-resident buffer (weights/scratch the GPU reads
+        /// many times and the host writes once). Preference:
+        ///   1. DEVICE_LOCAL without HOST_VISIBLE - true VRAM, full bandwidth for
+        ///      compute reads. Unmapped, so it has to be filled with a staged
+        ///      device copy.
+        ///   2. DEVICE_LOCAL with HOST_VISIBLE - the resizable-BAR window (256 MiB
+        ///      on this RX 5700 XT). Also VRAM-speed for the GPU.
+        /// Returns uint.MaxValue when the device has no device-local type at all,
+        /// so callers can fall back to ordinary host-visible buffers.
+        /// </summary>
+        public uint SelectDeviceLocalMemoryType(uint typeBits)
+        {
+            Vk.GetPhysicalDeviceMemoryProperties(PhysicalDevice, out PhysicalDeviceMemoryProperties props);
+
+            for (int pass = 0; pass < 2; pass++)
+            {
+                bool requireUnhosted = pass == 0;
+                for (uint i = 0; i < props.MemoryTypeCount; i++)
+                {
+                    if ((typeBits & (1u << (int)i)) == 0)
+                        continue;
+
+                    var flags = props.MemoryTypes[(int)i].PropertyFlags;
+                    if ((flags & MemoryPropertyFlags.DeviceLocalBit) == 0)
+                        continue;
+
+                    bool hostVisible = (flags & MemoryPropertyFlags.HostVisibleBit) != 0;
+
+                    //Pass 0 wants VRAM the host cannot map; pass 1 accepts the
+                    //host-visible device-local window.
+                    if (hostVisible == requireUnhosted)
+                        continue;
+
+                    return i;
+                }
+            }
+
+            return uint.MaxValue;
+        }
+
         /// <summary>True when <paramref name="memoryTypeIndex"/> is device-local VRAM.</summary>
         public bool IsDeviceLocalMemoryType(uint memoryTypeIndex)
         {

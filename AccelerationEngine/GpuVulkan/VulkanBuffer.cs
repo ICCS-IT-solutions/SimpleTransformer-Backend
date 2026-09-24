@@ -23,11 +23,17 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public DeviceMemory Memory;
         public ulong SizeBytes { get; }
 
+        /// <summary>True once the buffer and its memory have been destroyed.</summary>
+        public bool IsDisposed => _disposed;
+
         /// <summary>True when the chosen memory type is device-local VRAM.</summary>
         public bool IsDeviceLocal { get; private set; }
 
         /// <summary>Memory type index actually allocated (diagnostics).</summary>
         public uint ChosenMemoryTypeIndex { get; private set; }
+
+        /// <summary>True when the chosen memory type can be mapped by the host.</summary>
+        public bool IsHostVisible { get; private set; }
 
         // Phase 4 telemetry. Dispatch is single-threaded and synchronous,
         // so plain counters are sufficient (no interlocked needed).
@@ -139,6 +145,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             ChosenMemoryTypeIndex = memIndex;
             IsDeviceLocal = ctx.IsDeviceLocalMemoryType(memIndex);
+            IsHostVisible = ctx.IsHostVisibleMemoryType(memIndex);
 
             void* mapped = null;
             result = vk.MapMemory(ctx.Device, Memory, 0, sizeBytes, 0, &mapped);
@@ -150,6 +157,77 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         // Memory-type selection lives in VulkanContext.SelectMemoryType so the
         // buffer, and anything else that allocates, share one policy
         // (device-local -> host-cached -> coherent -> host-visible).
+
+        /// <summary>
+        /// Allocates a GPU-resident storage buffer: it prefers true VRAM
+        /// (DEVICE_LOCAL without HOST_VISIBLE) so compute reads run at VRAM
+        /// bandwidth instead of across PCIe. The memory stays unmapped, so the
+        /// caller has to fill it with a staged device copy
+        /// (see <see cref="VulkanKernelLauncher.CopyBuffer(VulkanBuffer, VulkanBuffer, ulong)"/>).
+        /// Returns null when the device offers no device-local type or the
+        /// allocation fails, letting callers fall back to host-visible buffers.
+        /// </summary>
+        public static VulkanBuffer? TryCreateDeviceResident(VulkanContext ctx, ulong sizeBytes)
+        {
+            var vk = ctx.Vk;
+            var bufferInfo = new BufferCreateInfo
+            {
+                SType = StructureType.BufferCreateInfo,
+                Size = sizeBytes,
+                Usage = BufferUsageFlags.StorageBufferBit |
+                        BufferUsageFlags.TransferSrcBit |
+                        BufferUsageFlags.TransferDstBit,
+                SharingMode = SharingMode.Exclusive
+            };
+
+            if (vk.CreateBuffer(ctx.Device, in bufferInfo, null, out Silk.NET.Vulkan.Buffer handle) != Result.Success)
+                return null;
+
+            vk.GetBufferMemoryRequirements(ctx.Device, handle, out MemoryRequirements req);
+
+            uint memIndex = ctx.SelectDeviceLocalMemoryType(req.MemoryTypeBits);
+            if (memIndex == uint.MaxValue)
+            {
+                vk.DestroyBuffer(ctx.Device, handle, null);
+                return null;
+            }
+
+            var allocInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = req.Size,
+                MemoryTypeIndex = memIndex
+            };
+
+            if (vk.AllocateMemory(ctx.Device, in allocInfo, null, out DeviceMemory memory) != Result.Success)
+            {
+                vk.DestroyBuffer(ctx.Device, handle, null);
+                return null;
+            }
+
+            if (vk.BindBufferMemory(ctx.Device, handle, memory, 0) != Result.Success)
+            {
+                vk.FreeMemory(ctx.Device, memory, null);
+                vk.DestroyBuffer(ctx.Device, handle, null);
+                return null;
+            }
+
+            TotalBuffersCreated++;
+            return new VulkanBuffer(ctx, sizeBytes, handle, memory, memIndex);
+        }
+
+        /// <summary>Wraps an already-allocated, unmapped buffer (device-resident).</summary>
+        private VulkanBuffer(VulkanContext ctx, ulong sizeBytes, Silk.NET.Vulkan.Buffer handle, DeviceMemory memory, uint memoryTypeIndex)
+        {
+            _ctx = ctx;
+            SizeBytes = sizeBytes;
+            Handle = handle;
+            Memory = memory;
+            ChosenMemoryTypeIndex = memoryTypeIndex;
+            IsDeviceLocal = ctx.IsDeviceLocalMemoryType(memoryTypeIndex);
+            IsHostVisible = ctx.IsHostVisibleMemoryType(memoryTypeIndex);
+            _mapped = null;
+        }
 
         public void Upload(ReadOnlySpan<float> data)
         {

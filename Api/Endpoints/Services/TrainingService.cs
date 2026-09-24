@@ -666,7 +666,15 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     tokenizer: _tokenizer,
                     jobManager: _jobManager));
 
-            await trainingTask.ContinueWith(
+            //Publish the live task before observing it: a pause/stop arriving just
+            //after this method returns must find a running loop, and the task can
+            //finish before a continuation is even attached.
+            control.RunningTask = trainingTask;
+
+            //Fire-and-forget observation of the detached loop. Awaiting this would
+            //hold the HTTP request open for the whole training run, which is what
+            //made /start and /resume appear to hang in the UI.
+            _ = trainingTask.ContinueWith(
                 task =>
                 {
                     if (task.IsFaulted)
@@ -678,9 +686,9 @@ namespace SimpleTransformer.Api.Endpoints.Services
                         _jobManager.Remove(job.EntryId);
                     }
                 },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
-
-            control.RunningTask = trainingTask;
 
             return new ApiResponse<TrainingProgressResponse>
             {

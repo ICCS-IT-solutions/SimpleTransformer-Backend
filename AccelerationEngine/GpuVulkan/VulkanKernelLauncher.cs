@@ -698,6 +698,53 @@ void main() {
             }
         }
 
+        /// <summary>
+        /// Copies bytes from a host-visible staging buffer into a device-resident
+        /// one (VRAM) and makes the write visible to the compute stage. Used once
+        /// when a weight tensor is promoted into the resident cache: a one-time
+        /// transfer instead of re-uploading the tensor for every op.
+        /// </summary>
+        public void CopyBuffer(VulkanBuffer source, VulkanBuffer destination, ulong sizeBytes)
+        {
+            if (sizeBytes == 0)
+                return;
+
+            lock (_dispatchGate)
+            {
+                var vk = _ctx.Vk;
+                CommandBuffer cmd = BeginRecording();
+
+                var region = new BufferCopy { SrcOffset = 0, DstOffset = 0, Size = sizeBytes };
+                vk.CmdCopyBuffer(cmd, source.Handle, destination.Handle, 1, &region);
+
+                //The transfer write must be visible to the compute reads that
+                //follow. Both are on the same queue, so no ownership transfer.
+                var barrier = new BufferMemoryBarrier
+                {
+                    SType = StructureType.BufferMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Buffer = destination.Handle,
+                    Offset = 0,
+                    Size = sizeBytes
+                };
+
+                vk.CmdPipelineBarrier(
+                    cmd,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.ComputeShaderBit,
+                    0,
+                    0, null,
+                    1, &barrier,
+                    0, null);
+
+                vk.EndCommandBuffer(cmd);
+                SubmitAndWait(cmd);
+            }
+        }
+
         private DescriptorSet AllocateAndBind(VulkanBuffer[] buffers, DescriptorSetLayout setLayout)
         {
             var vk = _ctx.Vk;

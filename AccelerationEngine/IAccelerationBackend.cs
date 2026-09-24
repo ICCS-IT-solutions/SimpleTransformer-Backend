@@ -110,6 +110,25 @@ namespace SimpleTransformer.AccelerationEngine
             TensorBase tensor,
             float value);
 
+        /// <summary>
+        /// Optional hint: <paramref name="tensor"/> is immutable for the model's
+        /// lifetime (e.g. frozen QLoRA base weights) and may therefore be kept in
+        /// device memory and reused by later ops instead of being uploaded per
+        /// call. Backends that can cache return true; the default implementation
+        /// (CPU backends, where the arrays are already where they are needed) is
+        /// a no-op returning false.
+        /// </summary>
+        bool TryRegisterResidentWeights(TensorBase tensor, string? name = null) => false;
+
+        /// <summary>
+        /// Optional counterpart to <see cref="TryRegisterResidentWeights"/>: releases
+        /// any device memory the backend cached for <paramref name="tensor"/>. A
+        /// layer owning an immutable weight calls this when it is disposed so
+        /// unloading a model gives the memory back instead of holding it until the
+        /// backend shuts down. The default implementation does nothing.
+        /// </summary>
+        void ReleaseResidentWeights(TensorBase tensor) { }
+
         // Synchronization
         void Synchronize();
     }

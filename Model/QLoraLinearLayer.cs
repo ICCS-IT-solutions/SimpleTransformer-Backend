@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using SimpleTransformer.AccelerationEngine;
 using SimpleTransformer.Model.Extensions;
 using SimpleTransformer.Model.Extensions.Numerics;
 
@@ -50,6 +51,14 @@ namespace SimpleTransformer.Model
 
         private TensorBase? _lastInput;
         private TensorBase? _lastLoraAOutput; // Cache X * A^T to eliminate recomputation in backward
+
+        // Frozen base weights, dequantized once and kept for the model's lifetime
+        // (they never change). Previously every forward pass unpacked the 4-bit
+        // weights into workspace scratch and re-uploaded the result per matmul.
+        private Tensor? _dequantizedBaseWeights;
+        private IAccelerationBackend? _baseWeightBackend;
+        private bool _residentRegistrationAttempted;
+        private readonly object _baseWeightGate = new();
 
         // ThreadLocal storage for multi-threaded parallel reductions across 3D batch slices
         private readonly ThreadLocal<Tensor> _threadLocalDA;
@@ -148,12 +157,11 @@ namespace SimpleTransformer.Model
 
             // Borrow buffers from TensorWorkspace
             TensorBase output = workspace.Borrow(rows, _outputSize, shape => new Tensor(shape[0], shape[1]));
-            TensorBase dequantW = workspace.Borrow(_outputSize, _inputSize, shape => new Tensor(shape[0], shape[1]));
             TensorBase loraAOut = workspace.Borrow(rows, _rank, shape => new Tensor(shape[0], shape[1]));
             _lastLoraAOutput = loraAOut;
 
-            // Step 1: Dequantize base weights W0 into temporary scratch memory
-            DequantizeBaseWeights(dequantW);
+            // Step 1: frozen base weights, dequantized once and VRAM-resident
+            TensorBase dequantW = GetDequantizedBaseWeights(workspace);
 
             // Step 2: Frozen Base Pass -> Output = Input * W0^T
             workspace.Backend.MatMul(input, dequantW, output, transposeB: true);
@@ -189,9 +197,8 @@ namespace SimpleTransformer.Model
             TensorBase loraAOut = workspace.Borrow(layers, rows, _rank, shape => new Tensor(shape[0], shape[1], shape[2]));
             _lastLoraAOutput = loraAOut;
 
-            // Single dequantization pass shared across all threads in the batch
-            TensorBase dequantW = workspace.Borrow(_outputSize, _inputSize, shape => new Tensor(shape[0], shape[1]));
-            DequantizeBaseWeights(dequantW);
+            // Frozen base weights: dequantized once, shared by all threads
+            TensorBase dequantW = GetDequantizedBaseWeights(workspace);
 
             Parallel.For(0, layers, b =>
             {
@@ -245,12 +252,11 @@ namespace SimpleTransformer.Model
 
             // Borrow temporary workspace buffers
             TensorBase inputGradient = workspace.Borrow(rows, _inputSize, shape => new Tensor(shape[0], shape[1]));
-            TensorBase dequantW = workspace.Borrow(_outputSize, _inputSize, shape => new Tensor(shape[0], shape[1]));
+            TensorBase dequantW = GetDequantizedBaseWeights(workspace);
             TensorBase dLoraAOut = workspace.Borrow(rows, _rank, shape => new Tensor(shape[0], shape[1]));
             TensorBase dInputAdapter = workspace.Borrow(rows, _inputSize, shape => new Tensor(shape[0], shape[1]));
 
             // 1. BASE PATH: dX_base = Gradient * W0
-            DequantizeBaseWeights(dequantW);
             workspace.Backend.MatMul(gradient, dequantW, inputGradient);
             // 2. LORA ADAPTER GRADIENTS:
             // dB += scale * (Gradient^T * loraAOut)
@@ -292,8 +298,7 @@ namespace SimpleTransformer.Model
             int rows = gradient.Rows;
 
             TensorBase inputGradient = workspace.Borrow(layers, rows, _inputSize, shape => new Tensor(shape[0], shape[1], shape[2]));
-            TensorBase dequantW = workspace.Borrow(_outputSize, _inputSize, shape => new Tensor(shape[0], shape[1]));
-            DequantizeBaseWeights(dequantW);
+            TensorBase dequantW = GetDequantizedBaseWeights(workspace);
 
             // Reset thread-local gradient buffers
             foreach (var localDA in _threadLocalDA.Values) workspace.Backend.Fill(localDA, 0f);
@@ -377,6 +382,40 @@ namespace SimpleTransformer.Model
 
         #region SIMD & Quantization Helpers
 
+        /// <summary>
+        /// The frozen base weights W0, dequantized exactly once and reused by every
+        /// forward and backward pass. Unpacking the 4-bit weights into workspace
+        /// scratch on each call (four times per layer per step: forward sequence,
+        /// forward batch, backward sequence, backward batch) plus re-uploading the
+        /// result for every matmul was the dominant cost of a training step.
+        /// The tensor is also registered with the backend as device-resident, so
+        /// the GPU keeps one VRAM copy and never receives it again.
+        /// </summary>
+        private Tensor GetDequantizedBaseWeights(TensorWorkspace workspace)
+        {
+            lock (_baseWeightGate)
+            {
+                if (_dequantizedBaseWeights == null)
+                {
+                    var weights = new Tensor(_outputSize, _inputSize);
+                    DequantizeBaseWeights(weights);
+                    _dequantizedBaseWeights = weights;
+                }
+
+                //Backends that cannot cache (CPU) return false and the tensor is
+                //simply used as-is.
+                if (!_residentRegistrationAttempted)
+                {
+                    _residentRegistrationAttempted = true;
+                    _baseWeightBackend = workspace.Backend;
+                    workspace.Backend.TryRegisterResidentWeights(
+                        _dequantizedBaseWeights, $"{Name}.base");
+                }
+
+                return _dequantizedBaseWeights;
+            }
+        }
+
         private void DequantizeBaseWeights(TensorBase targetDequantized)
         {
             // Simple block-wise 4-bit dequantization mapping 0..15 nibbles back to float
@@ -450,6 +489,14 @@ namespace SimpleTransformer.Model
             _loraAGradient.Dispose();
             _loraBGradient.Dispose();
             _biasGradient?.Dispose();
+
+            //Hand the frozen base weights' VRAM copy back before dropping the host
+            //tensor it was uploaded from, so unloading a model frees VRAM now
+            //rather than at backend shutdown.
+            if (_dequantizedBaseWeights != null)
+                _baseWeightBackend?.ReleaseResidentWeights(_dequantizedBaseWeights);
+
+            _dequantizedBaseWeights?.Dispose();
         }
 
         #endregion

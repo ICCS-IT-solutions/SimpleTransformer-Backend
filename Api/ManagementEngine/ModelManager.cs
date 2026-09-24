@@ -34,7 +34,18 @@ namespace SimpleTransformer.Api.ManagementEngine
             }
 
             // New model was successfully created.
-            // Now it is safe to dispose the previous model.
+            // Now it is safe to dispose the previous model - unless a training job
+            // is still running on it. Disposing mid-run tears the workspace out from
+            // under the loop, which surfaces as "Cannot access a disposed object"
+            // inside the job. The service refuses the switch up front; this is the
+            // backstop.
+            if (_loadedModel is { IsTraining: true })
+            {
+                throw new InvalidOperationException(
+                    "Cannot replace the loaded model while a training job is running on it. " +
+                    "Stop the job first.");
+            }
+
             _loadedModel?.Dispose();
 
             _loadedModel = model;
@@ -52,10 +63,25 @@ namespace SimpleTransformer.Api.ManagementEngine
             return _loadedModel;
         }
 
-        public void UnloadModel()
+        /// <summary>
+        /// True while the loaded model is owned by a running training job. Callers
+        /// must not unload or replace the model in that state.
+        /// </summary>
+        public bool IsLoadedModelTraining => _loadedModel is { IsTraining: true };
+
+        /// <summary>
+        /// Disposes and drops the loaded model. Returns false (leaving the model
+        /// intact) when a training job is running on it, because disposing the
+        /// model mid-run invalidates the job's tensors and workspace.
+        /// </summary>
+        public bool UnloadModel()
         {
+            if (_loadedModel is { IsTraining: true })
+                return false;
+
             _loadedModel?.Dispose();
             _loadedModel = null;
+            return true;
         }
     }
 }
