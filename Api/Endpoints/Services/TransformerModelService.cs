@@ -91,7 +91,8 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 Description = req.Description,
                 TransformerConfigId = req.TransformerConfig.EntryId,
                 TrainingConfigId = req.TrainingConfig.EntryId,
-                AccelerationBackend = req.AccelerationBackend
+                AccelerationBackend = req.AccelerationBackend,
+                UseQLora = req.UseQLora
             };
 
             await db.TransformerModels.AddAsync(model);
@@ -370,6 +371,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
             model.TrainingConfigId = req.TrainingConfig.EntryId;
             model.AccelerationBackend = req.AccelerationBackend;
             model.DateUpdated = DateTime.UtcNow;
+
+            //UseQLora is intentionally NOT updated here. It decides which trainable
+            //parameters the model exposes, so flipping it on an existing model would
+            //make every saved checkpoint unloadable. A new model is required to
+            //train the other way.
 
             await db.SaveChangesAsync();
 

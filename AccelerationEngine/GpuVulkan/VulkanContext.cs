@@ -54,6 +54,58 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// <summary>Bytes this process currently holds on the VRAM heap (0 = unknown).</summary>
         public ulong DeviceLocalUsageBytes { get; private set; }
 
+        /// <summary>
+        /// True when Resizable BAR is in effect: the main device-local heap is
+        /// itself host-visible, so the CPU can map VRAM directly instead of going
+        /// through a small aperture.
+        /// <para>
+        /// Detection is by heap layout rather than a driver-specific extension.
+        /// With ReBAR enabled the whole VRAM heap is exposed as
+        /// DEVICE_LOCAL|HOST_VISIBLE. With it disabled, the main VRAM heap has no
+        /// host-visible memory types at all and the driver instead advertises a
+        /// separate, small device-local host-visible heap - the legacy BAR window
+        /// (256 MiB on an RX 5700 XT) - which is orders of magnitude slower for
+        /// host traffic. That layout difference is what this flag reports.
+        /// </para>
+        /// </summary>
+        public bool ResizableBarEnabled { get; private set; }
+
+        /// <summary>
+        /// Total device-local memory the host can actually map, i.e. the BAR
+        /// aperture. Equal to the VRAM heap when ReBAR is enabled; a small
+        /// fraction of it when ReBAR is off.
+        /// </summary>
+        public ulong HostVisibleDeviceLocalBytes { get; private set; }
+
+        /// <summary>
+        /// True when a working set (activations, workspace, gradients) could
+        /// reasonably live in VRAM instead of being shuttled over PCIe each op.
+        /// <para>
+        /// This requires ReBAR. Without it the only host-mappable device memory is
+        /// the small BAR window, which measures in the tens of MiB/s here - three
+        /// orders of magnitude slower than cached system RAM - so placing a
+        /// per-op working set there would be far worse than leaving it in host
+        /// memory. With ReBAR the whole heap is mappable and the trade reverses,
+        /// because data can stay resident on the device instead of crossing the
+        /// bus repeatedly.
+        /// </para>
+        /// <para>
+        /// Note this is about a *resident* working set. It does not change the
+        /// preference for host-cached system RAM for the existing
+        /// pack/dispatch/unpack path, which still round-trips through the host
+        /// every op and therefore still favours the fastest host tier.
+        /// </para>
+        /// </summary>
+        public bool SupportsVramWorkingSet => ResizableBarEnabled;
+
+        /// <summary>
+        /// Device memory a resident working set could use: the mappable device-local
+        /// size when ReBAR is on, otherwise 0 because the BAR window is too small
+        /// and too slow to be useful for per-op data.
+        /// </summary>
+        public ulong VramWorkingSetBudgetBytes =>
+            ResizableBarEnabled ? HostVisibleDeviceLocalBytes : 0;
+
         public bool TryInitialize()
         {
             try
@@ -309,6 +361,8 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             DeviceLocalHeapSizeBytes = bestSize;
             DeviceLocalHeapIndex = bestIndex;
 
+            DetectResizableBar(props, bestIndex);
+
             if (!_memoryBudgetEnabled || bestIndex == uint.MaxValue)
                 return;
 
@@ -328,6 +382,70 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             DeviceLocalBudgetBytes = budget.HeapBudget[(int)bestIndex];
             DeviceLocalUsageBytes = budget.HeapUsage[(int)bestIndex];
+        }
+
+        /// <summary>
+        /// Works out whether Resizable BAR is in effect from the heap layout, and
+        /// how much device-local memory the host can actually map.
+        ///
+        /// A device-local heap is host-mappable when at least one of its memory
+        /// types carries HOST_VISIBLE. ReBAR is considered enabled only when that
+        /// is true for the *main* VRAM heap: with ReBAR off, the main heap has no
+        /// host-visible types and the driver exposes a separate small aperture
+        /// heap instead, which is what makes host access to VRAM so slow.
+        /// </summary>
+        private void DetectResizableBar(
+            PhysicalDeviceMemoryProperties props,
+            uint deviceLocalHeapIndex)
+        {
+            ulong hostVisibleDeviceLocal = 0;
+            bool mainHeapIsHostVisible = false;
+
+            for (uint h = 0; h < props.MemoryHeapCount; h++)
+            {
+                var heap = props.MemoryHeaps[(int)h];
+                if (!heap.Flags.HasFlag(MemoryHeapFlags.DeviceLocalBit))
+                    continue;
+
+                bool heapHasHostVisibleType = false;
+                for (uint m = 0; m < props.MemoryTypeCount; m++)
+                {
+                    var type = props.MemoryTypes[(int)m];
+                    if (type.HeapIndex != h)
+                        continue;
+
+                    if ((type.PropertyFlags & MemoryPropertyFlags.HostVisibleBit) != 0)
+                        heapHasHostVisibleType = true;
+                }
+
+                if (heapHasHostVisibleType)
+                    hostVisibleDeviceLocal += heap.Size;
+
+                if (h == deviceLocalHeapIndex)
+                    mainHeapIsHostVisible = heapHasHostVisibleType;
+            }
+
+            ResizableBarEnabled =
+                deviceLocalHeapIndex != uint.MaxValue && mainHeapIsHostVisible;
+            HostVisibleDeviceLocalBytes = hostVisibleDeviceLocal;
+        }
+
+        /// <summary>
+        /// One-line human-readable ReBAR status, e.g.
+        /// "Resizable BAR: enabled (7920 MiB of VRAM host-mappable)" or
+        /// "Resizable BAR: disabled (256 MiB BAR window of 7920 MiB VRAM mappable)".
+        /// </summary>
+        public string DescribeResizableBar()
+        {
+            const double mib = 1024.0 * 1024.0;
+
+            if (DeviceLocalHeapIndex == uint.MaxValue)
+                return "Resizable BAR: unknown (no device-local heap)";
+
+            return ResizableBarEnabled
+                ? $"Resizable BAR: enabled ({DeviceLocalHeapSizeBytes / mib:F0} MiB of VRAM host-mappable)"
+                : $"Resizable BAR: disabled ({HostVisibleDeviceLocalBytes / mib:F0} MiB BAR window " +
+                  $"of {DeviceLocalHeapSizeBytes / mib:F0} MiB VRAM mappable)";
         }
 
         private void CreateCommandPool()
@@ -521,6 +639,8 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     ? $", driver budget {DeviceLocalBudgetBytes / 1024.0 / 1024.0:F0} MiB" +
                       $", used by this process {DeviceLocalUsageBytes / 1024.0 / 1024.0:F0} MiB"
                     : " (live budget unavailable: VK_EXT_memory_budget not enabled)"));
+
+            Console.WriteLine($"  {DescribeResizableBar()}");
 
             Console.WriteLine($"  memory types ({props.MemoryTypeCount}):");
             for (uint i = 0; i < props.MemoryTypeCount; i++)

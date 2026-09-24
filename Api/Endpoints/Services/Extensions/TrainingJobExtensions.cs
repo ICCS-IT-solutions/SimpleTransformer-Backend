@@ -141,6 +141,36 @@ public static class TrainingJobExtensions
         var miniBatches = TrainingDataExtensions.CreateMiniBatches(model, samples);
         var numBatches = miniBatches.Count;
         Log.Information($"{numBatches} batches created from {samples.Count} samples.");
+
+        //Report any shortfall so a short batch is never a silent surprise: either
+        //DropLast discarded a remainder, or the dataset was too small to fill one
+        //full batch and the partial batch was kept deliberately.
+        int batchSize = config?.BatchSize ?? model.TrainingConfig.BatchSize;
+        int usedSampleCount = miniBatches.Sum(b => b.BatchSize);
+        int unusedSamples = samples.Count - usedSampleCount;
+        int smallestBatch = miniBatches.Count > 0 ? miniBatches.Min(b => b.BatchSize) : 0;
+        string batchingNote;
+        if (unusedSamples > 0 && model.TrainingConfig.DropLast)
+        {
+            batchingNote =
+                $" DropLast discarded the final partial batch ({unusedSamples} of " +
+                $"{samples.Count} samples unused this epoch).";
+            Log.Information(batchingNote);
+        }
+        else if (smallestBatch < batchSize)
+        {
+            //DropLast could not apply: the dataset never fills a full batch, so
+            //the partial batch is kept rather than leaving nothing to train on.
+            batchingNote =
+                $" Dataset does not fill a full batch of {batchSize} " +
+                $"({samples.Count} samples, smallest batch {smallestBatch}), " +
+                "so the partial batch is kept.";
+            Log.Information(batchingNote);
+        }
+        else
+        {
+            batchingNote = string.Empty;
+        }
         // Determine chunkSize dynamically based on miniBatches count
         int chunkSize = miniBatches.Count switch
         {
@@ -172,7 +202,8 @@ public static class TrainingJobExtensions
 
             job.Message =
                 $"Training prepared: {samples.Count} samples in " +
-                $"{numBatches} mini-batches ({totalOuterBatches} outer batches).";
+                $"{numBatches} mini-batches ({totalOuterBatches} outer batches)." +
+                batchingNote;
         });
 
         //Cancellation is scoped to this run. Stop and Cancel signal the job's

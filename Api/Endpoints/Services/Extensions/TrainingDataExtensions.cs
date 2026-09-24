@@ -33,10 +33,27 @@ public static class TrainingDataExtensions
         
         // Read directly from the model's TrainingConfig
         int batchSize = model.TrainingConfig.BatchSize;
+        bool dropLast = model.TrainingConfig.DropLast;
 
-        for (int start = 0; start < samples.Count; start += batchSize)
+        //A short trailing batch is trained, but it is a poor gradient estimate
+        //taken from far fewer samples than the rest of the epoch. Dropping it
+        //keeps every optimizer step based on a full batch, at the cost of
+        //leaving up to BatchSize-1 samples unused.
+        //
+        //That trade is only worth making when a full batch actually exists:
+        //if the dataset is smaller than one batch, dropping the remainder would
+        //leave nothing to train on, so the single partial batch is kept.
+        int fullBatches = samples.Count / batchSize;
+        bool willDropRemainder =
+            dropLast && samples.Count % batchSize != 0 && fullBatches > 0;
+
+        int limit = willDropRemainder
+            ? samples.Count - (samples.Count % batchSize)
+            : samples.Count;
+
+        for (int start = 0; start < limit; start += batchSize)
         {
-            int currentBatchSize = Math.Min(batchSize, samples.Count - start);
+            int currentBatchSize = Math.Min(batchSize, limit - start);
             int sequenceLength = samples[start].Input.Shape[0];
 
             Tensor inputBatch = new Tensor(currentBatchSize, sequenceLength);

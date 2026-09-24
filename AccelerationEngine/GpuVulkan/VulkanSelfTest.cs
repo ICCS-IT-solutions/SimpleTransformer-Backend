@@ -31,6 +31,39 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             int passed = 0;
             int failed = 0;
 
+            // ---- Resizable BAR detection -------------------------------------
+            //The layout rules the detection relies on: ReBAR is only reported as
+            //enabled when the main device-local heap is itself host-visible, and
+            //a VRAM working set is only considered viable in that case.
+            {
+                const double mib = 1024.0 * 1024.0;
+
+                //Invariants the detection must hold on any driver:
+                //  * ReBAR on  => the whole device-local heap is mappable, and a VRAM
+                //    working set is viable, sized to that mappable heap.
+                //  * ReBAR off => only a small aperture is mappable, and a VRAM
+                //    working set is deliberately not offered.
+                bool rebarOn = gpu.ResizableBarEnabled;
+                bool workingSetConsistent = rebarOn
+                    ? gpu.VramWorkingSetBudgetBytes == gpu.HostVisibleDeviceLocalBytes
+                      && gpu.VramWorkingSetBudgetBytes > 0
+                    : gpu.VramWorkingSetBudgetBytes == 0;
+                //ReBAR on means the main VRAM heap is mappable, so the mappable
+                //total covers it; ReBAR off means only a small aperture is
+                //mappable, necessarily smaller than the main heap.
+                bool apertureSane = gpu.DeviceLocalHeapSizeBytes == 0 ||
+                    (rebarOn
+                        ? gpu.HostVisibleDeviceLocalBytes >= gpu.DeviceLocalHeapSizeBytes
+                        : gpu.HostVisibleDeviceLocalBytes < gpu.DeviceLocalHeapSizeBytes);
+
+                Console.WriteLine(
+                    $"  [INFO] {gpu.ResizableBarInfo} | " +
+                    $"host-mappable device-local {gpu.HostVisibleDeviceLocalBytes / mib:F0} MiB | " +
+                    $"VRAM working set budget {gpu.VramWorkingSetBudgetBytes / mib:F0} MiB");
+
+                Report("ReBAR detection", workingSetConsistent && apertureSane ? 0f : 1f, 0f);
+            }
+
             void Report(string name, float maxDiff, float tol)
             {
                 bool ok = maxDiff <= tol;

@@ -49,6 +49,38 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// <summary>Human-readable host-staging budget, e.g. "host staging cap 8192 MiB of 32768 MiB system RAM (auto)".</summary>
         public string HostStagingInfo { get; private set; } = "n/a";
 
+        /// <summary>Resizable BAR status, e.g. "ReBAR off (256 MiB BAR window)".</summary>
+        public string ResizableBarInfo { get; private set; } = "n/a";
+
+        /// <summary>
+        /// True when the main VRAM heap is itself host-visible, i.e. Resizable BAR
+        /// is enabled and the CPU can map the whole heap.
+        /// </summary>
+        public bool ResizableBarEnabled => _ctx?.ResizableBarEnabled ?? false;
+
+        /// <summary>
+        /// True when the whole VRAM heap is host-mappable (Resizable BAR enabled),
+        /// so a working set could stay resident on the device instead of crossing
+        /// PCIe on every operation.
+        /// </summary>
+        public bool SupportsVramWorkingSet => _ctx?.SupportsVramWorkingSet ?? false;
+
+        /// <summary>
+        /// Device memory available to a resident VRAM working set. Zero unless
+        /// Resizable BAR is enabled, because the small BAR window is far too slow
+        /// to hold per-op data.
+        /// </summary>
+        public ulong VramWorkingSetBudgetBytes =>
+            _ctx?.VramWorkingSetBudgetBytes ?? 0UL;
+
+        /// <summary>Device-local memory the host can map (the BAR aperture), 0 when unknown.</summary>
+        public ulong HostVisibleDeviceLocalBytes =>
+            _ctx?.HostVisibleDeviceLocalBytes ?? 0UL;
+
+        /// <summary>Total size of the main device-local (VRAM) heap, 0 when unknown.</summary>
+        public ulong DeviceLocalHeapSizeBytes =>
+            _ctx?.DeviceLocalHeapSizeBytes ?? 0UL;
+
         // ---- VRAM-resident weight cache ---------------------------------------
         // Frozen base weights (the QLoRA matrices) are written once and read on
         // every step. One device-local copy per backing array is kept so the
@@ -324,8 +356,16 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 description += ", live budget unavailable (VK_EXT_memory_budget not enabled)";
             }
 
+            //ReBAR status travels with the memory facts: it explains whether the
+            //VRAM heap is directly mappable, which is the precondition for
+            //keeping a working set in VRAM rather than shuttling it over PCIe.
+            string rebar = ctx.ResizableBarEnabled
+                ? $"ReBAR on ({ctx.HostVisibleDeviceLocalBytes / mib:F0} MiB mappable)"
+                : $"ReBAR off ({ctx.HostVisibleDeviceLocalBytes / mib:F0} MiB BAR window)";
+
             return $"{description}, effective cap {effectiveBudget / mib:F0} MiB" +
-                (VulkanMemorySettings.BudgetBytesOverride > 0 ? " (config override)" : " (auto)");
+                (VulkanMemorySettings.BudgetBytesOverride > 0 ? " (config override)" : " (auto)") +
+                $", {rebar}";
         }
 
         public GpuVulkanBackend()
@@ -349,6 +389,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 GpuMemoryInfo = DescribeGpuMemory(ctx, GpuMemoryBudgetBytes);
                 HostStagingBudgetBytes = ComputeHostStagingBudget();
                 HostStagingInfo = DescribeHostStaging(HostStagingBudgetBytes);
+                ResizableBarInfo = ctx.DescribeResizableBar();
                 _pool = new VulkanBufferPool(ctx, GpuMemoryBudgetBytes, HostStagingBudgetBytes);
 
                 //One line per process so repeated backend probes (the /backends

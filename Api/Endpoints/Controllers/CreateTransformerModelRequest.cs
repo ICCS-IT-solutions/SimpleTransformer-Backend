@@ -13,6 +13,15 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         /// Acceleration backend name (BackendSelector.BackendType). "Auto" by default.
         /// </summary>
         public string AccelerationBackend { get; set; } = "Auto";
+
+        /// <summary>
+        /// True to build a quantised LoRA model (frozen 4-bit base weights plus
+        /// trainable adapters), false for a "raw" model where every weight is a
+        /// dense fp32 trainable parameter. Defaults to true. This is fixed at
+        /// creation and ignored on update: QLoRA and raw models have different
+        /// trainable parameter sets, so their checkpoints are not interchangeable.
+        /// </summary>
+        public bool UseQLora { get; set; } = true;
     }
 
     /*
@@ -22,6 +31,7 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         transformerConfig: TransformerConfigEntry;
         trainingConfig: TrainingConfigEntry;
         accelerationBackend: string;
+        useQLora: boolean;
     }
     */
 }

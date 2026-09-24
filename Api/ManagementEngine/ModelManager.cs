@@ -26,7 +26,9 @@ namespace SimpleTransformer.Api.ManagementEngine
             }
 
             // Construct the new model first.
-            var model = await _modelFactory.CreateModelAsync(modelId, useQLora: true);
+            //QLoRA vs raw is a structural property of the model and is read from
+            //the stored flag rather than hardcoded.
+            var model = await _modelFactory.CreateModelAsync(modelId);
 
             if (model == null)
             {

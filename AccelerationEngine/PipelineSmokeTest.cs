@@ -118,9 +118,156 @@ namespace SimpleTransformer.AccelerationEngine
             Console.WriteLine();
             Console.WriteLine($"Predict: {allTokenIds.Length} token ids, next = {nextTokenId} (valid range 0..{config.VocabSize - 1}): {predictOk}.");
 
+            // 7. Mini-batch assembly, including the DropLast remainder rule.
             Console.WriteLine();
-            Console.WriteLine($"Results: {(parityOk && trajectoryOk && predictOk ? "PASS" : "FAIL")}.");
-            return parityOk && trajectoryOk && predictOk;
+            Console.WriteLine("--- Mini-batch assembly (DropLast) ---");
+            bool batchingOk = CheckMiniBatching(config, trainingConfig);
+
+            // 8. Checkpoint round-trip and QLoRA/raw mode isolation.
+            //A QLoRA model and a raw model expose different trainable parameters,
+            //so a checkpoint from one must never load into the other. Schema v3
+            //records the mode so that is caught with a clear message instead of a
+            //confusing parameter-name failure.
+            Console.WriteLine();
+            Console.WriteLine("--- Checkpoint mode isolation ---");
+            bool checkpointOk = CheckpointModeIsolation(config, trainingConfig);
+
+            Console.WriteLine();
+            Console.WriteLine($"Results: {(parityOk && trajectoryOk && predictOk && batchingOk && checkpointOk ? "PASS" : "FAIL")}.");
+            return parityOk && trajectoryOk && predictOk && batchingOk && checkpointOk;
+        }
+
+        /// <summary>
+        /// Verifies the DropLast remainder rule: a short trailing batch is dropped
+        /// when at least one full batch exists, and kept when dropping would leave
+        /// nothing to train on.
+        /// </summary>
+        private static bool CheckMiniBatching(TransformerConfig config, TrainingConfig trainingConfig)
+        {
+            //Case 1: 9 samples, batch 8 -> one full batch, remainder of 1 dropped.
+            //Case 2: 5 samples, batch 8 -> no full batch exists, so the single
+            //partial batch must be kept or nothing would train.
+            //Case 3: 16 samples, batch 8 -> exactly two full batches, nothing dropped.
+            var cases = new (int samples, bool dropLast, int expectedBatches, int expectedSmallest)[]
+            {
+                (9, true, 1, 8),
+                (9, false, 2, 1),
+                (5, true, 1, 5),
+                (5, false, 1, 5),
+                (16, true, 2, 8),
+                (16, false, 2, 8),
+            };
+
+            bool allOk = true;
+            foreach (var (sampleCount, dropLast, expectedBatches, expectedSmallest) in cases)
+            {
+                var cfg = new TrainingConfig
+                {
+                    BatchSize = 8,
+                    DropLast = dropLast,
+                    Optimizer = OptimizerType.AdamW
+                };
+
+                using var model = new TransformerModel(
+                    Guid.NewGuid(), config, cfg, useQLora: true,
+                    BackendSelector.BackendType.CpuReference);
+
+                var samples = new List<TrainingSample>(sampleCount);
+                for (int i = 0; i < sampleCount; i++)
+                {
+                    samples.Add(new TrainingSample
+                    {
+                        Input = new Tensor(config.MaxSequenceLength),
+                        Target = new Tensor(config.MaxSequenceLength)
+                    });
+                }
+
+                var batches = TrainingDataExtensions.CreateMiniBatches(model, samples);
+                int smallest = batches.Count > 0 ? batches.Min(b => b.BatchSize) : 0;
+                int used = batches.Sum(b => b.BatchSize);
+
+                //DropLast on: the short trailing batch is discarded, so every
+                //kept batch is full. The single exception is a dataset smaller
+                //than one batch, where the only partial batch is kept so that
+                //something still trains.
+                //DropLast off: the remainder is kept, so a partial batch is correct.
+                bool datasetSmallerThanOneBatch = sampleCount < 8;
+                bool partialsAreLegal = !dropLast || datasetSmallerThanOneBatch;
+                bool everyBatchFull = batches.All(b => b.BatchSize == 8);
+
+                bool ok = batches.Count == expectedBatches &&
+                          smallest == expectedSmallest &&
+                          (partialsAreLegal || everyBatchFull);
+
+                Console.WriteLine(
+                    $"  samples={sampleCount,2} dropLast={dropLast,-5} -> " +
+                    $"{batches.Count} batch(es), smallest {smallest}, {used} used : {ok}");
+
+                allOk &= ok;
+            }
+
+            return allOk;
+        }
+
+        /// <summary>
+        /// Verifies that a saved checkpoint round-trips into a model of the same
+        /// training mode, and is rejected by a model of the opposite mode.
+        /// </summary>
+        private static bool CheckpointModeIsolation(TransformerConfig config, TrainingConfig trainingConfig)
+        {
+            var modelId = Guid.NewGuid();
+
+            using var qloraModel = new TransformerModel(modelId, config, trainingConfig, useQLora: true);
+            using var rawModel = new TransformerModel(modelId, config, trainingConfig, useQLora: false);
+
+            Console.WriteLine($"QLoRA model parameters : {qloraModel.Parameters.Count()}");
+            Console.WriteLine($"Raw model parameters   : {rawModel.Parameters.Count()}");
+
+            if (qloraModel.Parameters.Count() == rawModel.Parameters.Count())
+            {
+                Console.WriteLine("[FAIL] Expected the two modes to expose different parameter counts.");
+                return false;
+            }
+
+            // Round-trip: save from the QLoRA model, load into a fresh QLoRA model.
+            using var roundTrip = new TransformerModel(modelId, config, trainingConfig, useQLora: true);
+            using var buffer = new MemoryStream();
+            qloraModel.SaveCheckpoint(buffer, currentEpoch: 3, currentLoss: 1.25f);
+
+            buffer.Position = 0;
+            var (epoch, loss) = TransformerModel.LoadCheckpoint(buffer, roundTrip);
+            bool sameModeOk = epoch == 3 && MathF.Abs(loss - 1.25f) < 1e-6f;
+            Console.WriteLine($"QLoRA -> QLoRA load   : epoch {epoch}, loss {loss:G4} (expected 3, 1.25): {sameModeOk}");
+
+            // Raw round-trip.
+            using var rawRoundTrip = new TransformerModel(modelId, config, trainingConfig, useQLora: false);
+            using var rawBuffer = new MemoryStream();
+            rawModel.SaveCheckpoint(rawBuffer, currentEpoch: 2, currentLoss: 0.5f);
+
+            rawBuffer.Position = 0;
+            var (rawEpoch, rawLoss) = TransformerModel.LoadCheckpoint(rawBuffer, rawRoundTrip);
+            bool rawSameModeOk = rawEpoch == 2 && MathF.Abs(rawLoss - 0.5f) < 1e-6f;
+            Console.WriteLine($"Raw -> Raw load       : epoch {rawEpoch}, loss {rawLoss:G4} (expected 2, 0.5): {rawSameModeOk}");
+
+            // Cross-mode: a QLoRA checkpoint must be refused by a raw model.
+            bool crossRejected = false;
+            string? crossMessage = null;
+            try
+            {
+                buffer.Position = 0;
+                TransformerModel.LoadCheckpoint(buffer, rawRoundTrip);
+            }
+            catch (InvalidDataException ex)
+            {
+                crossRejected = true;
+                crossMessage = ex.Message;
+            }
+
+            Console.WriteLine($"QLoRA ckpt -> raw model: rejected = {crossRejected}");
+            if (crossMessage != null)
+                Console.WriteLine($"  message: {crossMessage}");
+
+            return sameModeOk && rawSameModeOk && crossRejected;
         }
 
         private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);

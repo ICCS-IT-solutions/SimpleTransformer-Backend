@@ -14,6 +14,20 @@ namespace SimpleTransformer.Model
         public int Epochs { get; set; } = 10;
         public float DropoutRate { get; set; } = 0.0f;
 
+        /// <summary>
+        /// When true, a trailing mini-batch that is smaller than
+        /// <see cref="BatchSize"/> is discarded instead of being trained on.
+        /// <para>
+        /// A short final batch is trained, but it is a poor gradient estimate
+        /// measured from far fewer samples than the rest of the epoch, so it adds
+        /// noise for no benefit. Dropping it keeps every optimizer step based on a
+        /// full batch. The trade-off is that up to BatchSize-1 samples are not
+        /// used in an epoch, which only matters when the dataset barely fills one
+        /// batch; in that case the final batch is kept so training still runs.
+        /// </para>
+        /// </summary>
+        public bool DropLast { get; set; } = true;
+
         // --- Optimizer Selection ---
         public OptimizerType Optimizer { get; set; } = OptimizerType.AdamW;
 
@@ -77,7 +91,8 @@ namespace SimpleTransformer.Model
             int? epochs = null, 
             float? dropoutRate = null, 
             float? weightDecay = null, 
-            float? maxGradientNorm = null)
+            float? maxGradientNorm = null,
+            bool? dropLast = null)
         {
             // Validate arguments before assigning if values exist
             if (learningRate.HasValue && learningRate.Value <= 0f)
@@ -99,6 +114,7 @@ namespace SimpleTransformer.Model
             DropoutRate = dropoutRate ?? DropoutRate;
             WeightDecay = weightDecay ?? WeightDecay;
             MaxGradientNorm = maxGradientNorm ?? MaxGradientNorm;
+            DropLast = dropLast ?? DropLast;
         }
     }
 }

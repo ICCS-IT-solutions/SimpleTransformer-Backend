@@ -98,6 +98,14 @@ namespace SimpleTransformer.Model
         private readonly List<ILayer> _layers = new();
         public TransformerConfig Config { get; }
         public TrainingConfig TrainingConfig { get; }
+
+        /// <summary>
+        /// True when the model was built as quantised LoRA (frozen 4-bit base
+        /// weights plus trainable adapters), false for a raw model where every
+        /// weight is a dense fp32 trainable parameter. Recorded in the checkpoint
+        /// so the two can never be confused on resume.
+        /// </summary>
+        public bool UsesQLora { get; private set; }
         public TransformerModel(Guid modelId, TransformerConfig? config = null, TrainingConfig? trainingConfig = null, bool useQLora = true, BackendSelector.BackendType backendType = BackendSelector.BackendType.Auto)
         {
             TransformerModelId = modelId;
@@ -110,6 +118,7 @@ namespace SimpleTransformer.Model
             ValidateConfig();
             Log.Information("Configuration is valid. Proceeding...");
 
+            UsesQLora = useQLora;
             BuildModel(useQLora);
             Log.Information($"Transformer model {modelId} ready to be loaded. Use Quantised LoRA: {useQLora}.");
         }
@@ -224,10 +233,16 @@ namespace SimpleTransformer.Model
             
             // Fixed 4-byte header (no length prefix)
             writer.Write("STCK"u8); 
-            writer.Write(2); // Schema version
+            writer.Write(3); // Schema version (v3 adds the useQLora flag)
 
             //Add the transformer model id to the checkpoint file 
             writer.Write(TransformerModelId.ToByteArray());
+
+            //v3: record whether this checkpoint came from a QLoRA or a raw model.
+            //A QLoRA model exposes LoRA adapters as trainable parameters while a
+            //raw model exposes dense weights, so the two checkpoint families are
+            //not interchangeable and must be rejected explicitly on load.
+            writer.Write(UsesQLora);
 
             writer.Write(currentEpoch);
             writer.Write(currentLoss);
@@ -305,10 +320,13 @@ namespace SimpleTransformer.Model
 
             int version = reader.ReadInt32();
 
-            if (version != 2)
+            //v2 predates the useQLora flag. Every v2 checkpoint was written by a
+            //QLoRA model (raw training was not reachable), so they are read as
+            //QLoRA=true and remain loadable.
+            if (version != 2 && version != 3)
             {
                 throw new InvalidDataException(
-                    $"Unsupported checkpoint schema version: {version}. Expected 2.");
+                    $"Unsupported checkpoint schema version: {version}. Expected 2 or 3.");
             }
             //Validate the checkpoint model id against the loaded model
 
@@ -320,6 +338,21 @@ namespace SimpleTransformer.Model
                 throw new InvalidDataException(
                     $"Checkpoint belongs to model {checkpointModelId}, " +
                     $"but was loaded into model {model.TransformerModelId}.");
+            }
+
+            bool checkpointUseQLora = true;
+            if (version >= 3)
+            {
+                checkpointUseQLora = reader.ReadBoolean();
+
+                if (checkpointUseQLora != model.UsesQLora)
+                {
+                    throw new InvalidDataException(
+                        $"Checkpoint was saved from a {(checkpointUseQLora ? "QLoRA" : "raw")} model, " +
+                        $"but this model is {(model.UsesQLora ? "QLoRA" : "raw")}. " +
+                        "The trainable parameters differ, so the checkpoint cannot be loaded. " +
+                        "Create a new model with the matching training mode.");
+                }
             }
 
             int epoch = reader.ReadInt32();
