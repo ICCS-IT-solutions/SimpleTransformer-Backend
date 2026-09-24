@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
 
 namespace SimpleTransformer.AppDb
 {
@@ -6,6 +7,8 @@ namespace SimpleTransformer.AppDb
     {
         [Key]
         public Guid EntryId { get; set; } = Guid.NewGuid();
+        public Guid TransformerModelId { get; set; }
+        public TransformerModelEntry? TransformerModel { get; set; }
         public required string Filename { get; set; }
         public required string Filepath { get; set; }
         public string? Sha256 { get; set; }

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using SimpleTransformer.Api.Endpoints.Services;
 using SimpleTransformer.Api.Requests;
 using SimpleTransformer.Api.Responses;
+using SimpleTransformer.AppDb;
 using SimpleTransformer.Model;
 using SimpleTransformer.Model.Tokenizer;
 
@@ -37,6 +38,12 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
 
             //Get the model and tokenizer from the injected instances in the constructor
             return await _service.Infer(req);
-        }        
+        } 
+
+        [HttpPost("api/v1/checkpoints/{transformerModelId}")]
+        public async Task<ApiResponse<List<TrainingCheckpointEntry>>> GetAvailableCheckpoints(Guid transformerModelId)
+        {
+            return await _service.GetCheckpointsForModel(transformerModelId);
+        }
     }
 }

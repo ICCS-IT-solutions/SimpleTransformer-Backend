@@ -79,6 +79,71 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     StatusCode = 500
                 };
             }
+            //Load and hydrate checkpoint
+            // -------------------------------------------------------------
+            // Checkpoint Hydration Logic
+            // -------------------------------------------------------------
+            if (req.TrainingCheckpointId.HasValue)
+            {
+                // Only load if the requested checkpoint differs from what is currently in memory
+                if (model.LoadedCheckpointId != req.TrainingCheckpointId.Value)
+                {
+                    var checkpointEntry = await db.TrainingCheckpoints
+                        .FirstOrDefaultAsync(x => x.EntryId == req.TrainingCheckpointId.Value);
+
+                    if (checkpointEntry == null)
+                    {
+                        return new ApiResponse<InferenceResponse>
+                        {
+                            Message = $"Checkpoint {req.TrainingCheckpointId.Value} not found.",
+                            Status = ResponseStatus.Error,
+                            StatusCode = 404
+                        };
+                    }
+
+                    // Ensure checkpoint matches model
+                    if (checkpointEntry.TransformerModelId != Guid.Empty &&
+                        checkpointEntry.TransformerModelId != model.TransformerModelId)
+                    {
+                        return new ApiResponse<InferenceResponse>
+                        {
+                            Message = "Checkpoint does not belong to the selected model.",
+                            Status = ResponseStatus.Error,
+                            StatusCode = 400
+                        };
+                    }
+
+                    string fullPath = Path.Combine(checkpointEntry.Filepath, checkpointEntry.Filename);
+                    if (!File.Exists(fullPath))
+                    {
+                        return new ApiResponse<InferenceResponse>
+                        {
+                            Message = $"Checkpoint binary file not found at '{fullPath}'.",
+                            Status = ResponseStatus.Error,
+                            StatusCode = 404
+                        };
+                    }
+
+                    try
+                    {
+                        await using var stream = File.OpenRead(fullPath);
+                        TransformerModel.LoadCheckpoint(stream, model);
+                        
+                        model.LoadedCheckpointId = checkpointEntry.EntryId;
+                    }
+                    catch (Exception ex)
+                    {
+                        return new ApiResponse<InferenceResponse>
+                        {
+                            Message = $"Failed to load checkpoint '{checkpointEntry.Filename}': {ex.Message}",
+                            Status = ResponseStatus.Error,
+                            StatusCode = 500
+                        };
+                    }
+                }
+            }            
+
+
             //Need a way to block inference if training is underway.
             if (string.IsNullOrEmpty(req.InputText)) 
                 throw new ArgumentException("Input must not be empty or null.");
@@ -132,6 +197,54 @@ namespace SimpleTransformer.Api.Endpoints.Services
 #endif
 
             return response;
+        }
+
+        public async Task<ApiResponse<List<TrainingCheckpointEntry>>> GetCheckpointsForModel(Guid transformerModelId)
+        {
+            using var db = await _dbFactory.CreateDbContextAsync();
+            var modelEntry = db.TransformerModels.FirstOrDefault(x => x.EntryId == transformerModelId);
+
+            if (modelEntry == null)
+            {
+                return new ApiResponse<List<TrainingCheckpointEntry>>
+                {
+                    Message = "Model not found.",
+                    Status = ResponseStatus.Error,
+                    StatusCode = 404
+                };
+            }
+
+            if (modelEntry.IsLoaded == false)
+            {
+                return new ApiResponse<List<TrainingCheckpointEntry>>
+                {
+                    Message = "Model not loaded.",
+                    Status = ResponseStatus.Error,
+                    StatusCode = 404
+                };
+            }
+
+            var foundCheckpoints = await db.TrainingCheckpoints
+            .Where(cp => cp.TransformerModelId == transformerModelId)
+            .ToListAsync();
+            
+            if(foundCheckpoints == null || foundCheckpoints.Count == 0)
+            {
+                return new ApiResponse<List<TrainingCheckpointEntry>>
+                {
+                    Message = "No checkpoints found.",
+                    Status = ResponseStatus.Error,
+                    StatusCode = 404
+                };
+            }
+
+            return new ApiResponse<List<TrainingCheckpointEntry>>
+            {
+                Message = "Checkpoints retrieved successfully.",
+                Status = ResponseStatus.Success,
+                StatusCode = 200,
+                Data = foundCheckpoints
+            };  
         }
 
         /// <summary>

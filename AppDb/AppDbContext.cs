@@ -36,6 +36,17 @@ namespace SimpleTransformer.AppDb
             modelBuilder.Entity<TrainingCheckpointEntry>()
                 .HasIndex(x => new { x.Filepath, x.Filename })
                 .IsUnique();
+            // Index for fast lookups by model
+            modelBuilder.Entity<TrainingCheckpointEntry>()
+                .HasIndex(x => x.TransformerModelId);
+
+            // Relationship configuration
+            modelBuilder.Entity<TrainingCheckpointEntry>()
+                .HasOne(x => x.TransformerModel)
+                .WithMany() // or .WithMany(m => m.Checkpoints) if added to TransformerModelEntry
+                .HasForeignKey(x => x.TransformerModelId)
+                .OnDelete(DeleteBehavior.Cascade); // or DeleteBehavior.Restrict depending on whether checkpoints should be kept if a model is deleted
+
             modelBuilder.Entity<VocabularyEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TrainingConfigPresetEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TransformerConfigPresetEntry>().HasKey(x => x.EntryId);

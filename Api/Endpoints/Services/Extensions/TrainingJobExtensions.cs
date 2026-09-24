@@ -306,6 +306,7 @@ public static class TrainingJobExtensions
                         //DB record per file instead of inserting a new row after every batch.
                         var checkpointEntry = await UpsertCheckpointAsync(
                             db,
+                            model.TransformerModelId,
                             $"checkpoints/{transformerModelName}/",
                             checkpointFilename,
                             epoch + 1,
@@ -397,6 +398,7 @@ public static class TrainingJobExtensions
                     //(a resumed run can recreate the same epoch/loss filename).
                     var checkpointEntry = await UpsertCheckpointAsync(
                         db,
+                        model.TransformerModelId,
                         $"checkpoints/{transformerModelName}/",
                         checkpointFilename,
                         epoch + 1,
@@ -486,6 +488,7 @@ public static class TrainingJobExtensions
     /// </summary>
     private static async Task<TrainingCheckpointEntry> UpsertCheckpointAsync(
         AppDbContext db,
+        Guid transformerModelId,
         string filepath,
         string filename,
         int epoch,
@@ -499,10 +502,15 @@ public static class TrainingJobExtensions
         {
             entry = new TrainingCheckpointEntry
             {
+                TransformerModelId = transformerModelId,
                 Filename = filename,
                 Filepath = filepath
             };
             await db.TrainingCheckpoints.AddAsync(entry);
+        }
+        else
+        {
+            entry.TransformerModelId = transformerModelId;
         }
 
         entry.Epoch = epoch;

@@ -13,6 +13,8 @@ namespace SimpleTransformer.Model
     public class TransformerModel : IDisposable
     {
         public Guid TransformerModelId { get; private set; }
+        public Guid? LoadedCheckpointId { get; internal set; }
+
         //These don't yet exist, but are created when the constructor calls BuildModel(). 
         private EmbeddingLayer _embedding = null!;
         private ILinearLayer _outputProjection = null!;

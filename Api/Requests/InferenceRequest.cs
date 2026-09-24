@@ -4,6 +4,7 @@ namespace SimpleTransformer.Api.Requests
     {
         public required string InputText { get; set; }
         public required Guid TransformerModelId { get; set; }
+        public Guid? TrainingCheckpointId { get; set; }
         public GenerationParameters GenerationParameters { get; set; } = new GenerationParameters();
     }
 
