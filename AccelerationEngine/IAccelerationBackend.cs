@@ -129,6 +129,22 @@ namespace SimpleTransformer.AccelerationEngine
         /// </summary>
         void ReleaseResidentWeights(TensorBase tensor) { }
 
+        /// <summary>
+        /// Optional refresh: re-uploads a tensor's current contents into its existing
+        /// VRAM-resident buffer after the host copy was mutated in place (an optimizer
+        /// step or checkpoint hydration). Returns false when the tensor is not resident
+        /// or the backend cannot cache (CPU backends) - callers may safely ignore the
+        /// result, the ordinary per-call upload path stays correct either way.
+        /// </summary>
+        bool TryRefreshResidentWeights(TensorBase tensor) => false;
+
+        /// <summary>
+        /// Optional one-line memory telemetry for logs, e.g. VRAM-resident bytes,
+        /// this process's VRAM usage and dispatch count. Empty string when the
+        /// backend has nothing to report (CPU backends).
+        /// </summary>
+        string DescribeMemoryUsage() => string.Empty;
+
         // Synchronization
         void Synchronize();
     }

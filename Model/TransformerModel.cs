@@ -517,6 +517,11 @@ namespace SimpleTransformer.Model
                 debugFileWriter.WriteLine($"Loaded parameter '{targetParam.Name}' with value {targetParam.Value.Data.Length} and {(targetParam.Gradient != null ? $"gradient {targetParam.Gradient.Data.Length}" : "no gradient")} from checkpoint.");
             }
 
+            //Array.Copy above mutated the weight arrays in place, so any VRAM
+            //resident copies now hold the pre-load weights; refresh them before
+            //the first MatMul can bind them.
+            RefreshResidentWeights();
+
             Log.Information("Successfully hydrated {Count} model weight tensors from checkpoint by parameter name.", modelParameters.Count);
         }
 
@@ -591,6 +596,12 @@ namespace SimpleTransformer.Model
                     DiagonisticUtilities.AssertNoNaN(p.Value, "Model weight matrix poisoned by optimizer step.");
                 }
 
+                // 8. Push the updated weights into their VRAM-resident copies (if
+                // any): one staged upload per tensor per step keeps the Vulkan
+                // MatMul fast path binding fresh device memory. CPU backends and
+                // non-resident tensors no-op immediately.
+                RefreshResidentWeights();
+
                 return loss;
             }
             finally
@@ -611,6 +622,20 @@ namespace SimpleTransformer.Model
             {
                 disposable.Dispose();
             }
+        }
+
+        /// <summary>
+        /// Re-uploads every trainable parameter into its existing VRAM-resident
+        /// device copy. Called after in-place weight updates (optimizer step,
+        /// checkpoint hydration) so the resident MatMul path never binds stale
+        /// weights. Safe no-op on CPU backends and for parameters that were never
+        /// promoted (they simply keep using the ordinary upload path).
+        /// </summary>
+        private void RefreshResidentWeights()
+        {
+            var backend = _workspace.Backend;
+            foreach (var p in Parameters)
+                backend.TryRefreshResidentWeights(p.Value);
         }
 
         public async Task<float> TrainStepAsync(TensorBase inputs, TensorBase expectedOutputs)

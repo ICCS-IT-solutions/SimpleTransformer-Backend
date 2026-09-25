@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using SimpleTransformer.AccelerationEngine;
 using SimpleTransformer.Model.Extensions;
 using SimpleTransformer.Model.Extensions.Numerics;
 
@@ -29,6 +30,14 @@ namespace SimpleTransformer.Model
         public Tensor? Bias => _bias;
 
         private TensorBase? _lastInput;
+
+        // VRAM residency (raw training): the weight matrix is a MatMul operand on
+        // every forward/backward call, so the Vulkan backend can keep one device
+        // copy instead of re-uploading it per call. Registration is attempted once
+        // on first use (CPU backends return false and change nothing); the device
+        // copy is refreshed after each optimizer step and released on dispose.
+        private bool _residentRegistrationAttempted;
+        private IAccelerationBackend? _residentBackend;
 
         // ThreadLocal storage to reuse dW and dB buffers across Parallel.For execution without allocations
         private readonly ThreadLocal<Tensor> _threadLocalDW;
@@ -90,12 +99,30 @@ namespace SimpleTransformer.Model
 
         public TensorBase Forward(TensorBase input, TensorWorkspace workspace)
         {
+            EnsureResidentWeights(workspace.Backend);
+
             return input.Rank switch
             {
                 2 => ForwardSequence(input, workspace),
                 3 => ForwardBatch(input, workspace),
                 _ => throw new ArgumentException("Linear layer expects rank 2 or rank 3.")
             };
+        }
+
+        /// <summary>
+        /// One-time promotion of the weight matrix into the backend's device
+        /// memory (Vulkan only). Subsequent MatMul calls bind the VRAM copy
+        /// directly; if the backend declines (CPU, over budget) the ordinary
+        /// per-call path keeps working unchanged.
+        /// </summary>
+        private void EnsureResidentWeights(IAccelerationBackend backend)
+        {
+            if (_residentRegistrationAttempted)
+                return;
+
+            _residentRegistrationAttempted = true;
+            _residentBackend = backend;
+            backend.TryRegisterResidentWeights(_weights, $"{Name}.weight");
         }
 
         private TensorBase ForwardSequence(TensorBase input, TensorWorkspace workspace)
@@ -307,6 +334,10 @@ namespace SimpleTransformer.Model
         }
         public void Dispose()
         {
+            //Give the device-local weight copy back to the driver before the
+            //managed tensors go away (no-op for CPU backends / unregistered).
+            _residentBackend?.ReleaseResidentWeights(_weights);
+
             _weightGradient.Dispose();
             _biasGradient?.Dispose();
         }

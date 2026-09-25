@@ -385,6 +385,33 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         }
 
         /// <summary>
+        /// Re-queries VK_EXT_memory_budget for this process's live VRAM usage so
+        /// telemetry reports current numbers instead of the init-time sample.
+        /// Cheap (one driver call), safe to call per epoch. No-op when the
+        /// extension is not enabled.
+        /// </summary>
+        public void RefreshMemoryUsage()
+        {
+            if (!_memoryBudgetEnabled || DeviceLocalHeapIndex == uint.MaxValue)
+                return;
+
+            var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT
+            {
+                SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt
+            };
+            var info = new PhysicalDeviceMemoryProperties2
+            {
+                SType = StructureType.PhysicalDeviceMemoryProperties2,
+                PNext = &budget
+            };
+
+            Vk.GetPhysicalDeviceMemoryProperties2(PhysicalDevice, &info);
+
+            DeviceLocalBudgetBytes = budget.HeapBudget[(int)DeviceLocalHeapIndex];
+            DeviceLocalUsageBytes = budget.HeapUsage[(int)DeviceLocalHeapIndex];
+        }
+
+        /// <summary>
         /// Works out whether Resizable BAR is in effect from the heap layout, and
         /// how much device-local memory the host can actually map.
         ///

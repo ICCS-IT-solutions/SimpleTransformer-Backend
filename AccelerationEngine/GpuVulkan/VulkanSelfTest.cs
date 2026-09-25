@@ -115,6 +115,28 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     else
                         Report("Resident idempotent register", 0f, 0f);
 
+                    // Refresh after an in-place update (the raw-training contract):
+                    // mutate the host weights as an optimizer step would, re-upload
+                    // via TryRefreshResidentWeights, and prove the next resident
+                    // MatMul binds the NEW values instead of the stale device copy.
+                    for (int i = 0; i < b.Data.Length; i++)
+                        b.Data[i] = b.Data[i] * 0.5f + 0.25f;
+                    Array.Copy(b.Data, referenceW.Data, b.Data.Length);
+
+                    bool refreshed = gpu.TryRefreshResidentWeights(b);
+                    if (!refreshed)
+                        Report("Resident refresh", 1f, 0f);
+                    else
+                    {
+                        ResidentMatMulCase("Resident refresh", 12, false);
+                    }
+
+                    // Refreshing a tensor that was never registered must report
+                    // false rather than pretending it did work.
+                    using (var unregistered = Rand(9, 11))
+                        Report("Refresh unregistered",
+                            gpu.TryRefreshResidentWeights(unregistered) ? 1f : 0f, 0f);
+
                     Console.WriteLine(
                         $"  [INFO] resident cache: {gpu.ResidentWeightCount} tensor(s), " +
                         $"{gpu.ResidentWeightBytes} B (VRAM budget {gpu.GpuMemoryBudgetBytes} B)");

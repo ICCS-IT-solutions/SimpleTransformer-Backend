@@ -14,6 +14,23 @@
       <SelfContained>true</SelfContained>
   </PropertyGroup> -->
 
+  <!--Config-->
+  <ItemGroup>
+    <None Update="config\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!--Database-->
+  <ItemGroup>
+    <None Update="data.db"> 
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="data.sqlite"> 
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>    
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
     <!-- <PackageReference Include="Microsoft.AspNetCore" Version="2.3.11" />

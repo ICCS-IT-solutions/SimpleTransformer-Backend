@@ -239,6 +239,83 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             }
         }
 
+        /// <summary>
+        /// Re-uploads the tensor's current contents into its existing VRAM-resident
+        /// buffer. Called after in-place weight updates (optimizer step, checkpoint
+        /// load) so the MatMul fast path keeps binding fresh device memory instead
+        /// of stale weights - one staged upload per tensor per step, replacing the
+        /// per-call pack+upload the ordinary path would do. Returns false when the
+        /// tensor is not resident (nothing to refresh) or staging fails; callers can
+        /// ignore the result, the ordinary path then simply re-uploads per call.
+        /// </summary>
+        public bool TryRefreshResidentWeights(TensorBase tensor)
+        {
+            if (_launcher == null || _ctx == null || _pool == null || ResidentWeightCount == 0)
+                return false;
+
+            //Only whole contiguous tensors, mirroring TryRegisterResidentWeights.
+            if (tensor.Offset != 0 || !tensor.IsContiguous)
+                return false;
+
+            int elementCount = tensor.Size;
+            if (elementCount <= 0)
+                return false;
+
+            long key = RuntimeHelpers.GetHashCode(tensor.Buffer);
+            VulkanBuffer device;
+            lock (_residentGate)
+            {
+                if (!TryFindResidentLocked(key, tensor.Buffer, tensor.Offset, elementCount, out device))
+                    return false; // not resident: nothing to refresh
+            }
+
+            VulkanBuffer? staging = null;
+            try
+            {
+                staging = _pool.Rent(elementCount);
+                staging.Upload(tensor.ReadOnlySpan[..elementCount]);
+                _launcher.CopyBuffer(staging, device, (ulong)elementCount * 4UL);
+                return true;
+            }
+            catch
+            {
+                //A stale device copy would silently feed old weights into every
+                //future MatMul, so drop the entry: the ordinary path then re-uploads
+                //per call and correctness is preserved.
+                ReleaseResidentWeights(tensor);
+                return false;
+            }
+            finally
+            {
+                if (staging != null) _pool.Return(staging);
+            }
+        }
+
+        /// <summary>
+        /// One-line memory telemetry: resident weights, this process's live VRAM
+        /// usage (re-queried via VK_EXT_memory_budget), the host staging pool and
+        /// the cumulative dispatch count. Empty when Vulkan is unavailable.
+        /// </summary>
+        public string DescribeMemoryUsage()
+        {
+            if (_ctx == null || _launcher == null)
+                return string.Empty;
+
+            _ctx.RefreshMemoryUsage();
+
+            const double mib = 1024.0 * 1024.0;
+            string vram = _ctx.MemoryBudgetSupported
+                ? $"process VRAM {_ctx.DeviceLocalUsageBytes / mib:F0} MiB " +
+                  $"of budget {_ctx.DeviceLocalBudgetBytes / mib:F0} MiB"
+                : $"VRAM heap {_ctx.DeviceLocalHeapSizeBytes / mib:F0} MiB " +
+                  "(live usage unavailable: VK_EXT_memory_budget not enabled)";
+
+            return $"VRAM-resident weights {ResidentWeightBytes / mib:F0} MiB " +
+                   $"across {ResidentWeightCount} tensors; {vram}; " +
+                   $"host pool {_pool?.HostRetainedBytes / mib ?? 0UL:F0} MiB; " +
+                   $"dispatches {DispatchCount}";
+        }
+
         private bool TryFindResidentLocked(long key, float[] backing, int offset, int elementCount, out VulkanBuffer buffer)
         {
             buffer = null!;

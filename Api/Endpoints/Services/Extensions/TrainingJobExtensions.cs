@@ -375,8 +375,17 @@ public static class TrainingJobExtensions
                     //count here, or the frontend renders e.g. "229 / 29".
                     job.CurrentBatch = job.TotalBatches;
                     job.CurrentLoss = epochLoss;
-                    job.Message =
-                        $"Epoch {epoch + 1} of {totalEpochs} completed.";
+
+                    //One-line memory snapshot so VRAM fill-up is visible per epoch
+                    //in both the log and the frontend job message (empty on CPU
+                    //backends, which have no device memory to report).
+                    string memory = model.Backend.DescribeMemoryUsage();
+                    job.Message = string.IsNullOrEmpty(memory)
+                        ? $"Epoch {epoch + 1} of {totalEpochs} completed."
+                        : $"Epoch {epoch + 1} of {totalEpochs} completed. {memory}";
+
+                    if (!string.IsNullOrEmpty(memory))
+                        Log.Information("Memory after epoch {Epoch}: {Memory}", epoch + 1, memory);
                 });
 
                 // Save checkpoint periodically via TransformerModel. Every 5 epochs or on the last epoch, save a checkpoint

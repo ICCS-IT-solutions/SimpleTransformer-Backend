@@ -142,6 +142,18 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// </summary>
         public uint? WorkingMemoryTypeIndex { get; private set; }
 
+        /// <summary>Live retained host-visible (system RAM) bytes across the pool.</summary>
+        public ulong HostRetainedBytes
+        {
+            get { lock (_gate) return _hostRetainedBytes; }
+        }
+
+        /// <summary>Live retained DEVICE_LOCAL (VRAM) bytes across the pool.</summary>
+        public ulong DeviceLocalRetainedBytes
+        {
+            get { lock (_gate) return _deviceLocalRetainedBytes; }
+        }
+
         public void Return(VulkanBuffer buffer)
         {
             if (buffer == null)
