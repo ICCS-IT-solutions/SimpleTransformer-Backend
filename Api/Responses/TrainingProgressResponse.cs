@@ -11,6 +11,9 @@ namespace SimpleTransformer.Api.Responses
         //resolve the exact model definition the job belongs to.
         public string TransformerModelId { get; set; } = string.Empty;
         public string TransformerModelName { get; set; } = string.Empty;
+        //Original filenames uploaded for file based jobs, comma separated.
+        //Empty for live text jobs.
+        public string SourceFileNames { get; set; } = string.Empty;
         public TrainingJobStatus Status { get; set; }
         public int CurrentEpoch { get; set; }
         public int TotalEpochs { get; set; }

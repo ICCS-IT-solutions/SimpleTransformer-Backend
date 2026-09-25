@@ -118,11 +118,13 @@ namespace SimpleTransformer.Api.Endpoints.Services
         public async Task<ApiResponse<TrainingResponse>> CreateJobFromFile(
             TrainingFileRequest req)
         {
-            if (req.TextFile == null || req.TextFile.Length == 0)
+            if (req.TextFiles == null ||
+                req.TextFiles.Count == 0 ||
+                req.TextFiles.All(f => f == null || f.Length == 0))
             {
                 return new ApiResponse<TrainingResponse>
                 {
-                    Message = "Training file must not be empty.",
+                    Message = "At least one non-empty training file must be provided.",
                     Status = ResponseStatus.Failure,
                     StatusCode = 400
                 };
@@ -167,22 +169,41 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             var jobId = Guid.NewGuid();
 
-            var extension = Path.GetExtension(req.TextFile.FileName);
-            var fileName = $"training-data{extension}";
-
             var jobDirectory = Path.Combine(
                 "training-data",
                 jobId.ToString());
 
             Directory.CreateDirectory(jobDirectory);
 
+            //Concatenate every uploaded file into a single training corpus so
+            //the existing single file training pipeline keeps working unchanged.
+            //The original filenames are captured on the job entry for provenance.
             var filePath = Path.Combine(
                 jobDirectory,
-                fileName);
+                "training-data.txt");
 
-            await using (var fileStream = File.Create(filePath))
+            var sourceFileNames = new List<string>();
+
+            await using (var writer = new StreamWriter(filePath, append: false))
             {
-                await req.TextFile.CopyToAsync(fileStream);
+                foreach (var file in req.TextFiles)
+                {
+                    if (file == null || file.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    sourceFileNames.Add(Path.GetFileName(file.FileName));
+
+                    using var reader = new StreamReader(file.OpenReadStream());
+                    var content = await reader.ReadToEndAsync();
+
+                    await writer.WriteAsync(content);
+
+                    //Document boundary between concatenated files.
+                    await writer.WriteLineAsync();
+                    await writer.WriteLineAsync();
+                }
             }
 
             var job = new TrainingJobEntry
@@ -198,6 +219,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
                 InputText = null,
                 InputFilePath = filePath,
+                SourceFileNames = string.Join(", ", sourceFileNames),
 
                 PreviousCheckpointId = req.PreviousCheckpointId,
 
@@ -858,6 +880,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     NumSubBatches = job.TotalSubBatches,
                     Message = job.Message,
                     Checkpoint = job.CheckpointFilename,
+                    SourceFileNames = job.SourceFileNames,
                     StartedAt = job.DateStarted,
                     CompletedAt = job.DateCompleted,
                     LastUpdatedAt = job.DateUpdated,
@@ -921,6 +944,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     NumSubBatches = x.TotalSubBatches,
                     Message = x.Message,
                     Checkpoint = x.CheckpointFilename,
+                    SourceFileNames = x.SourceFileNames,
                     StartedAt = x.DateStarted,
                     CompletedAt = x.DateCompleted,
                     LastUpdatedAt = x.DateUpdated,

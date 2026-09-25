@@ -28,6 +28,9 @@ namespace SimpleTransformer.AppDb
         //Training sources
         public string? InputText { get; set; } //For live training
         public string InputFilePath { get; set; } = string.Empty; //For batch training using files
+        //Original filenames uploaded for file based jobs, comma separated so a
+        //job can always be traced back to the exact corpus it was trained on.
+        public string SourceFileNames { get; set; } = string.Empty;
 
         // Optional checkpoint to resume from
         public Guid? PreviousCheckpointId { get; set; }

@@ -14,7 +14,9 @@ namespace SimpleTransformer.Api.Requests
     }
     public class TrainingFileRequest
     {
-        public required IFormFile TextFile { get; set; }
+        //One or more corpus files. They are concatenated server-side into a
+        //single training corpus while the original names are kept for tracking.
+        public List<IFormFile> TextFiles { get; set; } = new();
         public required Guid TransformerModelId { get; set; }
         public Guid VocabularyId { get; set; }
         public Guid? PreviousCheckpointId { get; set; }
