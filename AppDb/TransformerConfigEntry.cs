@@ -7,6 +7,7 @@ namespace SimpleTransformer.AppDb
     {
         [Key]
         public Guid EntryId { get; set; } = Guid.NewGuid();
+        public string? DisplayName { get; set; }
         public required string Name { get; set; }
         public required string Description { get; set; }
         public required TransformerConfig Config { get; set; }
@@ -17,6 +18,7 @@ namespace SimpleTransformer.AppDb
     {
         [Key]
         public Guid EntryId { get; set; } = Guid.NewGuid();
+        public string? DisplayName { get; set; }
         public required string Name { get; set; }
         public required Guid TransformerConfigId { get; set; }
         public required TransformerConfig Config { get; set; }

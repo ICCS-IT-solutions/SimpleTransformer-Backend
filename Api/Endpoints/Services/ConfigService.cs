@@ -53,6 +53,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
             using var _db = await _dbFactory.CreateDbContextAsync();
             var configToAdd = new TransformerConfigEntry
             {
+                DisplayName = req.DisplayName,
                 Name = req.Name,
                 Description = req.Description,
                 //Map each of the config variables to the ones coming from the request -> Config object
@@ -157,6 +158,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
+            config.DisplayName = req.DisplayName;
             config.Name = req.Name;
             config.Description = req.Description;
             config.Config = req.Config;
@@ -165,7 +167,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             return new ApiResponse<ConfigManagerResponse>
             {
-                Message = "Training configuration updated successfully.",
+                Message = "Transformer configuration updated successfully.",
                 Status = ResponseStatus.Success,
                 StatusCode = 200
             };
