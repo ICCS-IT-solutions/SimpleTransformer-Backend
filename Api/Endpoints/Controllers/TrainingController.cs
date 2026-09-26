@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using SimpleTransformer.Api.Endpoints.Services;
+using SimpleTransformer.Api.Endpoints.Services.Extensions;
 using SimpleTransformer.Api.Requests;
 using SimpleTransformer.Api.Responses;
 using SimpleTransformer.AppDb;
@@ -36,6 +37,14 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         public async Task<ApiResponse<TrainingResponse>> CreateJobFromFile([FromForm] TrainingFileRequest req)
         {
             return await _trainingService.CreateJobFromFile(req);
+        }
+
+        //Dry-run extract + preprocess over uploads. Creates no job and writes
+        //no files; returns the audit report with warnings and samples.
+        [HttpPost("api/v1/train/preview")]
+        public async Task<ApiResponse<CorpusPreprocessReport>> PreviewCorpus([FromForm] CorpusPreviewRequest req)
+        {
+            return await _trainingService.PreviewCorpus(req);
         }
 
         //This may come in as a string, so if it does, I need to parse it as a guid.

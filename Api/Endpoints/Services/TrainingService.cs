@@ -2,6 +2,7 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
+using SimpleTransformer.Api.Endpoints.Services.Extensions;
 using SimpleTransformer.Api.ManagementEngine;
 using SimpleTransformer.Api.Requests;
 using SimpleTransformer.Api.Responses;
@@ -118,9 +119,21 @@ namespace SimpleTransformer.Api.Endpoints.Services
         public async Task<ApiResponse<TrainingResponse>> CreateJobFromFile(
             TrainingFileRequest req)
         {
-            if (req.TextFiles == null ||
-                req.TextFiles.Count == 0 ||
-                req.TextFiles.All(f => f == null || f.Length == 0))
+            var hasUploads = req.TextFiles != null &&
+                req.TextFiles.Any(f => f != null && f.Length > 0);
+
+            // Either fresh uploads or a saved corpus must be provided, not both.
+            if (req.TrainingCorpusId.HasValue && hasUploads)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "Provide either uploaded files or a saved corpus, not both.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            if (!req.TrainingCorpusId.HasValue && !hasUploads)
             {
                 return new ApiResponse<TrainingResponse>
                 {
@@ -175,36 +188,170 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             Directory.CreateDirectory(jobDirectory);
 
-            //Concatenate every uploaded file into a single training corpus so
-            //the existing single file training pipeline keeps working unchanged.
-            //The original filenames are captured on the job entry for provenance.
+            //Extract plain-text documents from each upload (.txt passes through;
+            //JSON/JSONL shapes are deserialized), clean them, then concatenate
+            //into a single training corpus so the existing single file training
+            //pipeline keeps working unchanged. The original filenames are
+            //captured on the job entry for provenance.
             var filePath = Path.Combine(
                 jobDirectory,
                 "training-data.txt");
 
             var sourceFileNames = new List<string>();
+            Guid? trainingCorpusId = null;
+            string corpusSummary;
+
+            if (req.TrainingCorpusId.HasValue)
+            {
+                // Saved corpus path: copy the immutable snapshot into the job
+                // directory so the job stays self-contained and restart-safe.
+                var corpus = await db.TrainingCorpora
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x => x.EntryId == req.TrainingCorpusId.Value);
+
+                if (corpus == null)
+                {
+                    return new ApiResponse<TrainingResponse>
+                    {
+                        Message = "Saved corpus not found.",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 404
+                    };
+                }
+
+                var corpusSourcePath = Path.Combine(corpus.Filepath, corpus.Filename);
+                if (!File.Exists(corpusSourcePath))
+                {
+                    return new ApiResponse<TrainingResponse>
+                    {
+                        Message = $"Saved corpus '{corpus.Name}' is missing its file on disk.",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 410
+                    };
+                }
+
+                File.Copy(corpusSourcePath, filePath, overwrite: true);
+
+                var corpusReportPath = Path.Combine(corpus.Filepath, "preprocess-report.json");
+                if (File.Exists(corpusReportPath))
+                {
+                    File.Copy(corpusReportPath, Path.Combine(jobDirectory, "preprocess-report.json"), overwrite: true);
+                }
+
+                trainingCorpusId = corpus.EntryId;
+                sourceFileNames.Add($"corpus:{corpus.Name}");
+                if (!string.IsNullOrEmpty(corpus.SourceFileNames))
+                {
+                    sourceFileNames.Add(corpus.SourceFileNames);
+                }
+
+                corpusSummary = $"Saved corpus '{corpus.Name}': " +
+                    $"{corpus.DocumentsOut} documents ({corpus.CharsOut} chars).";
+                Log.Information("Training job {JobId} uses saved corpus '{Name}'.", jobId, corpus.Name);
+            }
+            else
+            {
+
+            var extractions = new List<CorpusExtractionResult>();
+
+            CorpusSourceFormat requestedFormat;
+            try
+            {
+                requestedFormat = req.ResolveFormat();
+            }
+            catch (ArgumentException ex)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = ex.Message,
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            foreach (var file in req.TextFiles)
+            {
+                if (file == null || file.Length == 0)
+                {
+                    continue;
+                }
+
+                var uploadName = Path.GetFileName(file.FileName);
+                sourceFileNames.Add(uploadName);
+
+                CorpusExtractionResult extraction;
+                try
+                {
+                    await using var uploadStream = file.OpenReadStream();
+                    extraction = await TrainingCorpusExtractor.ExtractAsync(
+                        uploadStream,
+                        uploadName,
+                        requestedFormat,
+                        req.TextField,
+                        req.Template);
+                }
+                catch (JsonException ex)
+                {
+                    return new ApiResponse<TrainingResponse>
+                    {
+                        Message = $"File '{uploadName}' is not valid JSON: {ex.Message}",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 400
+                    };
+                }
+
+                extractions.Add(extraction);
+            }
+
+            if (extractions.Count == 0)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "At least one non-empty training file must be provided.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            var (cleaned, report) = CorpusPreprocessor.Process(extractions, req.ToOptions());
+
+            if (cleaned.Count == 0)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "No usable training text could be extracted from the uploaded files. " +
+                        string.Join(" ", report.Warnings.Take(5)),
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
 
             await using (var writer = new StreamWriter(filePath, append: false))
             {
-                foreach (var file in req.TextFiles)
+                foreach (var document in cleaned)
                 {
-                    if (file == null || file.Length == 0)
-                    {
-                        continue;
-                    }
+                    await writer.WriteAsync(document);
 
-                    sourceFileNames.Add(Path.GetFileName(file.FileName));
-
-                    using var reader = new StreamReader(file.OpenReadStream());
-                    var content = await reader.ReadToEndAsync();
-
-                    await writer.WriteAsync(content);
-
-                    //Document boundary between concatenated files.
+                    //Document boundary between concatenated documents.
                     await writer.WriteLineAsync();
                     await writer.WriteLineAsync();
                 }
             }
+
+            //Audit trail beside the corpus: options, stats, warnings, samples.
+            var reportJson = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(Path.Combine(jobDirectory, "preprocess-report.json"), reportJson);
+
+            Log.Information(
+                "Training corpus prepared from {FileCount} file(s): {DocsIn} documents in, {DocsOut} out " +
+                "({Dedup} duplicates removed, {Filtered} filtered).",
+                extractions.Count, report.DocumentsIn, report.DocumentsOut,
+                report.DuplicatesRemoved, report.FilteredByLength + report.FilteredEmpty);
+
+            corpusSummary = $"Corpus: {report.DocumentsOut} documents ({report.CharsOut} chars) from " +
+                $"{extractions.Count} file(s); {report.DuplicatesRemoved} duplicates removed, " +
+                $"{report.FilteredByLength + report.FilteredEmpty} filtered.";
+            } // end upload path
 
             var job = new TrainingJobEntry
             {
@@ -220,6 +367,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 InputText = null,
                 InputFilePath = filePath,
                 SourceFileNames = string.Join(", ", sourceFileNames),
+                TrainingCorpusId = trainingCorpusId,
 
                 PreviousCheckpointId = req.PreviousCheckpointId,
 
@@ -232,9 +380,82 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             return new ApiResponse<TrainingResponse>
             {
-                Message = "Training job created successfully.",
+                Message = $"Training job created successfully. {corpusSummary}",
                 Status = ResponseStatus.Success,
                 StatusCode = 200
+            };
+        }
+
+        /// <summary>
+        /// Dry-run extract + preprocess over uploads. Creates no job and writes
+        /// no files; returns the audit report with warnings and samples.
+        /// </summary>
+        public async Task<ApiResponse<CorpusPreprocessReport>> PreviewCorpus(CorpusPreviewRequest req)
+        {
+            var files = req.TextFiles?
+                .Where(f => f != null && f.Length > 0)
+                .ToList() ?? new List<IFormFile>();
+
+            if (files.Count == 0)
+            {
+                return new ApiResponse<CorpusPreprocessReport>
+                {
+                    Message = "At least one non-empty file must be provided for preview.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            CorpusSourceFormat requestedFormat;
+            try
+            {
+                requestedFormat = req.ResolveFormat();
+            }
+            catch (ArgumentException ex)
+            {
+                return new ApiResponse<CorpusPreprocessReport>
+                {
+                    Message = ex.Message,
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            var extractions = new List<CorpusExtractionResult>();
+            foreach (var file in files)
+            {
+                var uploadName = Path.GetFileName(file!.FileName);
+                try
+                {
+                    await using var uploadStream = file.OpenReadStream();
+                    extractions.Add(await TrainingCorpusExtractor.ExtractAsync(
+                        uploadStream,
+                        uploadName,
+                        requestedFormat,
+                        req.TextField,
+                        req.Template));
+                }
+                catch (JsonException ex)
+                {
+                    return new ApiResponse<CorpusPreprocessReport>
+                    {
+                        Message = $"File '{uploadName}' is not valid JSON: {ex.Message}",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 400
+                    };
+                }
+            }
+
+            var (_, report) = CorpusPreprocessor.Process(extractions, req.ToOptions());
+
+            return new ApiResponse<CorpusPreprocessReport>
+            {
+                Message = report.DocumentsOut > 0
+                    ? $"Preview ready: {report.DocumentsOut} of {report.DocumentsIn} documents usable."
+                    : "Preview ready: no usable training text found. See warnings.",
+                Status = ResponseStatus.Success,
+                StatusCode = 200,
+                Data = report
             };
         }
 

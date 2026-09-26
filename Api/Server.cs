@@ -93,6 +93,7 @@ namespace SimpleTransformer.Api
                 // 6. Request API Services (Should be Scoped)
                 builder.Services.AddScoped<VocabularyService>();
                 builder.Services.AddScoped<TrainingService>();
+                builder.Services.AddScoped<TrainingCorpusService>();
                 builder.Services.AddScoped<InferenceService>();
                 builder.Services.AddScoped<TransformerModelService>();
                 builder.Services.AddScoped<ConfigService>();

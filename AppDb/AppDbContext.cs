@@ -18,6 +18,7 @@ namespace SimpleTransformer.AppDb
         public DbSet<TransformerConfigPresetEntry> TransformerConfigPresets { get; set; } = null!;
         public DbSet<TransformerModelEntry> TransformerModels { get; set; } = null!;
         public DbSet<TrainingJobEntry> TrainingJobs { get; set; } = null!;
+        public DbSet<TrainingCorpusEntry> TrainingCorpora { get; set; } = null!;
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -52,6 +53,11 @@ namespace SimpleTransformer.AppDb
             modelBuilder.Entity<TransformerConfigPresetEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TransformerModelEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TrainingJobEntry>().HasKey(x => x.EntryId);
+            modelBuilder.Entity<TrainingCorpusEntry>().HasKey(x => x.EntryId);
+
+            modelBuilder.Entity<TrainingCorpusEntry>()
+                .HasIndex(x => x.Name)
+                .IsUnique();
 
             // ---------------------------------------------------------------------
             // Training configuration
@@ -117,6 +123,9 @@ namespace SimpleTransformer.AppDb
             modelBuilder.Entity<TrainingJobEntry>()
                 .HasIndex(x => x.TrainingCheckpointId);
 
+            modelBuilder.Entity<TrainingJobEntry>()
+                .HasIndex(x => x.TrainingCorpusId);
+
             // ---------------------------------------------------------------------
             // Relationships
             // ---------------------------------------------------------------------
@@ -149,6 +158,12 @@ namespace SimpleTransformer.AppDb
                 .HasOne(x => x.TrainingCheckpoint)
                 .WithMany()
                 .HasForeignKey(x => x.TrainingCheckpointId)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            modelBuilder.Entity<TrainingJobEntry>()
+                .HasOne(x => x.TrainingCorpus)
+                .WithMany()
+                .HasForeignKey(x => x.TrainingCorpusId)
                 .OnDelete(DeleteBehavior.SetNull);
 
         }

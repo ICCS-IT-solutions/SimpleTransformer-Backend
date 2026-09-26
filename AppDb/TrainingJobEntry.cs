@@ -35,6 +35,11 @@ namespace SimpleTransformer.AppDb
         // Optional checkpoint to resume from
         public Guid? PreviousCheckpointId { get; set; }
 
+        // Optional saved corpus this job trains on. When set, the job's
+        // training-data.txt is a copy of the corpus file taken at creation.
+        public Guid? TrainingCorpusId { get; set; }
+        public TrainingCorpusEntry? TrainingCorpus { get; set; }
+
         //Status
         public DateTime DateCreated { get; set; } = DateTime.UtcNow;
         public DateTime DateUpdated { get; set; }
