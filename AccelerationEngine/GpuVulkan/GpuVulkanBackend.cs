@@ -736,32 +736,55 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             return flat;
         }
 
+        private static bool IsFullyContiguous(TensorBase t) =>
+            t.IsContiguous && (t.Rank <= 2 || t.LayerStride == t.Rows * t.Stride);
+
         private static void PackInto(TensorBase t, Span<float> flat)
         {
+            if (IsFullyContiguous(t))
+            {
+                t.ReadOnlySpan[..t.Size].CopyTo(flat);
+                return;
+            }
+
             int rows = RowCount(t);
             for (int r = 0; r < rows; r++)
                 Row(t, r).CopyTo(flat.Slice(r * t.Cols, t.Cols));
         }
 
-        private float[] RentScratch(int count)
+        private static void Unpack(ReadOnlySpan<float> flat, TensorBase t)
         {
-            // Small-count scratch comes from a lock-free per-size cache;
-            // rented arrays are returned explicitly by callers below.
-            return ScratchCache.Rent(count);
-        }
+            if (IsFullyContiguous(t))
+            {
+                flat[..t.Size].CopyTo(t.Span);
+                return;
+            }
 
-        private static void ReturnScratch(float[] array)
-        {
-            ScratchCache.Return(array);
+            int rows = RowCount(t);
+            for (int r = 0; r < rows; r++)
+                flat.Slice(r * t.Cols, t.Cols).CopyTo(Row(t, r));
         }
-
         private VulkanBuffer RentBuffer(int floatCount)
         {
+            if (VulkanPhaseProfile.Enabled)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                var buf = _pool!.Rent(floatCount);
+                VulkanPhaseProfile.RecordPool(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+                return buf;
+            }
             return _pool!.Rent(floatCount);
         }
 
         private void ReturnBuffer(VulkanBuffer buffer)
         {
+            if (VulkanPhaseProfile.Enabled)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                _pool!.Return(buffer);
+                VulkanPhaseProfile.RecordPool(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+                return;
+            }
             _pool!.Return(buffer);
         }
 
@@ -785,11 +808,33 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             public void Dispose() => _launcher?.OpFinish();
         }
 
-        private static void Unpack(ReadOnlySpan<float> flat, TensorBase t)
+
+        private static void PackBuffer(TensorBase t, VulkanBuffer buf, int count)
         {
-            int rows = RowCount(t);
-            for (int r = 0; r < rows; r++)
-                flat.Slice(r * t.Cols, t.Cols).CopyTo(Row(t, r));
+            if (VulkanPhaseProfile.Enabled)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                PackInto(t, buf.HostFloats(count));
+                buf.CommitUpload(count);
+                VulkanPhaseProfile.RecordStageIn(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+                return;
+            }
+            PackInto(t, buf.HostFloats(count));
+            buf.CommitUpload(count);
+        }
+
+        private static void UnpackBuffer(VulkanBuffer buf, TensorBase t, int count)
+        {
+            if (VulkanPhaseProfile.Enabled)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                buf.CommitDownload(count);
+                Unpack(buf.ReadOnlyHostFloats(count), t);
+                VulkanPhaseProfile.RecordStageOut(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+                return;
+            }
+            buf.CommitDownload(count);
+            Unpack(buf.ReadOnlyHostFloats(count), t);
         }
 
         private void RunUnary(VulkanKernel kernel, TensorBase tensor, float alpha)
@@ -803,21 +848,17 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
-            float[] flat = RentScratch(count);
             var buf = RentBuffer(count);
             try
             {
-                PackInto(tensor, flat.AsSpan(0, count));
-                buf.Upload(flat.AsSpan(0, count));
+                PackBuffer(tensor, buf, count);
                 buf.MarkReadback();
                 _launcher.Dispatch(kernel, new[] { buf }, (uint)count, alpha);
-                buf.Download(flat.AsSpan(0, count));
-                Unpack(flat.AsSpan(0, count), tensor);
+                UnpackBuffer(buf, tensor, count);
             }
             finally
             {
                 ReturnBuffer(buf);
-                ReturnScratch(flat);
             }
         }
 
@@ -838,27 +879,20 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(target) * target.Cols;
-            float[] a = RentScratch(count);
-            float[] b = RentScratch(count);
             var ba = RentBuffer(count);
             var bb = RentBuffer(count);
             try
             {
-                PackInto(target, a.AsSpan(0, count));
-                PackInto(source, b.AsSpan(0, count));
-                ba.Upload(a.AsSpan(0, count));
-                bb.Upload(b.AsSpan(0, count));
+                PackBuffer(target, ba, count);
+                PackBuffer(source, bb, count);
                 ba.MarkReadback();
                 _launcher.Dispatch(kernel, new[] { ba, bb }, (uint)count, 0f);
-                ba.Download(a.AsSpan(0, count));
-                Unpack(a.AsSpan(0, count), target);
+                UnpackBuffer(ba, target, count);
             }
             finally
             {
                 ReturnBuffer(ba);
                 ReturnBuffer(bb);
-                ReturnScratch(a);
-                ReturnScratch(b);
             }
         }
 
@@ -881,31 +915,22 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(a) * a.Cols;
-            float[] fa = RentScratch(count);
-            float[] fb = RentScratch(count);
-            float[] fr = RentScratch(count);
             var ba = RentBuffer(count);
             var bb = RentBuffer(count);
             var br = RentBuffer(count);
             try
             {
-                PackInto(a, fa.AsSpan(0, count));
-                PackInto(b, fb.AsSpan(0, count));
-                ba.Upload(fa.AsSpan(0, count));
-                bb.Upload(fb.AsSpan(0, count));
+                PackBuffer(a, ba, count);
+                PackBuffer(b, bb, count);
                 br.MarkReadback();
                 _launcher.Dispatch(kernel, new[] { ba, bb, br }, (uint)count, 0f);
-                br.Download(fr.AsSpan(0, count));
-                Unpack(fr.AsSpan(0, count), result);
+                UnpackBuffer(br, result, count);
             }
             finally
             {
                 ReturnBuffer(ba);
                 ReturnBuffer(bb);
                 ReturnBuffer(br);
-                ReturnScratch(fa);
-                ReturnScratch(fb);
-                ReturnScratch(fr);
             }
         }
 
@@ -949,36 +974,18 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             bool aResident = TryGetResidentBuffer(a, countA, out var residentA);
             bool bResident = TryGetResidentBuffer(b, countB, out var residentB);
 
-            float[] fa = aResident ? null! : Pack(a);
-            float[] fb = bResident ? null! : Pack(b);
-            if (!aResident && countA < fa.Length)
-                throw new ArgumentException("MatMul operand pack size mismatch.");
-            if (!bResident && countB < fb.Length)
-                throw new ArgumentException("MatMul operand pack size mismatch.");
-
-            float[] fr = RentScratch(countR);
             var ba = aResident ? residentA : RentBuffer(countA);
             var bb = bResident ? residentB : RentBuffer(countB);
             var br = RentBuffer(countR);
             try
             {
-                // PackInto handles strided/views; accumulate needs the current
-                // result contents on the device (the kernel reads r[ri]).
+                // Pack directly into buffer's mapped staging memory
                 if (!aResident)
-                {
-                    PackInto(a, fa.AsSpan(0, countA));
-                    ba.Upload(fa.AsSpan(0, countA));
-                }
+                    PackBuffer(a, ba, countA);
                 if (!bResident)
-                {
-                    PackInto(b, fb.AsSpan(0, countB));
-                    bb.Upload(fb.AsSpan(0, countB));
-                }
+                    PackBuffer(b, bb, countB);
                 if (accumulate)
-                {
-                    PackInto(result, fr.AsSpan(0, countR));
-                    br.Upload(fr.AsSpan(0, countR));
-                }
+                    PackBuffer(result, br, countR);
 
                 br.MarkReadback();
                 _launcher.DispatchMatMul(
@@ -986,24 +993,16 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     ba, bb, br, (uint)m, (uint)n, (uint)k, (uint)batch,
                     transposeA, transposeB, accumulate);
 
-                br.Download(fr.AsSpan(0, countR));
-                Unpack(fr.AsSpan(0, countR), result);
+                UnpackBuffer(br, result, countR);
             }
             finally
             {
                 // Resident buffers are owned by the cache, never returned to the pool.
                 if (!aResident)
-                {
                     ReturnBuffer(ba);
-                    ReturnScratch(fa);
-                }
                 if (!bResident)
-                {
                     ReturnBuffer(bb);
-                    ReturnScratch(fb);
-                }
                 ReturnBuffer(br);
-                ReturnScratch(fr);
             }
         }
 
@@ -1030,21 +1029,17 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.GeluInPlace(tensor); return; }
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
-            float[] f = RentScratch(count);
             var b = RentBuffer(count);
             try
             {
-                PackInto(tensor, f.AsSpan(0, count));
-                b.Upload(f.AsSpan(0, count));
+                PackBuffer(tensor, b, count);
                 b.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.GeluInPlace, new[] { b }, (uint)RowCount(tensor), (uint)tensor.Cols);
-                b.Download(f.AsSpan(0, count));
-                Unpack(f.AsSpan(0, count), tensor);
+                UnpackBuffer(b, tensor, count);
             }
             finally
             {
                 ReturnBuffer(b);
-                ReturnScratch(f);
             }
         }
 
@@ -1054,25 +1049,19 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.GeluInto(input, result); return; }
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(input) * input.Cols;
-            float[] fa = RentScratch(count);
-            float[] fr = RentScratch(count);
             var ba = RentBuffer(count);
             var br = RentBuffer(count);
             try
             {
-                PackInto(input, fa.AsSpan(0, count));
-                ba.Upload(fa.AsSpan(0, count));
+                PackBuffer(input, ba, count);
                 br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.GeluInto, new[] { ba, br }, (uint)RowCount(input), (uint)input.Cols);
-                br.Download(fr.AsSpan(0, count));
-                Unpack(fr.AsSpan(0, count), result);
+                UnpackBuffer(br, result, count);
             }
             finally
             {
                 ReturnBuffer(ba);
                 ReturnBuffer(br);
-                ReturnScratch(fa);
-                ReturnScratch(fr);
             }
         }
 
@@ -1083,31 +1072,22 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.GeluBackwardInto(input, outputGradient, inputGradient); return; }
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(input) * input.Cols;
-            float[] fx = RentScratch(count);
-            float[] fy = RentScratch(count);
-            float[] fr = RentScratch(count);
             var bx = RentBuffer(count);
             var by = RentBuffer(count);
             var br = RentBuffer(count);
             try
             {
-                PackInto(input, fx.AsSpan(0, count));
-                PackInto(outputGradient, fy.AsSpan(0, count));
-                bx.Upload(fx.AsSpan(0, count));
-                by.Upload(fy.AsSpan(0, count));
+                PackBuffer(input, bx, count);
+                PackBuffer(outputGradient, by, count);
                 br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.GeluBackward, new[] { bx, by, br }, (uint)RowCount(input), (uint)input.Cols);
-                br.Download(fr.AsSpan(0, count));
-                Unpack(fr.AsSpan(0, count), inputGradient);
+                UnpackBuffer(br, inputGradient, count);
             }
             finally
             {
                 ReturnBuffer(bx);
                 ReturnBuffer(by);
                 ReturnBuffer(br);
-                ReturnScratch(fx);
-                ReturnScratch(fy);
-                ReturnScratch(fr);
             }
         }
 
@@ -1117,29 +1097,23 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.LayerNormInPlace(tensor, gamma, beta, epsilon); return; }
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
-            float[] f = RentScratch(count);
-            float[] g = Pack1D(gamma);
-            float[] bb = Pack1D(beta);
             var bx = RentBuffer(count);
-            var bg = RentBuffer(g.Length);
-            var bbb = RentBuffer(bb.Length);
+            var bg = RentBuffer(gamma.Cols);
+            var bbb = RentBuffer(beta.Cols);
             try
             {
-                PackInto(tensor, f.AsSpan(0, count));
-                bx.Upload(f.AsSpan(0, count));
-                bg.Upload(g);
-                bbb.Upload(bb);
+                PackBuffer(tensor, bx, count);
+                PackBuffer(gamma, bg, gamma.Cols);
+                PackBuffer(beta, bbb, beta.Cols);
                 bx.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.LayerNormInPlace, new[] { bx, bg, bbb }, (uint)RowCount(tensor), (uint)tensor.Cols, epsilon);
-                bx.Download(f.AsSpan(0, count));
-                Unpack(f.AsSpan(0, count), tensor);
+                UnpackBuffer(bx, tensor, count);
             }
             finally
             {
                 ReturnBuffer(bx);
                 ReturnBuffer(bg);
                 ReturnBuffer(bbb);
-                ReturnScratch(f);
             }
         }
 
@@ -1152,24 +1126,18 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             int count = RowCount(input) * input.Cols;
             if (RowCount(result) * result.Cols != count)
                 throw new ArgumentException("LayerNormInto: shape mismatch.");
-            float[] fa = RentScratch(count);
-            float[] fr = RentScratch(count);
-            float[] g = Pack1D(gamma);
-            float[] bb = Pack1D(beta);
             var ba = RentBuffer(count);
-            var bg = RentBuffer(g.Length);
-            var bbb = RentBuffer(bb.Length);
+            var bg = RentBuffer(gamma.Cols);
+            var bbb = RentBuffer(beta.Cols);
             var br = RentBuffer(count);
             try
             {
-                PackInto(input, fa.AsSpan(0, count));
-                ba.Upload(fa.AsSpan(0, count));
-                bg.Upload(g);
-                bbb.Upload(bb);
+                PackBuffer(input, ba, count);
+                PackBuffer(gamma, bg, gamma.Cols);
+                PackBuffer(beta, bbb, beta.Cols);
                 br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.LayerNormInto, new[] { ba, bg, bbb, br }, (uint)RowCount(input), (uint)input.Cols, epsilon);
-                br.Download(fr.AsSpan(0, count));
-                Unpack(fr.AsSpan(0, count), result);
+                UnpackBuffer(br, result, count);
             }
             finally
             {
@@ -1177,8 +1145,6 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 ReturnBuffer(bg);
                 ReturnBuffer(bbb);
                 ReturnBuffer(br);
-                ReturnScratch(fa);
-                ReturnScratch(fr);
             }
         }
 
@@ -1187,21 +1153,17 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.SoftmaxInPlace(tensor); return; }
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
-            float[] f = RentScratch(count);
             var b = RentBuffer(count);
             try
             {
-                PackInto(tensor, f.AsSpan(0, count));
-                b.Upload(f.AsSpan(0, count));
+                PackBuffer(tensor, b, count);
                 b.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.SoftmaxInPlace, new[] { b }, (uint)RowCount(tensor), (uint)tensor.Cols);
-                b.Download(f.AsSpan(0, count));
-                Unpack(f.AsSpan(0, count), tensor);
+                UnpackBuffer(b, tensor, count);
             }
             finally
             {
                 ReturnBuffer(b);
-                ReturnScratch(f);
             }
         }
 
@@ -1212,31 +1174,22 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.SoftmaxBackwardInto(softmaxOutput, outputGradient, inputGradient); return; }
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(softmaxOutput) * softmaxOutput.Cols;
-            float[] fs = RentScratch(count);
-            float[] fy = RentScratch(count);
-            float[] fr = RentScratch(count);
             var bs = RentBuffer(count);
             var by = RentBuffer(count);
             var br = RentBuffer(count);
             try
             {
-                PackInto(softmaxOutput, fs.AsSpan(0, count));
-                PackInto(outputGradient, fy.AsSpan(0, count));
-                bs.Upload(fs.AsSpan(0, count));
-                by.Upload(fy.AsSpan(0, count));
+                PackBuffer(softmaxOutput, bs, count);
+                PackBuffer(outputGradient, by, count);
                 br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.SoftmaxBackward, new[] { bs, by, br }, (uint)RowCount(softmaxOutput), (uint)softmaxOutput.Cols);
-                br.Download(fr.AsSpan(0, count));
-                Unpack(fr.AsSpan(0, count), inputGradient);
+                UnpackBuffer(br, inputGradient, count);
             }
             finally
             {
                 ReturnBuffer(bs);
                 ReturnBuffer(by);
                 ReturnBuffer(br);
-                ReturnScratch(fs);
-                ReturnScratch(fy);
-                ReturnScratch(fr);
             }
         }
 
@@ -1253,27 +1206,20 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.ApplyMaskInPlace(scores, mask); return; }
             using var op = new GpuOpScope(_launcher);
             int count = scores.Rows * scores.Cols;
-            float[] fs = RentScratch(count);
-            float[] fm = RentScratch(count);
             var bs = RentBuffer(count);
             var bm = RentBuffer(count);
             try
             {
-                PackInto(scores, fs.AsSpan(0, count));
-                PackInto(mask, fm.AsSpan(0, count));
-                bs.Upload(fs.AsSpan(0, count));
-                bm.Upload(fm.AsSpan(0, count));
+                PackBuffer(scores, bs, count);
+                PackBuffer(mask, bm, count);
                 bs.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.ApplyMask, new[] { bs, bm }, (uint)count, 1);
-                bs.Download(fs.AsSpan(0, count));
-                Unpack(fs.AsSpan(0, count), scores);
+                UnpackBuffer(bs, scores, count);
             }
             finally
             {
                 ReturnBuffer(bs);
                 ReturnBuffer(bm);
-                ReturnScratch(fs);
-                ReturnScratch(fm);
             }
         }
 
@@ -1285,25 +1231,19 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.TransposeInto(source, destination); return; }
             using var op = new GpuOpScope(_launcher);
             int count = source.Rows * source.Cols;
-            float[] fs = RentScratch(count);
-            float[] fr = RentScratch(count);
             var bs = RentBuffer(count);
             var br = RentBuffer(count);
             try
             {
-                PackInto(source, fs.AsSpan(0, count));
-                bs.Upload(fs.AsSpan(0, count));
+                PackBuffer(source, bs, count);
                 br.MarkReadback();
                 _launcher.DispatchTranspose(bs, br, (uint)source.Rows, (uint)source.Cols);
-                br.Download(fr.AsSpan(0, count));
-                Unpack(fr.AsSpan(0, count), destination);
+                UnpackBuffer(br, destination, count);
             }
             finally
             {
                 ReturnBuffer(bs);
                 ReturnBuffer(br);
-                ReturnScratch(fs);
-                ReturnScratch(fr);
             }
         }
 
@@ -1313,25 +1253,19 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (_launcher == null) { _fallback.CopyInto(source, destination); return; }
             using var op = new GpuOpScope(_launcher);
             int count = RowCount(source) * source.Cols;
-            float[] fs = RentScratch(count);
-            float[] fr = RentScratch(count);
             var bs = RentBuffer(count);
             var br = RentBuffer(count);
             try
             {
-                PackInto(source, fs.AsSpan(0, count));
-                bs.Upload(fs.AsSpan(0, count));
+                PackBuffer(source, bs, count);
                 br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.Copy, new[] { bs, br }, (uint)count, 1);
-                br.Download(fr.AsSpan(0, count));
-                Unpack(fr.AsSpan(0, count), destination);
+                UnpackBuffer(br, destination, count);
             }
             finally
             {
                 ReturnBuffer(bs);
                 ReturnBuffer(br);
-                ReturnScratch(fs);
-                ReturnScratch(fr);
             }
         }
 

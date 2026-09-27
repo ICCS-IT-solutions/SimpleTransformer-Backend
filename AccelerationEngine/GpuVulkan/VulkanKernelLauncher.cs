@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+
 using Silk.NET.Vulkan;
 
 namespace SimpleTransformer.AccelerationEngine.GpuVulkan
@@ -788,6 +790,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             long seq = -1;
             bool wait = true;
 
+            long t0 = VulkanPhaseProfile.Enabled ? Stopwatch.GetTimestamp() : 0;
             lock (_dispatchGate)
             {
                 EnsureOpenLocked();
@@ -815,11 +818,19 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     wait = false;
                 }
             }
+            if (VulkanPhaseProfile.Enabled)
+                VulkanPhaseProfile.RecordDispatch(Stopwatch.GetTimestamp() - t0);
 
+            long tw0 = VulkanPhaseProfile.Enabled ? Stopwatch.GetTimestamp() : 0;
             if (owned != null)
                 Complete(owned, seq);
             else if (wait)
                 WaitForCompletion(seq);
+            if (VulkanPhaseProfile.Enabled)
+                VulkanPhaseProfile.RecordDispatchWait(Stopwatch.GetTimestamp() - tw0);
+            if (VulkanPhaseProfile.Enabled)
+                VulkanPhaseProfile.RecordOp();
+
         }
 
         /// <summary>True when no op is preparing and no explicit scope is open.</summary>

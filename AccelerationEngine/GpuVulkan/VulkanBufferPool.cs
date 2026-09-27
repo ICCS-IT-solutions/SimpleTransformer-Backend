@@ -52,12 +52,15 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
                 ulong bytes = (ulong)(bucket * 4);
 
-                // Device tier by default: the payload goes to VRAM and the host
-                // reaches it through a staging buffer. TryCreateStaged returns
-                // null when the process asked for the host tier, when the device
-                // has no device-local memory, or when an allocation fails, so
-                // the old system-RAM path is always one fallback away.
-                var buffer = VulkanBuffer.TryCreateStaged(_ctx, bytes)
+                // Device tier above the threshold: the payload goes to VRAM and the
+                // host reaches it through a staging buffer. Below the threshold,
+                // host-visible memory directly avoids the two extra copies and
+                // outperforms staged VRAM on small ops.
+                bool wantStaged = VulkanMemorySettings.PerOpMemoryTier == VulkanPerOpMemoryTier.DeviceLocal
+                                  && (VulkanMemorySettings.DeviceLocalThresholdBytes == 0
+                                      || bytes >= VulkanMemorySettings.DeviceLocalThresholdBytes);
+
+                var buffer = (wantStaged ? VulkanBuffer.TryCreateStaged(_ctx, bytes) : null)
                              ?? new VulkanBuffer(_ctx, bytes);
 
                 if (buffer.UsesStaging)

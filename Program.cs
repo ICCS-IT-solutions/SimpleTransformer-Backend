@@ -21,6 +21,21 @@ namespace SimpleTransformer
                         ? AccelerationEngine.GpuVulkan.VulkanPerOpMemoryTier.HostCached
                         : AccelerationEngine.GpuVulkan.VulkanPerOpMemoryTier.DeviceLocal;
             }
+            int tierMbIndex = Array.IndexOf(args, "--vulkan-tier-min-mb");
+            if (tierMbIndex >= 0 && tierMbIndex + 1 < args.Length)
+            {
+                if (ulong.TryParse(args[tierMbIndex + 1], out ulong minMb))
+                {
+                    AccelerationEngine.GpuVulkan.VulkanMemorySettings.DeviceLocalThresholdBytes =
+                        minMb * 1024UL * 1024UL;
+                }
+            }
+
+            if (args.Contains("--vulkan-profile"))
+            {
+                AccelerationEngine.GpuVulkan.VulkanPhaseProfile.Enabled = true;
+            }
+
 
             // Backend parity self-test (no server start): dotnet run -- --backend-selftest
             if (args.Contains("--backend-selftest"))

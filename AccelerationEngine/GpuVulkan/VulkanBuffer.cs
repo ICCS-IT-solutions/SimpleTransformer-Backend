@@ -370,6 +370,63 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             public ulong SizeBytes;
         }
 
+        /// <summary>
+        /// Direct access to the mapped host memory (staging companion when staged,
+        /// buffer's own mapped memory when host-visible). The engine uses this to
+        /// pack inputs straight into staging and unpack outputs straight out of it,
+        /// removing an entire host float[] memcpy round trip per op.
+        /// Throws when the buffer has no mapped host memory (e.g. unmapped device-resident).
+        /// </summary>
+        public Span<float> HostFloats(int floatCount)
+        {
+            void* target = _mapped;
+            if (target == null && _staging != null)
+                target = _staging.Mapped;
+            if (target == null)
+                throw new InvalidOperationException("Buffer has no mapped host memory.");
+
+            int bytes = floatCount * 4;
+            if ((ulong)bytes > SizeBytes)
+                throw new ArgumentOutOfRangeException(
+                    nameof(floatCount),
+                    $"Payload {bytes} B exceeds buffer capacity {SizeBytes} B.");
+
+            return new Span<float>(target, floatCount);
+        }
+
+        /// <summary>
+        /// Direct read-only access to the mapped host memory. Used for unpacking
+        /// after a dispatch completes (and after fence wait).
+        /// </summary>
+        public ReadOnlySpan<float> ReadOnlyHostFloats(int floatCount) => HostFloats(floatCount);
+
+        /// <summary>
+        /// Marks that the caller wrote bytes directly into <see cref="HostFloats"/>
+        /// and they are ready for the staged upload copy.
+        /// </summary>
+        public void CommitUpload(int floatCount)
+        {
+            int bytes = floatCount * 4;
+            TotalUploadedBytes += bytes;
+            if (_staging != null)
+                PendingUpload = true;
+        }
+
+        /// <summary>
+        /// Marks that bytes were read directly from <see cref="HostFloats"/> after
+        /// a completed dispatch. Validates that the read-back copy actually ran.
+        /// </summary>
+        public void CommitDownload(int floatCount)
+        {
+            if (_staging != null && ReadbackWanted)
+            {
+                throw new InvalidOperationException(
+                    "Downloaded a staged buffer whose read-back copy was never recorded: " +
+                    "call MarkReadback() before the dispatch that produces this result.");
+            }
+            TotalDownloadedBytes += floatCount * 4L;
+        }
+
         public void Upload(ReadOnlySpan<float> data)
         {
             void* target = _mapped;

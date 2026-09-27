@@ -52,5 +52,20 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// </summary>
         public static VulkanPerOpMemoryTier PerOpMemoryTier { get; set; } =
             VulkanPerOpMemoryTier.DeviceLocal;
+
+        /// <summary>
+        /// Threshold in bytes below which the buffer pool rents host-visible
+        /// memory directly, avoiding staging buffers entirely.
+        ///
+        /// Staging copies cost 2 full memory passes (host->staging->VRAM and
+        /// back) plus PCIe transfer overhead. For small operations (<= 1 MiB)
+        /// the CPU-side copy time dominates the PCIe execution time, so host-visible
+        /// buffers are faster. Above this threshold, VRAM bandwidth beats host
+        /// access and the device tier wins clearly (e.g. 37x on 512x1024x1024 MatMul).
+        ///
+        /// 0 = disabled (all pooled buffers staged to VRAM when DeviceLocal is selected).
+        /// Default: 1 MiB (262,144 floats).
+        /// </summary>
+        public static ulong DeviceLocalThresholdBytes { get; set; } = 1024UL * 1024UL;
     }
 }

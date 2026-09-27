@@ -110,6 +110,13 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             Console.WriteLine($"  host -> device     : {GpuVulkanBackend.UploadedBytes / 1024.0 / 1024.0:F2} MiB");
             Console.WriteLine($"  device -> host     : {GpuVulkanBackend.DownloadedBytes / 1024.0 / 1024.0:F2} MiB");
             Console.WriteLine();
+            if (VulkanPhaseProfile.Enabled)
+            {
+                Console.WriteLine("Phase Breakdown:");
+                Console.WriteLine(VulkanPhaseProfile.Summary());
+                Console.WriteLine();
+            }
+
 
             bool allocOk = buffersDelta == 0 && setsDelta == 0;
             _failed += allocOk ? 0 : 1;
