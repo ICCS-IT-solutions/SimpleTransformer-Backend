@@ -13,6 +13,8 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
 
         public TrainingCorpusController(TrainingCorpusService corpusService) => _corpusService = corpusService;
 
+        // 2GB cap: large .jsonl corpora stream line-by-line (see CorpusStreamPipeline).
+        [RequestSizeLimit(2147483648)]
         [HttpPost("api/v1/corpora/create")]
         public async Task<ApiResponse<CorpusDetailResponse>> Create([FromForm] CorpusCreateRequest req)
         {

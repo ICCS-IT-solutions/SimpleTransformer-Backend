@@ -1,3 +1,4 @@
+using SimpleTransformer.Api.Endpoints.Services.Extensions;
 using SimpleTransformer.Model;
 using Serilog;
 using SimpleTransformer.Model.Tokenizer;
@@ -38,6 +39,9 @@ namespace SimpleTransformer.Api
                 builder.WebHost.ConfigureKestrel(options =>
                 {
                     options.ListenAnyIP(5000);
+                    // Large corpus uploads (.jsonl up to 2GB) stream line-by-line;
+                    // Kestrel's default 30MB cap would reject them with 413.
+                    options.Limits.MaxRequestBodySize = CorpusStreamPipeline.MaxRequestBytes;
                 });  
 
                 builder.Services.AddSingleton<ConfigManager>(_configManager); 
@@ -53,6 +57,15 @@ namespace SimpleTransformer.Api
 
                 // 3. MVC & Open API
                 builder.Services.AddControllers();
+                builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
+                {
+                    // Multipart section cap must match the Kestrel body cap or
+                    // large corpus uploads fail binding with
+                    // "Multipart body length limit 134217728 exceeded".
+                    options.MultipartBodyLengthLimit = CorpusStreamPipeline.MaxRequestBytes;
+                    options.ValueLengthLimit = int.MaxValue;
+                    options.MultipartHeadersLengthLimit = int.MaxValue;
+                });
                 builder.Services.AddEndpointsApiExplorer();
                 builder.Services.AddSwaggerGen();
 

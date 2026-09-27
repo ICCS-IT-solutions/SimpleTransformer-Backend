@@ -1,3 +1,4 @@
+using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
 using SimpleTransformer.Api.Endpoints.Controllers;
@@ -62,62 +63,65 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     $"A corpus named '{name}' already exists. Choose a different name.", 409);
             }
 
-            var extractions = new List<CorpusExtractionResult>();
-            var sourceFileNames = new List<string>();
-            foreach (var file in files)
-            {
-                var uploadName = Path.GetFileName(file!.FileName);
-                sourceFileNames.Add(uploadName);
+            // Streamed extract + clean: each upload is read once and cleaned
+            // documents go straight to corpus.txt, so a 1GB .jsonl never sits
+            // fully in memory. Originals are NOT kept for large uploads (they
+            // would double disk usage); the report + options preserve provenance.
+            var corpusId = Guid.NewGuid();
+            var corpusDirectory = Path.Combine(CorpusRoot, corpusId.ToString());
+            Directory.CreateDirectory(corpusDirectory);
 
-                try
+            var stats = new CorpusStreamPipeline.StreamStats();
+            var streamOptions = new CorpusStreamPipeline.StreamOptions
+            {
+                Format = requestedFormat,
+                TextField = req.TextField,
+                Template = req.Template,
+                NormalizeWhitespace = req.ToOptions().NormalizeWhitespace,
+                StripHtml = req.ToOptions().StripHtml,
+                Deduplicate = req.ToOptions().Deduplicate,
+                MinChars = req.ToOptions().MinChars,
+                MaxChars = req.ToOptions().MaxChars
+            };
+
+            var sourceFileNames = new List<string>();
+            var corpusPath = Path.Combine(corpusDirectory, CorpusFileName);
+            await using (var output = new StreamWriter(
+                corpusPath, append: false, Encoding.UTF8, bufferSize: 1 << 20))
+            {
+                foreach (var file in files)
                 {
-                    await using var uploadStream = file.OpenReadStream();
-                    extractions.Add(await TrainingCorpusExtractor.ExtractAsync(
-                        uploadStream, uploadName, requestedFormat, req.TextField, req.Template));
-                }
-                catch (JsonException ex)
-                {
-                    return Fail<CorpusDetailResponse>(
-                        $"File '{uploadName}' is not valid JSON: {ex.Message}", 400);
+                    var uploadName = Path.GetFileName(file!.FileName);
+                    sourceFileNames.Add(uploadName);
+
+                    try
+                    {
+                        await using var uploadStream = file.OpenReadStream();
+                        await CorpusStreamPipeline.ProcessUploadAsync(
+                            uploadStream, uploadName, output, stats, streamOptions);
+                    }
+                    catch (JsonException ex)
+                    {
+                        CleanupDirectory(corpusDirectory);
+                        return Fail<CorpusDetailResponse>(
+                            $"File '{uploadName}' is not valid JSON: {ex.Message}", 400);
+                    }
+                    catch (InvalidDataException ex)
+                    {
+                        CleanupDirectory(corpusDirectory);
+                        return Fail<CorpusDetailResponse>(ex.Message, 400);
+                    }
                 }
             }
 
-            var (cleaned, report) = CorpusPreprocessor.Process(extractions, req.ToOptions());
-            if (cleaned.Count == 0)
+            var report = stats.ToReport();
+            if (report.DocumentsOut == 0)
             {
+                CleanupDirectory(corpusDirectory);
                 return Fail<CorpusDetailResponse>(
                     "No usable training text could be extracted from the uploaded files. " +
                     string.Join(" ", report.Warnings.Take(5)), 400);
             }
-
-            var corpusId = Guid.NewGuid();
-            var corpusDirectory = Path.Combine(CorpusRoot, corpusId.ToString());
-            Directory.CreateDirectory(corpusDirectory);
-            Directory.CreateDirectory(Path.Combine(corpusDirectory, "sources"));
-
-            // Keep the original uploads as evidence.
-            foreach (var file in files)
-            {
-                var dest = Path.Combine(corpusDirectory, "sources", Path.GetFileName(file!.FileName));
-                await using var destStream = new FileStream(dest, FileMode.Create);
-                await using var uploadStream = file.OpenReadStream();
-                await uploadStream.CopyToAsync(destStream);
-            }
-
-            var corpusPath = Path.Combine(corpusDirectory, CorpusFileName);
-            await using (var writer = new StreamWriter(corpusPath, append: false))
-            {
-                foreach (var document in cleaned)
-                {
-                    await writer.WriteAsync(document);
-                    await writer.WriteLineAsync();
-                    await writer.WriteLineAsync();
-                }
-            }
-
-            var reportJson = JsonSerializer.Serialize(
-                report, new JsonSerializerOptions { WriteIndented = true });
-            await File.WriteAllTextAsync(Path.Combine(corpusDirectory, ReportFileName), reportJson);
 
             var optionsJson = JsonSerializer.Serialize(req.ToOptions());
             var entry = new TrainingCorpusEntry
@@ -142,6 +146,12 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             await db.TrainingCorpora.AddAsync(entry);
             await db.SaveChangesAsync();
+
+            // The report can be large for GB-scale corpora (up to MaxWarnings +
+            // samples), but it is metadata, not data — keep it.
+            var reportJson = JsonSerializer.Serialize(
+                report, new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(Path.Combine(corpusDirectory, ReportFileName), reportJson);
 
             Log.Information(
                 "Training corpus '{Name}' created: {DocsOut} of {DocsIn} documents usable.",
@@ -233,6 +243,21 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 usedByJobs > 0
                     ? $"Corpus '{entry.Name}' deleted. {usedByJobs} existing {noun} keep their own copy of its text."
                     : $"Corpus '{entry.Name}' deleted.");
+        }
+
+        private static void CleanupDirectory(string directory)
+        {
+            try
+            {
+                if (Directory.Exists(directory))
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Corpus directory '{Path}' could not be removed.", directory);
+            }
         }
 
         private static async Task<List<string>> ReadReportWarnings(TrainingCorpusEntry entry)

@@ -252,8 +252,6 @@ namespace SimpleTransformer.Api.Endpoints.Services
             else
             {
 
-            var extractions = new List<CorpusExtractionResult>();
-
             CorpusSourceFormat requestedFormat;
             try
             {
@@ -261,81 +259,66 @@ namespace SimpleTransformer.Api.Endpoints.Services
             }
             catch (ArgumentException ex)
             {
-                return new ApiResponse<TrainingResponse>
-                {
-                    Message = ex.Message,
-                    Status = ResponseStatus.Failure,
-                    StatusCode = 400
-                };
+                return Failure(ex.Message);
             }
 
-            foreach (var file in req.TextFiles)
+            var requestOptions = req.ToOptions();
+            var streamOptions = new CorpusStreamPipeline.StreamOptions
             {
-                if (file == null || file.Length == 0)
-                {
-                    continue;
-                }
+                Format = requestedFormat,
+                TextField = req.TextField,
+                Template = req.Template,
+                NormalizeWhitespace = requestOptions.NormalizeWhitespace,
+                StripHtml = requestOptions.StripHtml,
+                Deduplicate = requestOptions.Deduplicate,
+                MinChars = requestOptions.MinChars,
+                MaxChars = requestOptions.MaxChars
+            };
 
-                var uploadName = Path.GetFileName(file.FileName);
-                sourceFileNames.Add(uploadName);
+            var stats = new CorpusStreamPipeline.StreamStats();
+            int fileCount = 0;
 
-                CorpusExtractionResult extraction;
-                try
+            await using (var writer = new StreamWriter(
+                filePath, append: false, System.Text.Encoding.UTF8, bufferSize: 1 << 20))
+            {
+                foreach (var file in req.TextFiles ?? Enumerable.Empty<IFormFile>())
                 {
-                    await using var uploadStream = file.OpenReadStream();
-                    extraction = await TrainingCorpusExtractor.ExtractAsync(
-                        uploadStream,
-                        uploadName,
-                        requestedFormat,
-                        req.TextField,
-                        req.Template);
-                }
-                catch (JsonException ex)
-                {
-                    return new ApiResponse<TrainingResponse>
+                    if (file == null || file.Length == 0)
                     {
-                        Message = $"File '{uploadName}' is not valid JSON: {ex.Message}",
-                        Status = ResponseStatus.Failure,
-                        StatusCode = 400
-                    };
+                        continue;
+                    }
+
+                    var uploadName = Path.GetFileName(file.FileName);
+                    sourceFileNames.Add(uploadName);
+                    fileCount++;
+
+                    try
+                    {
+                        await using var uploadStream = file.OpenReadStream();
+                        await CorpusStreamPipeline.ProcessUploadAsync(
+                            uploadStream, uploadName, writer, stats, streamOptions);
+                    }
+                    catch (JsonException ex)
+                    {
+                        return Failure($"File '{uploadName}' is not valid JSON: {ex.Message}");
+                    }
+                    catch (InvalidDataException ex)
+                    {
+                        return Failure(ex.Message);
+                    }
                 }
-
-                extractions.Add(extraction);
             }
 
-            if (extractions.Count == 0)
+            if (fileCount == 0)
             {
-                return new ApiResponse<TrainingResponse>
-                {
-                    Message = "At least one non-empty training file must be provided.",
-                    Status = ResponseStatus.Failure,
-                    StatusCode = 400
-                };
+                return Failure("At least one non-empty training file must be provided.");
             }
 
-            var (cleaned, report) = CorpusPreprocessor.Process(extractions, req.ToOptions());
-
-            if (cleaned.Count == 0)
+            var report = stats.ToReport();
+            if (report.DocumentsOut == 0)
             {
-                return new ApiResponse<TrainingResponse>
-                {
-                    Message = "No usable training text could be extracted from the uploaded files. " +
-                        string.Join(" ", report.Warnings.Take(5)),
-                    Status = ResponseStatus.Failure,
-                    StatusCode = 400
-                };
-            }
-
-            await using (var writer = new StreamWriter(filePath, append: false))
-            {
-                foreach (var document in cleaned)
-                {
-                    await writer.WriteAsync(document);
-
-                    //Document boundary between concatenated documents.
-                    await writer.WriteLineAsync();
-                    await writer.WriteLineAsync();
-                }
+                return Failure("No usable training text could be extracted from the uploaded files. " +
+                    string.Join(" ", report.Warnings.Take(5)));
             }
 
             //Audit trail beside the corpus: options, stats, warnings, samples.
@@ -345,11 +328,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
             Log.Information(
                 "Training corpus prepared from {FileCount} file(s): {DocsIn} documents in, {DocsOut} out " +
                 "({Dedup} duplicates removed, {Filtered} filtered).",
-                extractions.Count, report.DocumentsIn, report.DocumentsOut,
+                fileCount, report.DocumentsIn, report.DocumentsOut,
                 report.DuplicatesRemoved, report.FilteredByLength + report.FilteredEmpty);
 
             corpusSummary = $"Corpus: {report.DocumentsOut} documents ({report.CharsOut} chars) from " +
-                $"{extractions.Count} file(s); {report.DuplicatesRemoved} duplicates removed, " +
+                $"{fileCount} file(s); {report.DuplicatesRemoved} duplicates removed, " +
                 $"{report.FilteredByLength + report.FilteredEmpty} filtered.";
             } // end upload path
 
@@ -387,8 +370,9 @@ namespace SimpleTransformer.Api.Endpoints.Services
         }
 
         /// <summary>
-        /// Dry-run extract + preprocess over uploads. Creates no job and writes
-        /// no files; returns the audit report with warnings and samples.
+        /// Dry-run extract + preprocess over uploads. Streams to a temp file
+        /// (deleted afterwards) so GB-scale previews don't buffer in memory;
+        /// returns the audit report with warnings and samples.
         /// </summary>
         public async Task<ApiResponse<CorpusPreprocessReport>> PreviewCorpus(CorpusPreviewRequest req)
         {
@@ -398,12 +382,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             if (files.Count == 0)
             {
-                return new ApiResponse<CorpusPreprocessReport>
-                {
-                    Message = "At least one non-empty file must be provided for preview.",
-                    Status = ResponseStatus.Failure,
-                    StatusCode = 400
-                };
+                return PreviewFailure("At least one non-empty file must be provided for preview.");
             }
 
             CorpusSourceFormat requestedFormat;
@@ -413,40 +392,55 @@ namespace SimpleTransformer.Api.Endpoints.Services
             }
             catch (ArgumentException ex)
             {
-                return new ApiResponse<CorpusPreprocessReport>
-                {
-                    Message = ex.Message,
-                    Status = ResponseStatus.Failure,
-                    StatusCode = 400
-                };
+                return PreviewFailure(ex.Message);
             }
 
-            var extractions = new List<CorpusExtractionResult>();
-            foreach (var file in files)
+            var requestOptions = req.ToOptions();
+            var streamOptions = new CorpusStreamPipeline.StreamOptions
             {
-                var uploadName = Path.GetFileName(file!.FileName);
-                try
+                Format = requestedFormat,
+                TextField = req.TextField,
+                Template = req.Template,
+                NormalizeWhitespace = requestOptions.NormalizeWhitespace,
+                StripHtml = requestOptions.StripHtml,
+                Deduplicate = requestOptions.Deduplicate,
+                MinChars = requestOptions.MinChars,
+                MaxChars = requestOptions.MaxChars
+            };
+
+            var stats = new CorpusStreamPipeline.StreamStats();
+            var tempPath = Path.GetTempFileName();
+            try
+            {
+                await using (var output = new StreamWriter(
+                    tempPath, append: false, System.Text.Encoding.UTF8, bufferSize: 1 << 20))
                 {
-                    await using var uploadStream = file.OpenReadStream();
-                    extractions.Add(await TrainingCorpusExtractor.ExtractAsync(
-                        uploadStream,
-                        uploadName,
-                        requestedFormat,
-                        req.TextField,
-                        req.Template));
-                }
-                catch (JsonException ex)
-                {
-                    return new ApiResponse<CorpusPreprocessReport>
+                    foreach (var file in files)
                     {
-                        Message = $"File '{uploadName}' is not valid JSON: {ex.Message}",
-                        Status = ResponseStatus.Failure,
-                        StatusCode = 400
-                    };
+                        var uploadName = Path.GetFileName(file!.FileName);
+                        try
+                        {
+                            await using var uploadStream = file.OpenReadStream();
+                            await CorpusStreamPipeline.ProcessUploadAsync(
+                                uploadStream, uploadName, output, stats, streamOptions);
+                        }
+                        catch (JsonException ex)
+                        {
+                            return PreviewFailure($"File '{uploadName}' is not valid JSON: {ex.Message}");
+                        }
+                        catch (InvalidDataException ex)
+                        {
+                            return PreviewFailure(ex.Message);
+                        }
+                    }
                 }
             }
+            finally
+            {
+                try { File.Delete(tempPath); } catch { }
+            }
 
-            var (_, report) = CorpusPreprocessor.Process(extractions, req.ToOptions());
+            var report = stats.ToReport();
 
             return new ApiResponse<CorpusPreprocessReport>
             {
@@ -458,6 +452,20 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 Data = report
             };
         }
+
+        private static ApiResponse<TrainingResponse> Failure(string message) => new()
+        {
+            Message = message,
+            Status = ResponseStatus.Failure,
+            StatusCode = 400
+        };
+
+        private static ApiResponse<CorpusPreprocessReport> PreviewFailure(string message) => new()
+        {
+            Message = message,
+            Status = ResponseStatus.Failure,
+            StatusCode = 400
+        };
 
         public async Task<ApiResponse<TrainingProgressResponse>> PauseTrainingJob(Guid jobId)
         {

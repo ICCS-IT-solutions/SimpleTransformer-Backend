@@ -212,6 +212,83 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
                 $"{fileName}{location}: object has no usable text field " +
                 $"(looked for: {string.Join(", ", fields)}).");
         }
+
+        /// <summary>
+        /// Single-element extraction shared by the buffered and streaming paths.
+        /// Returns the document, or null when the element carries no usable text
+        /// (warning describes why; the caller prefixes the filename).
+        /// </summary>
+        public static string? ExtractDocumentFromElement(
+            JsonElement element,
+            string location,
+            string? textField,
+            string? template,
+            out string? warning)
+        {
+            warning = null;
+
+            if (element.ValueKind == JsonValueKind.String)
+            {
+                var value = element.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+
+                warning = $"{location}: skipped empty string value.";
+                return null;
+            }
+
+            if (element.ValueKind != JsonValueKind.Object)
+            {
+                warning = $"{location}: skipped {DescribeKind(element.ValueKind)} value; " +
+                    "expected a string or an object with a text field.";
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(template))
+            {
+                return RenderTemplate(element, template);
+            }
+
+            var fields = ResolveTextFields(textField);
+            foreach (var field in fields)
+            {
+                if (element.TryGetProperty(field, out var prop) &&
+                    prop.ValueKind == JsonValueKind.String)
+                {
+                    var value = prop.GetString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        return value;
+                    }
+                }
+            }
+
+            warning = $"{location}: object has no usable text field " +
+                $"(looked for: {string.Join(", ", fields)}).";
+            return null;
+        }
+
+        /// <summary>
+        /// Whole-document .json extraction for the streaming pipeline (the
+        /// buffered single-document path; guarded by size before calling).
+        /// </summary>
+        public static CorpusExtractionResult ExtractFromJsonString(
+            string content,
+            string fileName,
+            string? textField,
+            string? template)
+        {
+            var result = new CorpusExtractionResult
+            {
+                FileName = fileName,
+                ResolvedFormat = CorpusSourceFormat.Json
+            };
+
+            ExtractFromJsonDocument(content, fileName, textField, template, result);
+            return result;
+        }
         private static string RenderTemplate(JsonElement element, string template)
         {
             var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);

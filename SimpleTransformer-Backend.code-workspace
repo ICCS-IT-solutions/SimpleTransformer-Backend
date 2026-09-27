@@ -6,6 +6,10 @@
 		{
 			"name": "corpus-unit",
 			"path": "../../../../AppData/Local/Temp/corpus-unit"
+		},
+		{
+			"name": "corpus-stream-test",
+			"path": "../../../../AppData/Local/Temp/corpus-stream-test"
 		}
 	],
 	"settings": {

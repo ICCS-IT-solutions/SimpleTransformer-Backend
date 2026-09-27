@@ -33,6 +33,8 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
             return await _trainingService.CreateJob(req);
         }
 
+        // 2GB cap: large .jsonl corpora stream line-by-line (see CorpusStreamPipeline).
+        [RequestSizeLimit(2147483648)]
         [HttpPost("api/v1/train/file")]
         public async Task<ApiResponse<TrainingResponse>> CreateJobFromFile([FromForm] TrainingFileRequest req)
         {
@@ -41,6 +43,8 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
 
         //Dry-run extract + preprocess over uploads. Creates no job and writes
         //no files; returns the audit report with warnings and samples.
+        // 2GB cap, matching the corpus endpoints.
+        [RequestSizeLimit(2147483648)]
         [HttpPost("api/v1/train/preview")]
         public async Task<ApiResponse<CorpusPreprocessReport>> PreviewCorpus([FromForm] CorpusPreviewRequest req)
         {
