@@ -8,6 +8,20 @@ namespace SimpleTransformer
     {
         static void Main(string[] args)
         {
+            // Optional accelerator switch for A/B measurement, e.g.
+            //   dotnet run -c Release -- --vulkan-bench --vulkan-tier host
+            //   dotnet run -c Release -- --vulkan-bench --vulkan-tier device
+            // Keeps the accelerator configuration-free: the host process pushes
+            // the choice into the settings static before any backend exists.
+            int tierIndex = Array.IndexOf(args, "--vulkan-tier");
+            if (tierIndex >= 0 && tierIndex + 1 < args.Length)
+            {
+                AccelerationEngine.GpuVulkan.VulkanMemorySettings.PerOpMemoryTier =
+                    args[tierIndex + 1].Equals("host", StringComparison.OrdinalIgnoreCase)
+                        ? AccelerationEngine.GpuVulkan.VulkanPerOpMemoryTier.HostCached
+                        : AccelerationEngine.GpuVulkan.VulkanPerOpMemoryTier.DeviceLocal;
+            }
+
             // Backend parity self-test (no server start): dotnet run -- --backend-selftest
             if (args.Contains("--backend-selftest"))
             {

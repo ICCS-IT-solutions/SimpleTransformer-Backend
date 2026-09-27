@@ -50,14 +50,32 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 if (_buckets.TryGetValue(bucket, out var stack) && stack.Count > 0)
                     return stack.Pop()!;
 
-                var buffer = new VulkanBuffer(_ctx, (ulong)(bucket * 4));
-                if (buffer.IsDeviceLocal)
+                ulong bytes = (ulong)(bucket * 4);
+
+                // Device tier by default: the payload goes to VRAM and the host
+                // reaches it through a staging buffer. TryCreateStaged returns
+                // null when the process asked for the host tier, when the device
+                // has no device-local memory, or when an allocation fails, so
+                // the old system-RAM path is always one fallback away.
+                var buffer = VulkanBuffer.TryCreateStaged(_ctx, bytes)
+                             ?? new VulkanBuffer(_ctx, bytes);
+
+                if (buffer.UsesStaging)
                 {
                     AnyDeviceLocal = true;
+                    StagedBufferCount++;
                     _deviceLocalRetainedBytes += buffer.SizeBytes;
 
                     //Keep retained VRAM under the detected/configured budget by
                     //dropping idle buffers first (this new one is not pooled yet).
+                    if (_deviceLocalBudgetBytes > 0 &&
+                        _deviceLocalRetainedBytes > _deviceLocalBudgetBytes)
+                        EvictIdleOverBudget(deviceLocalTier: true);
+                }
+                else if (buffer.IsDeviceLocal)
+                {
+                    AnyDeviceLocal = true;
+                    _deviceLocalRetainedBytes += buffer.SizeBytes;
                     if (_deviceLocalBudgetBytes > 0 &&
                         _deviceLocalRetainedBytes > _deviceLocalBudgetBytes)
                         EvictIdleOverBudget(deviceLocalTier: true);
@@ -72,6 +90,17 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                         _hostRetainedBytes > _hostBudgetBytes)
                         EvictIdleOverBudget(deviceLocalTier: false);
                 }
+
+                // A device-tier buffer also holds its bytes on the host side,
+                // and that half is charged to the system-RAM budget.
+                if (buffer.StagingSizeBytes > 0)
+                {
+                    _hostRetainedBytes += buffer.StagingSizeBytes;
+                    if (_hostBudgetBytes > 0 &&
+                        _hostRetainedBytes > _hostBudgetBytes)
+                        EvictIdleOverBudget(deviceLocalTier: false);
+                }
+
                 WorkingMemoryTypeIndex ??= buffer.ChosenMemoryTypeIndex;
                 _all.Add(buffer);
                 return buffer;
@@ -85,10 +114,21 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         private void RemoveLiveLocked(VulkanBuffer buffer)
         {
             _all.Remove(buffer);
-            if (buffer.IsDeviceLocal)
+            if (buffer.UsesStaging)
+            {
+                StagedBufferCount--;
                 _deviceLocalRetainedBytes -= buffer.SizeBytes;
+                // The host half of a device-tier buffer goes back too.
+                _hostRetainedBytes -= buffer.StagingSizeBytes;
+            }
+            else if (buffer.IsDeviceLocal)
+            {
+                _deviceLocalRetainedBytes -= buffer.SizeBytes;
+            }
             else
+            {
                 _hostRetainedBytes -= buffer.SizeBytes;
+            }
         }
 
         /// <summary>
@@ -135,6 +175,12 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
         /// <summary>True when at least one pooled buffer got DEVICE_LOCAL memory.</summary>
         public bool AnyDeviceLocal { get; private set; }
+
+        /// <summary>
+        /// Pooled buffers whose payload is in VRAM behind a staging buffer.
+        /// These are the ones the GPU reads at device-local bandwidth.
+        /// </summary>
+        public int StagedBufferCount { get; private set; }
 
         /// <summary>
         /// Memory type index the pool's working buffers actually use. With the

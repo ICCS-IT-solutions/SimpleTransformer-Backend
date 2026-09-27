@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using SimpleTransformer.Model;
 
 namespace SimpleTransformer.AccelerationEngine.GpuVulkan
@@ -430,6 +431,105 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 gpu.CopyInto(s, act);
                 Report("CopyInto", MaxDiff(exp, act), 1e-6f);
             }
+
+            // ---- Unified dispatch: two dependent ops, ONE submission ----------
+            // c = a + b followed by c *= 3, recorded into the same command
+            // buffer. The second dispatch consumes the first one's output, so
+            // this only produces the right answer if the in-batch barrier really
+            // orders them (and if the read-back copy of the LAST dispatch is the
+            // one that lands in the staging buffer).
+            if (gpu.Launcher is { } launcher && gpu.Pool is { } pool)
+            {
+                const int n = 64 * 64;
+                var a = pool.Rent(n);
+                var b = pool.Rent(n);
+                var c = pool.Rent(n);
+                try
+                {
+                    var left = new float[n];
+                    var right = new float[n];
+                    var actual = new float[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        left[i] = (i % 7) - 3f;
+                        right[i] = (i % 5) - 2f;
+                    }
+
+                    a.Upload(left);
+                    b.Upload(right);
+
+                    long submitsBefore = launcher.SubmitCount;
+                    long dispatchesBefore = launcher.DispatchCount;
+
+                    launcher.BeginBatch();
+                    launcher.Dispatch(
+                        VulkanKernel.AddInto, new VulkanBuffer[] { a, b, c }, (uint)n, 0f);
+                    // Read-back belongs to the dispatch that produces the final
+                    // value, so it is requested here rather than above.
+                    c.MarkReadback();
+                    launcher.Dispatch(VulkanKernel.Scale, new[] { c }, (uint)n, 3f);
+                    launcher.EndBatch();
+
+                    c.Download(actual.AsSpan());
+
+                    float maxDiff = 0f;
+                    for (int i = 0; i < n; i++)
+                        maxDiff = MathF.Max(maxDiff, MathF.Abs(actual[i] - (left[i] + right[i]) * 3f));
+                    Report("Batched add+scale", maxDiff, 1e-6f);
+
+                    long dispatches = launcher.DispatchCount - dispatchesBefore;
+                    long submits = launcher.SubmitCount - submitsBefore;
+                    Report("Batch became one submit", submits == 1 ? 0f : 1f, 0f);
+                    Console.WriteLine(
+                        $"  [INFO] explicit batch: {dispatches} dispatches -> {submits} submission(s)");
+                }
+                finally
+                {
+                    pool.Return(a);
+                    pool.Return(b);
+                    pool.Return(c);
+                }
+            }
+
+            // ---- Automatic batching: a parallel wave coalesces ---------------
+            // This is the training shape (QLoRA/LinearLayer dispatch from many
+            // threads). Every op is announced before it packs, so the wave ends
+            // up in far fewer submissions than it has dispatches.
+            {
+                const int tensors = 64;
+                var inputs = new Tensor[tensors];
+                var expected = new Tensor[tensors];
+                for (int i = 0; i < tensors; i++)
+                {
+                    inputs[i] = Rand(16, 16);
+                    expected[i] = (Tensor)inputs[i].Clone();
+                    reference.ScaleInPlace(expected[i], 2f);
+                }
+
+                long submitsBefore = gpu.SubmitCount;
+                long dispatchesBefore = gpu.DispatchCount;
+
+                Parallel.For(0, tensors, i => gpu.ScaleInPlace(inputs[i], 2f));
+
+                float worst = 0f;
+                for (int i = 0; i < tensors; i++)
+                    worst = MathF.Max(worst, MaxDiff(expected[i], inputs[i]));
+                Report("Parallel dispatch parity", worst, 1e-5f);
+
+                long dispatches = gpu.DispatchCount - dispatchesBefore;
+                long submits = gpu.SubmitCount - submitsBefore;
+                double perSubmit = submits > 0 ? (double)dispatches / submits : 0.0;
+                Console.WriteLine(
+                    $"  [INFO] parallel wave: {dispatches} dispatches in {submits} submissions " +
+                    $"({perSubmit:F2} per submission, largest batch {gpu.MaxBatchSize})");
+                Report("Parallel wave coalesced", submits < dispatches ? 0f : 1f, 0f);
+            }
+
+            Console.WriteLine(
+                $"  [INFO] totals: {gpu.DispatchCount} dispatches in {gpu.SubmitCount} submissions, " +
+                $"{gpu.BatchedSubmits} multi-dispatch submits, largest batch {gpu.MaxBatchSize}, " +
+                $"working set {gpu.PooledDeviceLocalBytes / (1024.0 * 1024.0):F1} MiB in VRAM " +
+                $"across {gpu.StagedBufferCount} staged buffers");
 
             Console.WriteLine();
             Console.WriteLine($"Results: {passed} passed, {failed} failed.");

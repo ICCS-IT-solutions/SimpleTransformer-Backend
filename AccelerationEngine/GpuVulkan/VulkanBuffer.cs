@@ -16,12 +16,51 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
     /// (37-52 MiB/s vs ~43 GiB/s), and every op here round trips through the
     /// host, so device-local VRAM would be the worst possible choice.
     /// </summary>
+    /// <summary>
+    /// Storage buffer wrapper in one of two tiers.
+    /// <list type="bullet">
+    /// <item>host tier - a mapped HOST_VISIBLE|HOST_CACHED buffer in system RAM.
+    /// Upload/Download are pure memcpy, which is what the old per-op sync model
+    /// needed (every op round-tripped through the host).</item>
+    /// <item>device tier - a DEVICE_LOCAL (VRAM) buffer with a mapped
+    /// host-visible staging companion. The payload lives in VRAM for the GPU,
+    /// the host reads and writes system RAM, and the bus is crossed only by
+    /// copies recorded into the command batch (see
+    /// <see cref="VulkanKernelLauncher"/>). This is what puts the working set
+    /// in VRAM instead of in system RAM.</item>
+    /// </list>
+    /// Memory type selection is delegated to
+    /// <see cref="VulkanContext.SelectMemoryType"/>, which prefers
+    /// HOST_VISIBLE|HOST_COHERENT|HOST_CACHED system RAM. That is
+    /// counter-intuitive but measured: on this RX 5700 XT the resizable-BAR
+    /// (DEVICE_LOCAL|HOST_VISIBLE) heap is ~1000x slower for host round trips
+    /// (37-52 MiB/s vs ~43 GiB/s), so the device tier must reach VRAM through
+    /// copies instead of by mapping it.
+    /// </summary>
     public sealed unsafe class VulkanBuffer : IDisposable
     {
         private readonly VulkanContext _ctx;
         public Silk.NET.Vulkan.Buffer Handle;
         public DeviceMemory Memory;
         public ulong SizeBytes { get; }
+
+        /// <summary>Host-visible companion of a device-local buffer, else null.</summary>
+        private StagingMemory? _staging;
+
+        /// <summary>True when the payload lives in VRAM behind a staging buffer.</summary>
+        public bool UsesStaging => _staging != null;
+
+        /// <summary>Host-visible buffer the copies move bytes through.</summary>
+        public Silk.NET.Vulkan.Buffer StagingHandle => _staging!.Handle;
+
+        /// <summary>Bytes this buffer holds on the host side (0 unless staged).</summary>
+        public ulong StagingSizeBytes => _staging != null ? SizeBytes : 0;
+
+        /// <summary>Set by <see cref="Upload"/>, consumed when the next dispatch records the copy.</summary>
+        public bool PendingUpload { get; set; }
+
+        /// <summary>Set by <see cref="MarkReadback"/>, consumed by the dispatch that produces the result.</summary>
+        public bool ReadbackWanted { get; set; }
 
         /// <summary>True once the buffer and its memory have been destroyed.</summary>
         public bool IsDisposed => _disposed;
@@ -229,9 +268,114 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             _mapped = null;
         }
 
+        /// <summary>
+        /// Allocates a device-tier buffer: a DEVICE_LOCAL (VRAM) payload plus a
+        /// mapped host-visible staging companion, so per-op data lives in VRAM
+        /// while the host keeps touching fast system RAM. Returns null when the
+        /// host process asked for the host tier, when the device offers no
+        /// device-local type, or when either allocation fails - the pool then
+        /// falls back to a plain host-visible buffer.
+        /// </summary>
+        public static VulkanBuffer? TryCreateStaged(VulkanContext ctx, ulong sizeBytes)
+        {
+            if (VulkanMemorySettings.PerOpMemoryTier != VulkanPerOpMemoryTier.DeviceLocal)
+                return null;
+
+            VulkanBuffer? device = TryCreateDeviceResident(ctx, sizeBytes);
+            if (device == null)
+                return null;
+
+            if (!device.AttachStaging(ctx))
+            {
+                device.Dispose();
+                return null;
+            }
+
+            return device;
+        }
+
+        /// <summary>Adds the host-visible companion a device-tier buffer needs.</summary>
+        private bool AttachStaging(VulkanContext ctx)
+        {
+            var vk = ctx.Vk;
+            var info = new BufferCreateInfo
+            {
+                SType = StructureType.BufferCreateInfo,
+                Size = SizeBytes,
+                Usage = BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit,
+                SharingMode = SharingMode.Exclusive
+            };
+
+            if (vk.CreateBuffer(ctx.Device, in info, null, out Silk.NET.Vulkan.Buffer handle)
+                != Result.Success)
+            {
+                return false;
+            }
+
+            vk.GetBufferMemoryRequirements(ctx.Device, handle, out MemoryRequirements req);
+
+            uint memIndex;
+            try
+            {
+                // Host-cached system RAM: the staging side of every copy, and
+                // the tier the old per-op path measured as by far the fastest
+                // for host access.
+                memIndex = ctx.SelectMemoryType(req.MemoryTypeBits, preferHostCached: true);
+            }
+            catch (InvalidOperationException)
+            {
+                vk.DestroyBuffer(ctx.Device, handle, null);
+                return false;
+            }
+
+            var allocInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = req.Size,
+                MemoryTypeIndex = memIndex
+            };
+            if (vk.AllocateMemory(ctx.Device, in allocInfo, null, out DeviceMemory memory)
+                != Result.Success)
+            {
+                vk.DestroyBuffer(ctx.Device, handle, null);
+                return false;
+            }
+
+            void* mapped = null;
+            if (vk.BindBufferMemory(ctx.Device, handle, memory, 0) != Result.Success ||
+                vk.MapMemory(ctx.Device, memory, 0, SizeBytes, 0, ref mapped) != Result.Success)
+            {
+                vk.FreeMemory(ctx.Device, memory, null);
+                vk.DestroyBuffer(ctx.Device, handle, null);
+                return false;
+            }
+
+            TotalBuffersCreated++;
+            _staging = new StagingMemory
+            {
+                Handle = handle,
+                Memory = memory,
+                Mapped = mapped,
+                SizeBytes = SizeBytes
+            };
+            return true;
+        }
+
+        /// <summary>The mapped host-visible companion of a device-tier buffer.</summary>
+        private sealed class StagingMemory
+        {
+            public Silk.NET.Vulkan.Buffer Handle;
+            public DeviceMemory Memory;
+            public void* Mapped;
+            public ulong SizeBytes;
+        }
+
         public void Upload(ReadOnlySpan<float> data)
         {
-            if (_mapped == null)
+            void* target = _mapped;
+            if (target == null && _staging != null)
+                target = _staging.Mapped;
+            if (target == null)
                 throw new InvalidOperationException("Buffer memory is not mapped.");
             int bytes = data.Length * 4;
             if ((ulong)bytes > SizeBytes)
@@ -241,26 +385,57 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             fixed (float* src = data)
             {
                 new ReadOnlySpan<byte>(src, bytes)
-                    .CopyTo(new Span<byte>(_mapped, bytes));
+                    .CopyTo(new Span<byte>(target, bytes));
             }
             TotalUploadedBytes += bytes;
+
+            // A device-local buffer only sees these bytes through a copy the
+            // next dispatch records; the dispatcher consumes the flag.
+            if (_staging != null)
+                PendingUpload = true;
         }
 
         public void Download(Span<float> data)
         {
-            if (_mapped == null)
+            void* source = _mapped;
+            if (source == null && _staging != null)
+                source = _staging.Mapped;
+            if (source == null)
                 throw new InvalidOperationException("Buffer memory is not mapped.");
             int bytes = data.Length * 4;
             if ((ulong)bytes > SizeBytes)
                 throw new ArgumentOutOfRangeException(
                     nameof(data), $"Payload {bytes} B exceeds buffer capacity {SizeBytes} B.");
 
+            // Staging memory only holds what a recorded copy put there; a
+            // pending flag means the dispatch that should have copied it back
+            // never ran, so the bytes on hand are stale.
+            if (_staging != null && ReadbackWanted)
+            {
+                throw new InvalidOperationException(
+                    "Downloaded a staged buffer whose read-back copy was never recorded: " +
+                    "call MarkReadback() before the dispatch that produces this result.");
+            }
+
             fixed (float* dst = data)
             {
-                new ReadOnlySpan<byte>(_mapped, bytes)
+                new ReadOnlySpan<byte>(source, bytes)
                     .CopyTo(new Span<byte>(dst, bytes));
             }
             TotalDownloadedBytes += bytes;
+        }
+
+        /// <summary>
+        /// Declares that the caller will <see cref="Download"/> this buffer's
+        /// result after the next dispatch, so the dispatcher records the
+        /// device->staging copy into that batch instead of costing an extra
+        /// round trip. No-op on the host tier, where the read is a plain memcpy
+        /// over the mapped memory.
+        /// </summary>
+        public void MarkReadback()
+        {
+            if (_staging != null)
+                ReadbackWanted = true;
         }
 
         public void Dispose()
@@ -272,6 +447,15 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 _ctx.Vk.UnmapMemory(_ctx.Device, Memory);
                 _mapped = null;
+            }
+            if (_staging != null)
+            {
+                _ctx.Vk.UnmapMemory(_ctx.Device, _staging.Memory);
+                if (_staging.Handle.Handle != 0)
+                    _ctx.Vk.DestroyBuffer(_ctx.Device, _staging.Handle, null);
+                if (_staging.Memory.Handle != 0)
+                    _ctx.Vk.FreeMemory(_ctx.Device, _staging.Memory, null);
+                _staging = null;
             }
             if (Handle.Handle != 0)
             {

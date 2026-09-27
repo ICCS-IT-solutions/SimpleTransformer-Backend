@@ -138,9 +138,11 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
                 ulong bytes = (ulong)elementCount * 4UL;
 
-                //Never exceed the detected/configured VRAM budget.
+                //Never exceed the detected/configured VRAM budget. The pooled
+                //working set is allocated from the same heap, so it counts.
+                long poolDeviceBytes = (long)(_pool?.DeviceLocalRetainedBytes ?? 0UL);
                 if (GpuMemoryBudgetBytes > 0 &&
-                    (ulong)ResidentWeightBytes + bytes > GpuMemoryBudgetBytes)
+                    (ulong)(ResidentWeightBytes + poolDeviceBytes) + bytes > GpuMemoryBudgetBytes)
                 {
                     WarnResidentBudgetOnce(name, bytes);
                     return false;
@@ -312,8 +314,11 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             return $"VRAM-resident weights {ResidentWeightBytes / mib:F0} MiB " +
                    $"across {ResidentWeightCount} tensors; {vram}; " +
+                   $"working set in VRAM {PooledDeviceLocalBytes / mib:F0} MiB " +
+                   $"across {StagedBufferCount} staged buffers; " +
                    $"host pool {_pool?.HostRetainedBytes / mib ?? 0UL:F0} MiB; " +
-                   $"dispatches {DispatchCount}";
+                   $"dispatches {DispatchCount} in {SubmitCount} submissions " +
+                   $"({AvgDispatchesPerSubmit:F2} per submission, largest batch {MaxBatchSize})";
         }
 
         private bool TryFindResidentLocked(long key, float[] backing, int offset, int elementCount, out VulkanBuffer buffer)
@@ -504,6 +509,35 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// <summary>Times the descriptor pool had to be recycled.</summary>
         public long DescriptorPoolRecycles => _launcher?.DescriptorPoolRecycles ?? 0;
 
+        /// <summary>
+        /// Queue submissions actually issued. With batching this - not
+        /// <see cref="DispatchCount"/> - is what reaches the driver, so
+        /// <c>DispatchCount / SubmitCount</c> is how many CPU round trips the
+        /// batching removed.
+        /// </summary>
+        public long SubmitCount => _launcher?.SubmitCount ?? 0;
+
+        /// <summary>Submissions that carried more than one dispatch.</summary>
+        public long BatchedSubmits => _launcher?.BatchedSubmits ?? 0;
+
+        /// <summary>Largest number of dispatches coalesced into one submission.</summary>
+        public int MaxBatchSize => _launcher?.MaxBatchSize ?? 0;
+
+        /// <summary>Mean dispatches per submission; 1.0 means no coalescing.</summary>
+        public double AvgDispatchesPerSubmit => _launcher?.AvgDispatchesPerSubmit ?? 0;
+
+        /// <summary>Pooled buffers whose payload currently lives in VRAM.</summary>
+        public int StagedBufferCount => _pool?.StagedBufferCount ?? 0;
+
+        /// <summary>VRAM retained by the pooled working buffers.</summary>
+        public ulong PooledDeviceLocalBytes => _pool?.DeviceLocalRetainedBytes ?? 0UL;
+
+        /// <summary>Launcher handle; engine-internal tests of the batch path only.</summary>
+        internal VulkanKernelLauncher? Launcher => _launcher;
+
+        /// <summary>Buffer pool; engine-internal tests of the batch path only.</summary>
+        internal VulkanBufferPool? Pool => _pool;
+
         /// <summary>Cumulative host-to-device bytes copied.</summary>
         public static long UploadedBytes => VulkanBuffer.TotalUploadedBytes;
 
@@ -517,10 +551,11 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public static long BuffersCreated => VulkanBuffer.TotalBuffersCreated;
 
         /// <summary>
-        /// True only if per-op buffers landed in VRAM. Expected to be FALSE:
-        /// the measured policy prefers host-cached system RAM because every op
-        /// round trips through the host (see VulkanContext.SelectMemoryType).
-        /// Kept as a diagnostic.
+        /// True when the per-op working buffers are device-local. With the
+        /// default device tier this is expected to be TRUE: the payload sits in
+        /// VRAM and the host reaches it through copies recorded into the same
+        /// command batch as the dispatch, so the GPU no longer reads every
+        /// operand over PCIe.
         /// </summary>
         public bool UsingDeviceLocalMemory => _pool?.AnyDeviceLocal ?? false;
 
@@ -584,16 +619,33 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             Console.WriteLine("Selected policy tiers (what the backend actually allocates):");
             foreach (int floats in new[] { 16_384, 262_144, 1_048_576 })
             {
+                // The pooled working set is device-local (VRAM) by default, and
+                // the host never maps it. What the host still touches per op is
+                // the staging buffer behind it, so that is the tier whose host
+                // round trip has to stay fast.
+                using var staging = new VulkanBuffer(_ctx!, (ulong)floats * 4);
+                ReportProbe(floats, staging, "staging");
+            }
+
+            foreach (int floats in new[] { 16_384, 262_144, 1_048_576 })
+            {
                 var buffer = RentBuffer(floats);
                 try
                 {
-                    ReportProbe(floats, buffer, "policy");
+                    Console.WriteLine(
+                        $"  working set {floats * 4 / 1024,6} KiB: " +
+                        $"deviceLocal={buffer.IsDeviceLocal,-5} " +
+                        $"stagedThroughHost={buffer.UsesStaging,-5}");
                 }
                 finally
                 {
                     ReturnBuffer(buffer);
                 }
             }
+
+            Console.WriteLine(
+                $"  working set held in VRAM: {_pool?.DeviceLocalRetainedBytes ?? 0UL} B " +
+                $"across {_pool?.StagedBufferCount ?? 0} staged buffers");
         }
 
         /// <summary>Measures one forced memory type with a 1 MiB payload.</summary>
@@ -713,6 +765,26 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             _pool!.Return(buffer);
         }
 
+        /// <summary>
+        /// Brackets one GPU op with the launcher's batch announcement. The op
+        /// is announced BEFORE the pack/upload, so every op of a parallel wave
+        /// keeps the batch open and the wave is submitted once instead of once
+        /// per op. Dispose also runs when the op throws, which is what stops a
+        /// failed op from wedging the batch its peers are waiting for.
+        /// </summary>
+        private readonly struct GpuOpScope : IDisposable
+        {
+            private readonly VulkanKernelLauncher? _launcher;
+
+            public GpuOpScope(VulkanKernelLauncher? launcher)
+            {
+                _launcher = launcher;
+                _launcher?.OpStart();
+            }
+
+            public void Dispose() => _launcher?.OpFinish();
+        }
+
         private static void Unpack(ReadOnlySpan<float> flat, TensorBase t)
         {
             int rows = RowCount(t);
@@ -729,6 +801,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 return;
             }
 
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
             float[] flat = RentScratch(count);
             var buf = RentBuffer(count);
@@ -736,6 +809,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 PackInto(tensor, flat.AsSpan(0, count));
                 buf.Upload(flat.AsSpan(0, count));
+                buf.MarkReadback();
                 _launcher.Dispatch(kernel, new[] { buf }, (uint)count, alpha);
                 buf.Download(flat.AsSpan(0, count));
                 Unpack(flat.AsSpan(0, count), tensor);
@@ -762,6 +836,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 return;
             }
 
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(target) * target.Cols;
             float[] a = RentScratch(count);
             float[] b = RentScratch(count);
@@ -773,6 +848,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PackInto(source, b.AsSpan(0, count));
                 ba.Upload(a.AsSpan(0, count));
                 bb.Upload(b.AsSpan(0, count));
+                ba.MarkReadback();
                 _launcher.Dispatch(kernel, new[] { ba, bb }, (uint)count, 0f);
                 ba.Download(a.AsSpan(0, count));
                 Unpack(a.AsSpan(0, count), target);
@@ -803,6 +879,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 return;
             }
 
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(a) * a.Cols;
             float[] fa = RentScratch(count);
             float[] fb = RentScratch(count);
@@ -816,6 +893,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PackInto(b, fb.AsSpan(0, count));
                 ba.Upload(fa.AsSpan(0, count));
                 bb.Upload(fb.AsSpan(0, count));
+                br.MarkReadback();
                 _launcher.Dispatch(kernel, new[] { ba, bb, br }, (uint)count, 0f);
                 br.Download(fr.AsSpan(0, count));
                 Unpack(fr.AsSpan(0, count), result);
@@ -857,6 +935,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 return;
             }
 
+            using var op = new GpuOpScope(_launcher);
             int k = kA;
             int countA = RowCount(a) * a.Cols;
             int countB = RowCount(b) * b.Cols;
@@ -901,6 +980,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     br.Upload(fr.AsSpan(0, countR));
                 }
 
+                br.MarkReadback();
                 _launcher.DispatchMatMul(
                     accumulate ? VulkanKernel.MatMulAccumulate : VulkanKernel.MatMul,
                     ba, bb, br, (uint)m, (uint)n, (uint)k, (uint)batch,
@@ -948,6 +1028,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public void GeluInPlace(TensorBase tensor)
         {
             if (_launcher == null) { _fallback.GeluInPlace(tensor); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
             float[] f = RentScratch(count);
             var b = RentBuffer(count);
@@ -955,6 +1036,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 PackInto(tensor, f.AsSpan(0, count));
                 b.Upload(f.AsSpan(0, count));
+                b.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.GeluInPlace, new[] { b }, (uint)RowCount(tensor), (uint)tensor.Cols);
                 b.Download(f.AsSpan(0, count));
                 Unpack(f.AsSpan(0, count), tensor);
@@ -970,6 +1052,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         {
             ValidateSame(input, result, "GeluInto");
             if (_launcher == null) { _fallback.GeluInto(input, result); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(input) * input.Cols;
             float[] fa = RentScratch(count);
             float[] fr = RentScratch(count);
@@ -979,6 +1062,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 PackInto(input, fa.AsSpan(0, count));
                 ba.Upload(fa.AsSpan(0, count));
+                br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.GeluInto, new[] { ba, br }, (uint)RowCount(input), (uint)input.Cols);
                 br.Download(fr.AsSpan(0, count));
                 Unpack(fr.AsSpan(0, count), result);
@@ -997,6 +1081,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             ValidateSame(input, outputGradient, "GeluBackwardInto");
             ValidateSame(input, inputGradient, "GeluBackwardInto");
             if (_launcher == null) { _fallback.GeluBackwardInto(input, outputGradient, inputGradient); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(input) * input.Cols;
             float[] fx = RentScratch(count);
             float[] fy = RentScratch(count);
@@ -1010,6 +1095,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PackInto(outputGradient, fy.AsSpan(0, count));
                 bx.Upload(fx.AsSpan(0, count));
                 by.Upload(fy.AsSpan(0, count));
+                br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.GeluBackward, new[] { bx, by, br }, (uint)RowCount(input), (uint)input.Cols);
                 br.Download(fr.AsSpan(0, count));
                 Unpack(fr.AsSpan(0, count), inputGradient);
@@ -1029,6 +1115,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         {
             ValidateNorm(tensor, gamma, beta, "LayerNormInPlace");
             if (_launcher == null) { _fallback.LayerNormInPlace(tensor, gamma, beta, epsilon); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
             float[] f = RentScratch(count);
             float[] g = Pack1D(gamma);
@@ -1042,6 +1129,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 bx.Upload(f.AsSpan(0, count));
                 bg.Upload(g);
                 bbb.Upload(bb);
+                bx.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.LayerNormInPlace, new[] { bx, bg, bbb }, (uint)RowCount(tensor), (uint)tensor.Cols, epsilon);
                 bx.Download(f.AsSpan(0, count));
                 Unpack(f.AsSpan(0, count), tensor);
@@ -1060,6 +1148,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             ValidateSame(input, result, "LayerNormInto");
             ValidateNorm(input, gamma, beta, "LayerNormInto");
             if (_launcher == null) { _fallback.LayerNormInto(input, gamma, beta, result, epsilon); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(input) * input.Cols;
             if (RowCount(result) * result.Cols != count)
                 throw new ArgumentException("LayerNormInto: shape mismatch.");
@@ -1077,6 +1166,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 ba.Upload(fa.AsSpan(0, count));
                 bg.Upload(g);
                 bbb.Upload(bb);
+                br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.LayerNormInto, new[] { ba, bg, bbb, br }, (uint)RowCount(input), (uint)input.Cols, epsilon);
                 br.Download(fr.AsSpan(0, count));
                 Unpack(fr.AsSpan(0, count), result);
@@ -1095,6 +1185,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public void SoftmaxInPlace(TensorBase tensor)
         {
             if (_launcher == null) { _fallback.SoftmaxInPlace(tensor); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(tensor) * tensor.Cols;
             float[] f = RentScratch(count);
             var b = RentBuffer(count);
@@ -1102,6 +1193,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 PackInto(tensor, f.AsSpan(0, count));
                 b.Upload(f.AsSpan(0, count));
+                b.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.SoftmaxInPlace, new[] { b }, (uint)RowCount(tensor), (uint)tensor.Cols);
                 b.Download(f.AsSpan(0, count));
                 Unpack(f.AsSpan(0, count), tensor);
@@ -1118,6 +1210,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             ValidateSame(softmaxOutput, outputGradient, "SoftmaxBackwardInto");
             ValidateSame(softmaxOutput, inputGradient, "SoftmaxBackwardInto");
             if (_launcher == null) { _fallback.SoftmaxBackwardInto(softmaxOutput, outputGradient, inputGradient); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(softmaxOutput) * softmaxOutput.Cols;
             float[] fs = RentScratch(count);
             float[] fy = RentScratch(count);
@@ -1131,6 +1224,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PackInto(outputGradient, fy.AsSpan(0, count));
                 bs.Upload(fs.AsSpan(0, count));
                 by.Upload(fy.AsSpan(0, count));
+                br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.SoftmaxBackward, new[] { bs, by, br }, (uint)RowCount(softmaxOutput), (uint)softmaxOutput.Cols);
                 br.Download(fr.AsSpan(0, count));
                 Unpack(fr.AsSpan(0, count), inputGradient);
@@ -1157,6 +1251,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (scores.Rank != 2 || mask.Rank != 2 || scores.Rows != mask.Rows || scores.Cols != mask.Cols)
                 throw new ArgumentException("Mask shape mismatch.");
             if (_launcher == null) { _fallback.ApplyMaskInPlace(scores, mask); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = scores.Rows * scores.Cols;
             float[] fs = RentScratch(count);
             float[] fm = RentScratch(count);
@@ -1168,6 +1263,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 PackInto(mask, fm.AsSpan(0, count));
                 bs.Upload(fs.AsSpan(0, count));
                 bm.Upload(fm.AsSpan(0, count));
+                bs.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.ApplyMask, new[] { bs, bm }, (uint)count, 1);
                 bs.Download(fs.AsSpan(0, count));
                 Unpack(fs.AsSpan(0, count), scores);
@@ -1187,6 +1283,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 destination.Rows != source.Cols || destination.Cols != source.Rows)
                 throw new ArgumentException("Transpose shape mismatch.");
             if (_launcher == null) { _fallback.TransposeInto(source, destination); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = source.Rows * source.Cols;
             float[] fs = RentScratch(count);
             float[] fr = RentScratch(count);
@@ -1196,6 +1293,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 PackInto(source, fs.AsSpan(0, count));
                 bs.Upload(fs.AsSpan(0, count));
+                br.MarkReadback();
                 _launcher.DispatchTranspose(bs, br, (uint)source.Rows, (uint)source.Cols);
                 br.Download(fr.AsSpan(0, count));
                 Unpack(fr.AsSpan(0, count), destination);
@@ -1213,6 +1311,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         {
             ValidateSame(source, destination, "CopyInto");
             if (_launcher == null) { _fallback.CopyInto(source, destination); return; }
+            using var op = new GpuOpScope(_launcher);
             int count = RowCount(source) * source.Cols;
             float[] fs = RentScratch(count);
             float[] fr = RentScratch(count);
@@ -1222,6 +1321,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 PackInto(source, fs.AsSpan(0, count));
                 bs.Upload(fs.AsSpan(0, count));
+                br.MarkReadback();
                 _launcher.DispatchRowwise(VulkanKernel.Copy, new[] { bs, br }, (uint)count, 1);
                 br.Download(fr.AsSpan(0, count));
                 Unpack(fr.AsSpan(0, count), destination);
@@ -1257,6 +1357,9 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
         public void Synchronize()
         {
+            //Recorded-but-unsent work has to go out first, otherwise there is
+            //nothing left for the device-wide wait to pick up.
+            _launcher?.Flush();
             _ctx?.Synchronize();
         }
 
