@@ -16,7 +16,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
     /// (37-52 MiB/s vs ~43 GiB/s), and every op here round trips through the
     /// host, so device-local VRAM would be the worst possible choice.
     /// </summary>
-    internal sealed unsafe class VulkanBuffer : IDisposable
+    public sealed unsafe class VulkanBuffer : IDisposable
     {
         private readonly VulkanContext _ctx;
         public Silk.NET.Vulkan.Buffer Handle;

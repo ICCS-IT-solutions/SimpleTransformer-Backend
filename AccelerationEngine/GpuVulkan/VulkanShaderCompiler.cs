@@ -7,7 +7,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
     /// Compiles GLSL compute shaders to SPIR-V at startup via shaderc.
     /// One shared compiler; throws with the shaderc error log on failure.
     /// </summary>
-    internal sealed unsafe class VulkanShaderCompiler : IDisposable
+    public sealed unsafe class VulkanShaderCompiler : IDisposable
     {
         private readonly Shaderc _shaderc = Shaderc.GetApi();
         private Compiler* _compiler;

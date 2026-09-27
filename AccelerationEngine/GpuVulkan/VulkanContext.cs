@@ -10,7 +10,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
     /// device with one compute queue, one reusable command pool.
     /// Never throws for missing GPUs - check IsAvailable, fall back to CPU.
     /// </summary>
-    internal sealed unsafe class VulkanContext : IDisposable
+    public sealed unsafe class VulkanContext : IDisposable
     {
         public Vk Vk { get; } = Vk.GetApi();
 
