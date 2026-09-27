@@ -14,6 +14,26 @@ namespace SimpleTransformer.AppDb
         public required Guid TrainingConfigId { get; set; }
 
         /// <summary>
+        /// Vocabulary this model tokenises with. Nullable so models created before
+        /// the reference existed keep working (they fall back to the vocabulary the
+        /// server loaded at startup).
+        /// <para>
+        /// The token id space is decided by the vocabulary, and checkpoints record
+        /// <see cref="Model.TransformerConfig.VocabSize"/>, so this is fixed in
+        /// practice: <see cref="TransformerModelService"/> ignores it on update, and
+        /// a training job pins a null value the first time it runs. Training with a
+        /// different vocabulary requires a new model.
+        /// </para>
+        /// </summary>
+        public Guid? VocabularyId { get; set; }
+
+        /// <summary>
+        /// Convenience navigation for responses. Only populated where the query
+        /// explicitly includes it.
+        /// </summary>
+        public VocabularyEntry? Vocabulary { get; set; }
+
+        /// <summary>
         /// Acceleration backend used by this model. One of the
         /// <see cref="AccelerationEngine.BackendSelector.BackendType"/> names.
         /// Defaults to "Auto" (best available at load time).

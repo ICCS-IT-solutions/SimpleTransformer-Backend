@@ -73,6 +73,14 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 };
             }
 
+            //Pin/validate the vocabulary before doing any work: a job trained with the
+            //wrong token id space produces a model whose checkpoints cannot be used.
+            var vocabularyProblem = await ValidateVocabularyAsync(db, modelEntry, model, req.VocabularyId);
+            if (vocabularyProblem != null)
+            {
+                return vocabularyProblem;
+            }
+
             if (string.IsNullOrEmpty(req.InputText))
             {
                 return new ApiResponse<TrainingResponse>
@@ -178,6 +186,14 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     Status = ResponseStatus.Failure,
                     StatusCode = 404
                 };
+            }
+
+            //Pin/validate the vocabulary before extracting the corpus: a job trained
+            //with the wrong token id space produces unusable checkpoints.
+            var vocabularyProblem = await ValidateVocabularyAsync(db, modelEntry, model, req.VocabularyId);
+            if (vocabularyProblem != null)
+            {
+                return vocabularyProblem;
             }
 
             var jobId = Guid.NewGuid();
@@ -451,6 +467,67 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 StatusCode = 200,
                 Data = report
             };
+        }
+
+        /// <summary>
+        /// Resolves the vocabulary a job asked for and checks it against the model.
+        /// <para>
+        /// A model starts unpinned and the first job that trains it pins the chosen
+        /// vocabulary. Later jobs must reuse it: a checkpoint's token id space is
+        /// fixed by the vocabulary that trained it. Returns null when the request may
+        /// proceed, otherwise the response to return.
+        /// </para>
+        /// </summary>
+        private async Task<ApiResponse<TrainingResponse>?> ValidateVocabularyAsync(
+            AppDbContext db,
+            TransformerModelEntry modelEntry,
+            TransformerModel model,
+            Guid vocabularyId)
+        {
+            var vocabulary = await db.Vocabularies
+                .FirstOrDefaultAsync(x => x.EntryId == vocabularyId);
+
+            if (vocabulary == null)
+            {
+                return Failure(
+                    "The selected vocabulary does not exist. Compile one, or choose a different vocabulary for this job.");
+            }
+
+            if (modelEntry.VocabularyId.HasValue && modelEntry.VocabularyId.Value != vocabularyId)
+            {
+                var pinned = await db.Vocabularies
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x => x.EntryId == modelEntry.VocabularyId.Value);
+
+                return Failure(
+                    $"Model '{modelEntry.Name}' is pinned to vocabulary " +
+                    $"'{pinned?.Name ?? modelEntry.VocabularyId.Value.ToString()}'. " +
+                    $"Start a new model to train with '{vocabulary.Name}'.");
+            }
+
+            var problem = VocabularyArtifacts.DescribeModelVocabularyProblem(
+                modelEntry.Name,
+                model.Config.VocabSize,
+                vocabulary,
+                VocabularyArtifacts.TryReadTokenCount(vocabulary));
+
+            if (problem != null)
+            {
+                return Failure(problem);
+            }
+
+            if (!modelEntry.VocabularyId.HasValue)
+            {
+                modelEntry.VocabularyId = vocabularyId;
+                modelEntry.DateUpdated = DateTime.UtcNow;
+                await db.SaveChangesAsync();
+
+                Log.Information(
+                    "Model {Model} pinned to vocabulary {Vocabulary} ({Tokens} tokens).",
+                    modelEntry.Name, vocabulary.Name, vocabulary.NumTokens);
+            }
+
+            return null;
         }
 
         private static ApiResponse<TrainingResponse> Failure(string message) => new()

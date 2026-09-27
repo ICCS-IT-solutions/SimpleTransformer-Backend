@@ -1,0 +1,25 @@
+{
+  "DocumentsIn": 1,
+  "DocumentsOut": 1,
+  "CharsIn": 4291058,
+  "CharsOut": 4259933,
+  "DuplicatesRemoved": 0,
+  "FilteredByLength": 0,
+  "FilteredEmpty": 0,
+  "Files": [
+    {
+      "FileName": "bsb.txt",
+      "ResolvedFormat": "Txt",
+      "DocumentsIn": 1,
+      "DocumentsOut": 1
+    }
+  ],
+  "Warnings": [],
+  "Samples": [
+    {
+      "FileName": "bsb.txt",
+      "Original": "The Holy Bible, Berean Standard Bible, BSB is produced in cooperation with Bible Hub, Discovery Bible, unfoldingWord, Bible Aquifer, OpenBible.com, and the Berean Bible Translation Committee. \t\r\nThis text of God\u0027s Word has been dedicated to the public domain. Free resources and databases are available at BereanBible.com.\t\r\nVerse\tBerean Standard Bible\r\nGenesis 1:1\tIn the beginning God created the heavens and the earth.\r\nGenesis 1:2\tNow the earth was formless and void, and darkness was over the su\u2026",
+      "Cleaned": "The Holy Bible, Berean Standard Bible, BSB is produced in cooperation with Bible Hub, Discovery Bible, unfoldingWord, Bible Aquifer, OpenBible.com, and the Berean Bible Translation Committee. This text of God\u0027s Word has been dedicated to the public domain. Free resources and databases are available at BereanBible.com. Verse Berean Standard Bible Genesis 1:1 In the beginning God created the heavens and the earth. Genesis 1:2 Now the earth was formless and void, and darkness was over the surface o\u2026"
+    }
+  ]
+}

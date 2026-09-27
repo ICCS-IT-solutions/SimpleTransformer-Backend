@@ -100,6 +100,19 @@ namespace SimpleTransformer.AppDb
 
             modelBuilder.Entity<TransformerModelEntry>()
                 .HasIndex(x => x.TrainingConfigId);
+
+            modelBuilder.Entity<TransformerModelEntry>()
+                .HasIndex(x => x.VocabularyId);
+
+            //A model is pinned to the vocabulary that trained it: removing that
+            //vocabulary would leave the model unable to load (and its checkpoints
+            //unusable), so the delete is restricted.
+            modelBuilder.Entity<TransformerModelEntry>()
+                .HasOne(x => x.Vocabulary)
+                .WithMany()
+                .HasForeignKey(x => x.VocabularyId)
+                .OnDelete(DeleteBehavior.Restrict);
+
             // ---------------------------------------------------------------------
             // Training jobs
             // ---------------------------------------------------------------------

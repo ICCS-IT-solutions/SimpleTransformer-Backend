@@ -22,6 +22,16 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         /// trainable parameter sets, so their checkpoints are not interchangeable.
         /// </summary>
         public bool UseQLora { get; set; } = true;
+
+        /// <summary>
+        /// Vocabulary the model should tokenise with. Null leaves the model
+        /// unpinned: it runs on the vocabulary the server loaded at startup until a
+        /// training job pins one. When set, creation is refused if the artifact is
+        /// missing or its token count disagrees with the transformer config, and the
+        /// value is ignored on update because a vocabulary change would orphan every
+        /// saved checkpoint (they record VocabSize).
+        /// </summary>
+        public Guid? VocabularyId { get; set; }
     }
 
     /*

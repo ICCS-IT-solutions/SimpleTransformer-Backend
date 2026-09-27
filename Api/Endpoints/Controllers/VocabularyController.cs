@@ -41,6 +41,18 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
             return await _vocabularyService.GetCurrentVocabularyProperties();
         }
 
+        [HttpGet("api/v1/vocabulary/properties/{modelId:guid}")]
+        public async Task<ApiResponse<VocabularyPropertiesResponse>> GetActiveVocabularyProperties(Guid modelId)
+        {
+            return await _vocabularyService.GetActiveVocabularyProperties(modelId);
+        }
+
+        [HttpGet("api/v1/vocabulary/active")]
+        public async Task<ApiResponse<VocabularyPropertiesResponse>> GetActiveVocabulary()
+        {
+            return await _vocabularyService.GetActiveVocabularyProperties(null);
+        }
+
         [HttpGet("api/v1/vocabulary/available")]
         public async Task<ApiResponse<AvailableVocabulariesResponse>> GetAvailableVocabularies()
         {

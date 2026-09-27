@@ -35,13 +35,18 @@ namespace SimpleTransformer.Model.Tokenizer
         {
             List<string> texts = new();
 
-            foreach (string filename in filenames)
+            var filePaths = filenames.Select(filename => Path.Combine(sourceDirectory, filename)).ToList();
+            foreach (var sourcePath in filePaths)
             {
-                string sourcePath = Path.Combine(sourceDirectory, filename);
-
                 ValidateSourceFile(sourcePath);
+            }
 
-                texts.Add(File.ReadAllText(sourcePath));
+            // BPE must hold all texts plus per-word symbol lists in memory.
+            VocabularySourceReader.ValidateTotalSize(filePaths, 256L * 1024 * 1024, "BPE");
+
+            foreach (var sourcePath in filePaths)
+            {
+                texts.Add(VocabularySourceReader.ReadAllText(sourcePath));
             }
 
             return TrainBpe(texts, targetVocabSize);
@@ -140,12 +145,7 @@ namespace SimpleTransformer.Model.Tokenizer
             if (!File.Exists(path))
                 throw new FileNotFoundException("Vocabulary source file not found.", path);
 
-            string ext = Path.GetExtension(path);
-            if (!string.Equals(ext, ".txt", StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(ext, ".log", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new ArgumentException("Vocabulary source must be a .txt or .log file.", nameof(path));
-            }
+            VocabularySourceReader.ValidateExtension(path);
         }
     }
 }

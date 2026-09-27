@@ -77,7 +77,7 @@ namespace SimpleTransformer.Api
                     });
                     options.AddPolicy("Frontend", pol =>
                     {
-                        pol.WithOrigins("http://localhost:5173").AllowAnyMethod().AllowAnyHeader();
+                        pol.WithOrigins("http://localhost:5173","https://192.168.3.3:5173","http://127.0.0.1:5173").AllowAnyMethod().AllowAnyHeader();
                     });
                 });
 

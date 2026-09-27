@@ -26,6 +26,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
             await using var db = await _dbFactory.CreateDbContextAsync();
             var model = await db.TransformerModels
                 .AsNoTracking()
+                .Include(x => x.Vocabulary)
                 .FirstOrDefaultAsync(x => x.EntryId == modelId);
 
             if (model == null)
@@ -54,7 +55,9 @@ namespace SimpleTransformer.Api.Endpoints.Services
         public async Task<ApiResponse<TransformerModelResponse>> GetModels()
         {
             await using var db = await _dbFactory.CreateDbContextAsync();
-            var models = await db.TransformerModels.ToListAsync();
+            var models = await db.TransformerModels
+                .Include(x => x.Vocabulary)
+                .ToListAsync();
             return new ApiResponse<TransformerModelResponse>()
             {
                 Message = "Models fetched successfully.",
@@ -85,6 +88,43 @@ namespace SimpleTransformer.Api.Endpoints.Services
         public async Task<ApiResponse<TransformerModelResponse>> CreateTransformerModel(CreateTransformerModelRequest req)
         {
             await using var db = await _dbFactory.CreateDbContextAsync();
+
+            //The vocabulary decides the token id space and checkpoints record the
+            //configuration's VocabSize, so refuse a model whose artifact does not
+            //match its config here instead of failing at load or training time.
+            if (req.VocabularyId.HasValue)
+            {
+                var vocabulary = await db.Vocabularies
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x => x.EntryId == req.VocabularyId.Value);
+
+                if (vocabulary == null)
+                {
+                    return new ApiResponse<TransformerModelResponse>
+                    {
+                        Message = $"Vocabulary {req.VocabularyId.Value} not found in database.",
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 404
+                    };
+                }
+
+                var problem = VocabularyArtifacts.DescribeModelVocabularyProblem(
+                    req.Name,
+                    req.TransformerConfig.Config.VocabSize,
+                    vocabulary,
+                    VocabularyArtifacts.TryReadTokenCount(vocabulary));
+
+                if (problem != null)
+                {
+                    return new ApiResponse<TransformerModelResponse>
+                    {
+                        Message = problem,
+                        Status = ResponseStatus.Failure,
+                        StatusCode = 400
+                    };
+                }
+            }
+
             var model = new TransformerModelEntry
             {
                 Name = req.Name,
@@ -92,7 +132,8 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 TransformerConfigId = req.TransformerConfig.EntryId,
                 TrainingConfigId = req.TrainingConfig.EntryId,
                 AccelerationBackend = req.AccelerationBackend,
-                UseQLora = req.UseQLora
+                UseQLora = req.UseQLora,
+                VocabularyId = req.VocabularyId
             };
 
             await db.TransformerModels.AddAsync(model);
@@ -376,6 +417,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
             //parameters the model exposes, so flipping it on an existing model would
             //make every saved checkpoint unloadable. A new model is required to
             //train the other way.
+
+            //VocabularyId is likewise fixed at creation: it decides the token id
+            //space, checkpoints record VocabSize, and a swap would leave every saved
+            //checkpoint unloadable. The training path pins an unset value on first
+            //use instead.
 
             await db.SaveChangesAsync();
 
