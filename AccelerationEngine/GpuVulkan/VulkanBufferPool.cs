@@ -14,8 +14,19 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
     /// </summary>
     internal sealed class VulkanBufferPool : IDisposable
     {
+        // Idle buckets older than this are returned to the driver by TrimIdle,
+        // so variable sequence lengths and batch sizes cannot pin every
+        // power-of-two bucket for the life of the process.
+        private static readonly TimeSpan DefaultIdleLifetime = TimeSpan.FromMinutes(2);
+
+        private sealed class Bucket
+        {
+            public readonly Stack<VulkanBuffer> Buffers = new();
+            public long LastUsedTicks = DateTime.UtcNow.Ticks;
+        }
+
         private readonly VulkanContext _ctx;
-        private readonly Dictionary<int, Stack<VulkanBuffer>> _buckets = new();
+        private readonly Dictionary<int, Bucket> _buckets = new();
         private readonly List<VulkanBuffer> _all = new();
         private readonly object _gate = new();
         private readonly ulong _deviceLocalBudgetBytes;
@@ -47,8 +58,11 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             lock (_gate)
             {
                 int bucket = BucketFor(floatCount);
-                if (_buckets.TryGetValue(bucket, out var stack) && stack.Count > 0)
-                    return stack.Pop()!;
+                if (_buckets.TryGetValue(bucket, out var entry) && entry.Buffers.Count > 0)
+                {
+                    entry.LastUsedTicks = DateTime.UtcNow.Ticks;
+                    return entry.Buffers.Pop()!;
+                }
 
                 ulong bytes = (ulong)(bucket * 4);
 
@@ -146,20 +160,20 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (budget == 0)
                 return;
 
-            foreach (var stack in _buckets.Values)
+            foreach (var entry in _buckets.Values)
             {
                 if (RetainedBytes(deviceLocalTier) <= budget)
                     break;
 
-                if (stack.Count == 0)
+                if (entry.Buffers.Count == 0)
                     continue;
 
                 //Drain the bucket, disposing only the tier that is over budget,
                 //then push the survivors back with their order intact.
-                var keep = new List<VulkanBuffer>(stack.Count);
-                while (stack.Count > 0 && RetainedBytes(deviceLocalTier) > budget)
+                var keep = new List<VulkanBuffer>(entry.Buffers.Count);
+                while (entry.Buffers.Count > 0 && RetainedBytes(deviceLocalTier) > budget)
                 {
-                    var candidate = stack.Pop();
+                    var candidate = entry.Buffers.Pop();
                     if (candidate.IsDeviceLocal == deviceLocalTier)
                     {
                         RemoveLiveLocked(candidate);
@@ -172,7 +186,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 }
 
                 for (int i = keep.Count - 1; i >= 0; i--)
-                    stack.Push(keep[i]);
+                    entry.Buffers.Push(keep[i]);
             }
         }
 
@@ -211,12 +225,65 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             lock (_gate)
             {
                 int bucket = BucketFor((int)(buffer.SizeBytes / 4));
-                if (!_buckets.TryGetValue(bucket, out var stack))
+                if (!_buckets.TryGetValue(bucket, out var entry))
                 {
-                    stack = new Stack<VulkanBuffer>();
-                    _buckets[bucket] = stack;
+                    entry = new Bucket();
+                    _buckets[bucket] = entry;
                 }
-                stack.Push(buffer);
+                entry.Buffers.Push(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Returns idle buckets older than <paramref name="maxIdleAge"/> (or the
+        /// two-minute default) to the driver. Only buckets with every buffer
+        /// returned are eligible - rented buffers are never touched - and the
+        /// most recently used bucket is always kept so the steady-state hot
+        /// path stays allocation-free. Safe between training steps, after
+        /// epochs, or on model unload.
+        /// </summary>
+        public void TrimIdle(TimeSpan? maxIdleAge = null)
+        {
+            TimeSpan lifetime = maxIdleAge ?? DefaultIdleLifetime;
+            long cutoff = DateTime.UtcNow.Ticks - lifetime.Ticks;
+
+            lock (_gate)
+            {
+                if (_disposed || _buckets.Count == 0)
+                    return;
+
+                int? hottestBucket = null;
+                long hottestTicks = long.MinValue;
+                foreach (var pair in _buckets)
+                {
+                    if (pair.Value.LastUsedTicks > hottestTicks)
+                    {
+                        hottestTicks = pair.Value.LastUsedTicks;
+                        hottestBucket = pair.Key;
+                    }
+                }
+
+                var deadBuckets = new List<int>();
+                foreach (var pair in _buckets)
+                {
+                    var bucket = pair.Value;
+                    if (bucket.Buffers.Count == 0 || bucket.LastUsedTicks > cutoff)
+                        continue;
+                    if (hottestBucket.HasValue && pair.Key == hottestBucket.Value)
+                        continue;
+
+                    while (bucket.Buffers.Count > 0)
+                    {
+                        var buffer = bucket.Buffers.Pop();
+                        RemoveLiveLocked(buffer);
+                        buffer.Dispose();
+                    }
+
+                    deadBuckets.Add(pair.Key);
+                }
+
+                foreach (int bucket in deadBuckets)
+                    _buckets.Remove(bucket);
             }
         }
 

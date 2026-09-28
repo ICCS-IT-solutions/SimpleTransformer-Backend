@@ -59,20 +59,25 @@ namespace SimpleTransformer.Model
             if (input.Rank != 2) 
                 throw new ArgumentException("Input must be a matrix (Rank 2).");
 
-            // 1. Project input into Q, K, V workspace tensors
-            TensorBase q = _queryProjection.Forward(input, workspace);
-            TensorBase k = _keyProjection.Forward(input, workspace);
-            TensorBase v = _valueProjection.Forward(input, workspace);
+            // Q/K/V projections plus the attention chain are sequential on this
+            // thread: one scope, one submission, one fence wait. CPU no-op.
+            using (workspace.Backend.BeginBatchScope())
+            {
+                // 1. Project input into Q, K, V workspace tensors
+                TensorBase q = _queryProjection.Forward(input, workspace);
+                TensorBase k = _keyProjection.Forward(input, workspace);
+                TensorBase v = _valueProjection.Forward(input, workspace);
 
-            // 2. Compute attention output
-            TensorBase output = _attention.Forward(q, k, v, mask, workspace);
+                // 2. Compute attention output
+                TensorBase output = _attention.Forward(q, k, v, mask, workspace);
 
-            // 3. Release intermediate Q, K, V buffers back to workspace pool
-            workspace.Release(q);
-            workspace.Release(k);
-            workspace.Release(v);
+                // 3. Release intermediate Q, K, V buffers back to workspace pool
+                workspace.Release(q);
+                workspace.Release(k);
+                workspace.Release(v);
 
-            return output;
+                return output;
+            }
         }
 
         private TensorBase ForwardBatch(TensorBase input, TensorBase? mask, TensorWorkspace workspace)

@@ -538,6 +538,53 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// <summary>Buffer pool; engine-internal tests of the batch path only.</summary>
         internal VulkanBufferPool? Pool => _pool;
 
+        /// <summary>
+        /// Opens an explicit batch scope: every op issued through this backend
+        /// until the scope is disposed records into one submission, and dispose
+        /// submits it and blocks until it completes. Model code brackets a
+        /// sequential op chain (attention score chain, feed-forward pair) with
+        /// this so one fence wait covers the whole chain instead of one wait
+        /// per op. Thread-affine: open and dispose on the same thread, and
+        /// never hold a scope across a Parallel.For fan-out (workers would
+        /// deadlock against the owner's pending-prep wait).
+        /// </summary>
+        public IDisposable BeginBatchScope()
+        {
+            if (_launcher == null)
+                return NullBatchScope.Instance;
+            return new GpuBatchScope(_launcher);
+        }
+
+        /// <summary>
+        /// Drops idle pooled staging buffers and cached descriptor sets back
+        /// toward the configured budgets (variable sequence lengths and batch
+        /// sizes otherwise pin every power-of-two bucket forever). Safe between
+        /// training steps, after epochs, or on model unload.
+        /// </summary>
+        public void TrimIdleMemory()
+        {
+            _launcher?.TrimDescriptorCache();
+            _pool?.TrimIdle(TimeSpan.FromMinutes(2));
+            ScratchCache.TrimIdle();
+        }
+
+        private sealed class GpuBatchScope : IDisposable
+        {
+            private VulkanKernelLauncher? _launcher;
+
+            public GpuBatchScope(VulkanKernelLauncher launcher)
+            {
+                _launcher = launcher;
+                _launcher.BeginBatch();
+            }
+
+            public void Dispose()
+            {
+                var launcher = Interlocked.Exchange(ref _launcher, null);
+                launcher?.EndBatch();
+            }
+        }
+
         /// <summary>Cumulative host-to-device bytes copied.</summary>
         public static long UploadedBytes => VulkanBuffer.TotalUploadedBytes;
 

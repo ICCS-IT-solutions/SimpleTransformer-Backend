@@ -602,6 +602,12 @@ namespace SimpleTransformer.Model
                 // non-resident tensors no-op immediately.
                 RefreshResidentWeights();
 
+                // 9. Return idle pooled device state toward budget: variable
+                // sequence lengths and batch sizes churn power-of-two buckets
+                // every step, so trim here rather than pinning them forever.
+                // CPU backends no-op.
+                _workspace.Backend.TrimIdleMemory();
+
                 return loss;
             }
             finally

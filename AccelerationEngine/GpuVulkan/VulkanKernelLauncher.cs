@@ -1184,6 +1184,33 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         }
 
         /// <summary>
+        /// Drops the descriptor-set cache when it is safe: nothing recorded and
+        /// nothing in flight, so no live command buffer can reference a set.
+        /// Called between training steps via TrimIdleMemory so variable shapes
+        /// cannot pin an ever-growing set of binding tuples.
+        /// </summary>
+        public void TrimDescriptorCache()
+        {
+            if (_disposed)
+                return;
+
+            lock (_dispatchGate)
+            {
+                if (_openRecords > 0 || _inflightBatches > 0 || _explicitDepth > 0)
+                    return;
+                if (_setCache.Count == 0)
+                    return;
+
+                _setCache.Clear();
+                if (_spool != null && _spool.Value.Handle != 0)
+                {
+                    _ctx.Vk.DestroyDescriptorPool(_ctx.Device, _spool.Value, null);
+                    _spool = null;
+                }
+            }
+        }
+
+        /// <summary>
         /// Drops cached sets that a pool reset invalidated. When
         /// <paramref name="keepSpool"/> is set only the primary pool's sets go;
         /// otherwise every cached set is stale.

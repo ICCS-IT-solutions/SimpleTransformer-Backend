@@ -1,6 +1,25 @@
 using SimpleTransformer.Model;
+
 namespace SimpleTransformer.AccelerationEngine
 {
+    /// <summary>
+    /// No-op batch scope for backends that execute synchronously (CPU).
+    /// Kept as a singleton so sequential model code can open a scope
+    /// without allocating.
+    /// </summary>
+    internal sealed class NullBatchScope : IDisposable
+    {
+        public static readonly NullBatchScope Instance = new();
+
+        private NullBatchScope()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
     public interface IAccelerationBackend : IDisposable
     {
         string Name { get; }
@@ -9,6 +28,22 @@ namespace SimpleTransformer.AccelerationEngine
 
         /// <summary>True when the backend initialized successfully and can execute ops.</summary>
         bool IsAvailable { get; }
+
+        /// <summary>
+        /// Opens an explicit batch scope: every op issued through this backend
+        /// until the scope is disposed should land in as few device submissions
+        /// as possible, with the scope owner blocking for completion on dispose.
+        /// CPU backends return a no-op scope. Callers must dispose on the same
+        /// thread that opened the scope; scopes do not cross threads.
+        /// </summary>
+        IDisposable BeginBatchScope() => NullBatchScope.Instance;
+
+        /// <summary>
+        /// Releases idle pooled memory (staging buffers, cached descriptor sets)
+        /// back toward the configured budgets. Safe to call between steps; a
+        /// no-op for backends without pooled device state.
+        /// </summary>
+        void TrimIdleMemory() { }
 
         // Element-wise operations
         void ScaleInPlace(

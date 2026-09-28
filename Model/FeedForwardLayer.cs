@@ -57,35 +57,46 @@ namespace SimpleTransformer.Model
             var forwardWatch = Stopwatch.StartNew();
             Log.Information("[FeedForwardLayer.Forward] Started forward propagation...");
 
-            // 1. Linear expansion: [T, C] -> [T, 4C]
-            TensorBase expanded = _expand.Forward(input, workspace);
-            Log.Information($"[FeedForwardLayer.Forward] Finished linear expansion in {forwardWatch.ElapsedMilliseconds} ms.");
-
-            // 2. GELU activation: Pass workspace explicitly
-            forwardWatch.Restart();
-            TensorBase activated = _activation.Forward(expanded, workspace);
-            Log.Information($"[FeedForwardLayer.Forward] Finished gelu activation in {forwardWatch.ElapsedMilliseconds} ms.");
-
-            // Release intermediate expansion buffer if GELU created a new tensor
-            if (!ReferenceEquals(expanded, activated))
+            // Sequential expand/activate/project chain under one batch scope:
+            // one submission and one fence wait instead of one wait per op.
+            // CPU backends no-op. Parallel paths stay outside scopes (the
+            // launcher batch is thread-affine and workers would deadlock).
+            using (workspace.Backend.BeginBatchScope())
             {
-                workspace.Release(expanded);
+                // 1. Linear expansion: [T, C] -> [T, 4C]
+                TensorBase expanded = _expand.Forward(input, workspace);
+                Log.Information($"[FeedForwardLayer.Forward] Finished linear expansion in {forwardWatch.ElapsedMilliseconds} ms.");
+
+                // 2. GELU activation: Pass workspace explicitly
+                forwardWatch.Restart();
+                TensorBase activated = _activation.Forward(expanded, workspace);
+                Log.Information($"[FeedForwardLayer.Forward] Finished gelu activation in {forwardWatch.ElapsedMilliseconds} ms.");
+
+                // Release intermediate expansion buffer if GELU created a new tensor
+                if (!ReferenceEquals(expanded, activated))
+                {
+                    workspace.Release(expanded);
+                }
+
+                // 3. Linear projection: [T, 4C] -> [T, C]
+                forwardWatch.Restart();
+                TensorBase output = _project.Forward(activated, workspace);
+                Log.Information($"[FeedForwardLayer.Forward] Finished linear projection in {forwardWatch.ElapsedMilliseconds} ms.");
+                forwardWatch.Stop();
+
+                // Release intermediate activation buffer after projection finishes
+                workspace.Release(activated);
+
+                return output;
             }
-
-            // 3. Linear projection: [T, 4C] -> [T, C]
-            forwardWatch.Restart();
-            TensorBase output = _project.Forward(activated, workspace);
-            Log.Information($"[FeedForwardLayer.Forward] Finished linear projection in {forwardWatch.ElapsedMilliseconds} ms.");
-            forwardWatch.Stop();
-
-            // Release intermediate activation buffer after projection finishes
-            workspace.Release(activated);
-
-            return output;
         }
 
         private TensorBase ForwardBatch3D(TensorBase input, TensorWorkspace workspace)
         {
+            // Rank-3 path fans out across Parallel.For workers inside the linear
+            // and GELU layers: keep it outside any explicit scope (the launcher
+            // batch is thread-affine; the automatic OpStart/OpFinish wave
+            // coalescing already merges those workers into fewer submissions).
             TensorBase expanded = _expand.Forward(input, workspace);
             TensorBase activated = _activation.Forward(expanded, workspace);
 

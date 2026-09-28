@@ -8,8 +8,25 @@ namespace SimpleTransformer.Model
 {
     public class TensorWorkspace : IDisposable
     {
+        // Reference-identity wrapper so the active set tracks tensor identity,
+        // not value equality: two distinct tensors with equal shapes must not
+        // compare equal, or releasing one would unregister the other.
+        private readonly struct TensorEntry : IEquatable<TensorEntry>
+        {
+            public readonly TensorBase Tensor;
+
+            public TensorEntry(TensorBase tensor) => Tensor = tensor;
+
+            public bool Equals(TensorEntry other) => ReferenceEquals(Tensor, other.Tensor);
+            public override bool Equals(object? obj) => obj is TensorEntry other && Equals(other);
+            public override int GetHashCode() => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Tensor);
+        }
+
         private readonly ConcurrentDictionary<TensorShapeKey, ConcurrentBag<TensorBase>> _pool = new();
-        private readonly ConcurrentBag<TensorBase> _activeTensors = new();
+        // Tracks live borrows so Release can reject foreign or double-released
+        // tensors (which would otherwise alias one buffer to two borrowers).
+        // A concurrent dictionary doubles as the set: the value is unused.
+        private readonly ConcurrentDictionary<TensorEntry, byte> _activeTensors = new();
         private bool _isDisposed;
 
         /// <summary>
@@ -58,7 +75,7 @@ namespace SimpleTransformer.Model
             }
 
             // Track active allocation for automatic sweep on Reset()
-            _activeTensors.Add(tensor);
+            _activeTensors.TryAdd(new TensorEntry(tensor), 0);
             return tensor;
         }
 
@@ -119,11 +136,18 @@ namespace SimpleTransformer.Model
             return Borrow(reference.Shape, factory);
         }
         /// <summary>
-        /// Releases a tensor back to the pool for reuse.
+        /// Releases a tensor back to the pool for reuse. Tensors never borrowed
+        /// from this workspace (layer outputs already released, foreign views)
+        /// are ignored so a double-release cannot stock the pool with the same
+        /// instance twice - that aliasing would let two borrowers silently share
+        /// one buffer and corrupt each other's activations.
         /// </summary>
         public void Release(TensorBase? tensor)
         {
             if (tensor == null || _isDisposed) return;
+
+            if (!_activeTensors.TryRemove(new TensorEntry(tensor), out _))
+                return;
 
             var key = new TensorShapeKey(tensor.Shape);
             var bag = _pool.GetOrAdd(key, _ => new ConcurrentBag<TensorBase>());
@@ -138,8 +162,13 @@ namespace SimpleTransformer.Model
         {
             ThrowIfDisposed();
 
-            while (_activeTensors.TryTake(out var tensor))
+            foreach (var pair in _activeTensors)
             {
+                if (!_activeTensors.TryRemove(pair.Key, out _))
+                    continue;
+
+                var tensor = pair.Key.Tensor;
+
                 // Reset data state so previous intermediate results don't bleed over
                 tensor.Clear();
 
@@ -154,6 +183,8 @@ namespace SimpleTransformer.Model
         {
             if (_isDisposed) return;
             _isDisposed = true;
+
+            _activeTensors.Clear();
 
             foreach (var key in _pool.Keys)
             {

@@ -55,35 +55,42 @@ namespace SimpleTransformer.Model
             TensorBase kTransposed = workspace.Borrow2D(k.Cols, k.Rows);
             TensorBase scores = workspace.Borrow2D(q.Rows, k.Rows);
 
-            // 1. Q * K^T
-            workspace.Backend.TransposeInto(k, kTransposed);
-            workspace.Backend.MatMul(q, kTransposed, scores);
-            workspace.Release(kTransposed);
-
-            // 2. Scale scores: 1 / sqrt(d_k)
-            workspace.Backend.ScaleInPlace(scores, 1.0f / MathF.Sqrt(_headSize));
-
-            // 3. Apply mask if provided (-1e9f before softmax)
-            if (mask != null)
+            // Sequential chain, one fence wait: the transpose/matmul/scale/mask/
+            // softmax/copy/matmul chain round-trips per op today (each op packs,
+            // dispatches, waits, then unpacks). The scope keeps the dispatches in
+            // one submission; the unpacks still wait per op. CPU backends no-op.
+            using (workspace.Backend.BeginBatchScope())
             {
-                workspace.Backend.ApplyMaskInPlace(scores, mask);
+                // 1. Q * K^T
+                workspace.Backend.TransposeInto(k, kTransposed);
+                workspace.Backend.MatMul(q, kTransposed, scores);
+                workspace.Release(kTransposed);
+
+                // 2. Scale scores: 1 / sqrt(d_k)
+                workspace.Backend.ScaleInPlace(scores, 1.0f / MathF.Sqrt(_headSize));
+
+                // 3. Apply mask if provided (-1e9f before softmax)
+                if (mask != null)
+                {
+                    workspace.Backend.ApplyMaskInPlace(scores, mask);
+                }
+
+                // 4. Softmax computation
+                workspace.Backend.SoftmaxInPlace(scores);
+
+                // 5. Cache softmax weights PER BATCH ITEM for backprop (persist until Backward completes)
+                Tensor currentWeights = new Tensor(scores.Rows, scores.Cols);
+                workspace.Backend.CopyInto(scores, currentWeights);
+                _lastWeights.Add(currentWeights);
+
+                // 6. Output = SoftmaxWeights * V
+                TensorBase output = workspace.Borrow2D(scores.Rows, v.Cols);
+                workspace.Backend.MatMul(scores, v, output);
+
+                workspace.Release(scores);
+
+                return output;
             }
-
-            // 4. Softmax computation
-            workspace.Backend.SoftmaxInPlace(scores);
-
-            // 5. Cache softmax weights PER BATCH ITEM for backprop (persist until Backward completes)
-            Tensor currentWeights = new Tensor(scores.Rows, scores.Cols);
-            workspace.Backend.CopyInto(scores, currentWeights);
-            _lastWeights.Add(currentWeights);
-
-            // 6. Output = SoftmaxWeights * V
-            TensorBase output = workspace.Borrow2D(scores.Rows, v.Cols);
-            workspace.Backend.MatMul(scores, v, output);
-
-            workspace.Release(scores);
-
-            return output;
         }
 
         private TensorBase ForwardBatch(TensorBase q, TensorBase k, TensorBase v, TensorBase? mask, TensorWorkspace workspace)
