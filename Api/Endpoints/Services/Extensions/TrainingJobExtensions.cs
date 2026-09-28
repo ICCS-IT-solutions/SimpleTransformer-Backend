@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Serilog;
 using SimpleTransformer.Api.Endpoints.Services;
+using SimpleTransformer.Api.Endpoints.Services.Extensions;
 using SimpleTransformer.Api.ManagementEngine;
 using SimpleTransformer.Api.Responses;
 using SimpleTransformer.AppDb;
@@ -121,9 +122,60 @@ public static class TrainingJobExtensions
         TrainingJobManager jobManager     
     )
     {
-        using var db = await dbFactory.CreateDbContextAsync();
-        string inputText;
+        int batchSize = config?.BatchSize ?? model.TrainingConfig.BatchSize;
+        bool dropLast = model.TrainingConfig.DropLast;
+        int window = model.Config.MaxSequenceLength;
 
+        // Preferred path: stream windows off the pre-tokenized .stbin cache
+        // (O(batch*seq) memory). Legacy path below keeps jobs whose corpus
+        // predates the cache, plus live-text jobs, working unchanged.
+        var cachePath = job.InputFilePath != null
+            ? Path.ChangeExtension(job.InputFilePath, ".stbin")
+            : null;
+        // Lifetime spans the whole run; disposed in finally. Null means the
+        // legacy text-buffering path is in use for this job.
+        StreamingBatchSource? stream = null;
+        long streamSamples = 0;
+        int streamBatches = 0;
+        if (cachePath != null && File.Exists(cachePath))
+        {
+            try
+            {
+                // Stale-cache guard: ids from another vocabulary would train
+                // garbage silently. Live-tokenizer mismatch also falls back to
+                // text with a warning rather than training wrong.
+                var header = TokenCache.ReadHeader(cachePath);
+                TokenCache.Validate(header, job.VocabularyId, tokenizer.VocabularySize, (int)tokenizer.Type);
+                stream = new StreamingBatchSource(cachePath, window, batchSize, dropLast);
+                streamSamples = stream.SampleCount;
+                streamBatches = stream.BatchCount;
+                Log.Information(
+                    "Token cache hit: {Tokens} ids ({Dtype}), {Samples} samples, {Batches} batches; streaming.",
+                    header.TokenCount, header.Dtype, streamSamples, streamBatches);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Token cache unusable; falling back to text buffering.");
+                stream?.Dispose();
+                stream = null;
+            }
+        }
+
+        string inputText = string.Empty;
+        IReadOnlyList<TrainingSample> legacySamples = Array.Empty<TrainingSample>();
+        IReadOnlyList<MiniBatch> miniBatches = Array.Empty<MiniBatch>();
+        int numBatches;
+        int totalSamples;
+        if (stream != null)
+        {
+            // StreamingBatchSource derived its own sample/batch counts from the
+            // cache header, so nothing is buffered (or re-tokenized) here.
+            numBatches = streamBatches;
+            totalSamples = (int)Math.Min(streamSamples, int.MaxValue);
+            Log.Information($"{numBatches} streaming batches from {streamSamples} samples.");
+        }
+        else
+        {
         if(job.InputText != null)
         {
             inputText = job.InputText;
@@ -137,24 +189,31 @@ public static class TrainingJobExtensions
             throw new ArgumentException("Input text or file path must be provided.");
         }
 
-        var samples = TrainingDataExtensions.CreateTrainingSamples(model, tokenizer, inputText);
-        var miniBatches = TrainingDataExtensions.CreateMiniBatches(model, samples);
-        var numBatches = miniBatches.Count;
-        Log.Information($"{numBatches} batches created from {samples.Count} samples.");
-
-        //Report any shortfall so a short batch is never a silent surprise: either
-        //DropLast discarded a remainder, or the dataset was too small to fill one
-        //full batch and the partial batch was kept deliberately.
-        int batchSize = config?.BatchSize ?? model.TrainingConfig.BatchSize;
-        int usedSampleCount = miniBatches.Sum(b => b.BatchSize);
-        int unusedSamples = samples.Count - usedSampleCount;
+        legacySamples = TrainingDataExtensions.CreateTrainingSamples(model, tokenizer, inputText);
+        miniBatches = TrainingDataExtensions.CreateMiniBatches(model, legacySamples);
+        numBatches = miniBatches.Count;
+        Log.Information($"{numBatches} batches created from {legacySamples.Count} samples.");
+        totalSamples = legacySamples.Count;
+        }
         int smallestBatch = miniBatches.Count > 0 ? miniBatches.Min(b => b.BatchSize) : 0;
+        int fullBatches = batchSize > 0 ? totalSamples / batchSize : 0;
+        int remainder = batchSize > 0 ? totalSamples % batchSize : 0;
+        bool willDrop = model.TrainingConfig.DropLast && remainder != 0 && fullBatches > 0;
+        int unusedSamples = willDrop ? remainder : 0;
+        if (stream != null)
+        {
+            // StreamingBatchSource made the same drop decision arithmetically, so
+            // only the UI-facing summary values need deriving here.
+            smallestBatch = totalSamples == 0 ? 0
+                : willDrop || remainder == 0 ? batchSize : remainder;
+            numBatches = streamBatches; // == fullBatches + partial above
+        }
         string batchingNote;
         if (unusedSamples > 0 && model.TrainingConfig.DropLast)
         {
             batchingNote =
                 $" DropLast discarded the final partial batch ({unusedSamples} of " +
-                $"{samples.Count} samples unused this epoch).";
+                $"{totalSamples} samples unused this epoch).";
             Log.Information(batchingNote);
         }
         else if (smallestBatch < batchSize)
@@ -163,7 +222,7 @@ public static class TrainingJobExtensions
             //the partial batch is kept rather than leaving nothing to train on.
             batchingNote =
                 $" Dataset does not fill a full batch of {batchSize} " +
-                $"({samples.Count} samples, smallest batch {smallestBatch}), " +
+                $"({totalSamples} samples, smallest batch {smallestBatch}), " +
                 "so the partial batch is kept.";
             Log.Information(batchingNote);
         }
@@ -171,8 +230,11 @@ public static class TrainingJobExtensions
         {
             batchingNote = string.Empty;
         }
-        // Determine chunkSize dynamically based on miniBatches count
-        int chunkSize = miniBatches.Count switch
+        // Determine chunkSize dynamically based on miniBatches count. On the
+        // streaming path miniBatches is deliberately empty (nothing is
+        // buffered), so the batch count stands in for it.
+        int batchCountForChunking = miniBatches.Count > 0 ? miniBatches.Count : numBatches;
+        int chunkSize = batchCountForChunking switch
         {
             >= 8 => 8,
             >= 4 => 4,
@@ -183,7 +245,10 @@ public static class TrainingJobExtensions
         // Zero-allocation chunking using .NET 6+ Chunk()
         var subBatches = miniBatches.Chunk(chunkSize);
         
-        int totalOuterBatches = subBatches.Count();
+        // Number of optimizer steps the UI counts as "batches". Computed from
+        // the counts rather than subBatches.Count() so the streaming path (no
+        // buffered chunks to enumerate) reports the same shape instead of 0.
+        int totalOuterBatches = (numBatches + chunkSize - 1) / chunkSize;
 
         var totalEpochs = startEpoch + (config?.Epochs ?? 10); // Default to 10 epochs if not specified
 
@@ -201,7 +266,7 @@ public static class TrainingJobExtensions
             job.CurrentSubBatch = 0;
 
             job.Message =
-                $"Training prepared: {samples.Count} samples in " +
+                $"Training prepared: {totalSamples} samples in " +
                 $"{numBatches} mini-batches ({totalOuterBatches} outer batches)." +
                 batchingNote;
         });
@@ -222,8 +287,11 @@ public static class TrainingJobExtensions
             {
                 float epochLoss = 0f;
                 int stepsCompleted = 0;
-                // Single Random instance reused across the engine
-                var rng = new Random();
+                // Deterministic per-epoch seed: streaming shuffles window
+                // indices (not tensors), legacy shuffles batch lists. Same
+                // corpus + same seed => same order, resumable and debuggable.
+                int epochSeed = unchecked((int)(0x9E3779B9u * (uint)(epoch + 1) + 0x51F15EEDu));
+                var rng = new Random(epochSeed);
 
                 await UpdateJob(dbFactory, job.EntryId, job =>
                 {
@@ -237,6 +305,90 @@ public static class TrainingJobExtensions
 
                 if (numBatches > 8)
                 {
+                    if (stream != null)
+                    {
+                        // STREAMING PATH: pages windows off the .stbin cache.
+                        // StreamEpoch already shuffled the window indices, so the
+                        // order is fixed inside it; grouping into outer batches is
+                        // only the UI/checkpoint cadence. Batches are pulled ONE at
+                        // a time and trained before the next MoveNext, because every
+                        // yielded MiniBatch shares two reusable tensors - buffering
+                        // them (ToList/Chunk/Shuffle) would make all of them alias
+                        // the final batch. This is what holds memory at O(batch*seq).
+                        await UpdateJob(dbFactory, job.EntryId, job =>
+                        {
+                            job.Message = $"Shuffling batches (epoch {epoch + 1}/{totalEpochs}).";
+                            job.TotalSubBatches = chunkSize;
+                        });
+
+                        using var epochBatches = stream.StreamEpoch(epochSeed).GetEnumerator();
+                        bool hasBatch = epochBatches.MoveNext();
+                        int batch = 0;
+                        while (hasBatch)
+                        {
+                            await control.WaitIfPausedAsync(controlTokenSource.Token);
+                            controlTokenSource.Token.ThrowIfCancellationRequested();
+
+                            int subBatch = 0;
+                            for (; subBatch < chunkSize && hasBatch; subBatch++)
+                            {
+                                await control.WaitIfPausedAsync(controlTokenSource.Token);
+                                controlTokenSource.Token.ThrowIfCancellationRequested();
+
+                                // Only valid until the next MoveNext: train now.
+                                var item = epochBatches.Current;
+                                epochLoss += model.TrainStep(item.Inputs, item.Targets);
+                                stepsCompleted++;
+                                hasBatch = epochBatches.MoveNext();
+
+                                var runningMean = epochLoss / stepsCompleted;
+                                int batchNo = batch + 1, subNo = subBatch + 1;
+                                await UpdateJob(dbFactory, job.EntryId, job =>
+                                {
+                                    job.CurrentBatch = batchNo;
+                                    job.CurrentSubBatch = subNo;
+                                    job.CurrentLoss = runningMean;
+                                    job.Message =
+                                        $"Epoch {epoch + 1}/{totalEpochs}, batch {batchNo}/{totalOuterBatches}, " +
+                                        $"sub-batch {subNo}/{chunkSize} - loss {runningMean:F6}";
+                                });
+
+                                if (subNo % 4 == 0 || subNo == 1)
+                                {
+                                    Log.Information($"Epoch {epoch + 1}, Batch {batchNo}, Sub-Batch {subNo} training loss: {epochLoss:F6}");
+                                }
+                            }
+                            var transformerModelName = await GetModelNameFromId(dbFactory, modelEntry.EntryId);
+                            var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-temp.bin";
+                            var checkpointDirname = $"checkpoints/{transformerModelName}";
+                            Directory.CreateDirectory(checkpointDirname);
+
+                            string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
+
+                            await using (var ckptStream = File.Create(checkpointFilepath))
+                            {
+                                model.SaveCheckpoint(ckptStream, epoch, epochLoss);
+                            }
+
+                            var checkpointEntry = await UpsertCheckpointAsync(
+                                dbFactory,
+                                model.TransformerModelId,
+                                $"checkpoints/{transformerModelName}/",
+                                checkpointFilename,
+                                epoch + 1,
+                                epochLoss,
+                                new FileInfo(checkpointFilepath).Length);
+
+                            await UpdateJob(dbFactory, job.EntryId, job =>
+                            {
+                                job.CheckpointFilename = checkpointFilepath;
+                                job.TrainingCheckpointId = checkpointEntry.EntryId;
+                            });
+                            batch++;
+                        }
+                    }
+                    else
+                    {
                     // Shuffle the outer sub-batch groups ONCE per epoch
                     var shuffledSubBatches = Shuffle(subBatches.ToList(), rng);
                     await UpdateJob (dbFactory, job.EntryId, job => 
@@ -297,15 +449,15 @@ public static class TrainingJobExtensions
 
                         string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
 
-                        await using (var stream = File.Create(checkpointFilepath))
+                        await using (var ckptStream = File.Create(checkpointFilepath))
                         {
-                            model.SaveCheckpoint(stream, epoch, epochLoss);
+                            model.SaveCheckpoint(ckptStream, epoch, epochLoss);
                         }
 
                         //The temp checkpoint file is overwritten in place, so upsert a single
                         //DB record per file instead of inserting a new row after every batch.
                         var checkpointEntry = await UpsertCheckpointAsync(
-                            db,
+                            dbFactory,
                             model.TransformerModelId,
                             $"checkpoints/{transformerModelName}/",
                             checkpointFilename,
@@ -319,11 +471,20 @@ public static class TrainingJobExtensions
                             job.TrainingCheckpointId = checkpointEntry.EntryId;
                         });
                     }
+                    } // end legacy buffered >8 path
                 }
                 else
                 {   // Number of sub batches here is 1.
-                    // Shuffle standard mini-batches ONCE per epoch
-                    var shuffledMiniBatches = Shuffle(miniBatches.ToList(), rng);
+                    // Shuffle standard mini-batches ONCE per epoch. On the
+                    // streaming path the batches must be snapshotted (they
+                    // normally alias two reusable tensors) before they can be
+                    // held/shuffled - bounded here because this branch only runs
+                    // when the epoch is a handful of batches.
+                    List<MiniBatch> shuffledMiniBatches;
+                    if (stream != null)
+                        shuffledMiniBatches = stream.MaterializeEpoch(epochSeed).ToList();
+                    else
+                        shuffledMiniBatches = Shuffle(miniBatches.ToList(), rng);
                     await UpdateJob(dbFactory, job.EntryId, job =>
                     {
                         job.Message = $"Shuffling batches (epoch {epoch + 1}/{totalEpochs}).";
@@ -364,7 +525,9 @@ public static class TrainingJobExtensions
                     }
                 }
 
-                epochLoss /= miniBatches.Count;
+                // Average over STEPS actually taken (streaming reuses 2 buffers,
+                // so miniBatches is empty there): identical scale on both paths.
+                epochLoss /= Math.Max(1, stepsCompleted);
 
                 Log.Information($"Epoch {epoch + 1}: Loss={epochLoss:F6}");
                 await UpdateJob(dbFactory, job.EntryId, job =>
@@ -398,15 +561,15 @@ public static class TrainingJobExtensions
 
                     string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
 
-                    await using (var stream = File.Create(checkpointFilepath))
+                    await using (var ckptFile = File.Create(checkpointFilepath))
                     {
-                        model.SaveCheckpoint(stream, epoch, epochLoss);
+                        model.SaveCheckpoint(ckptFile, epoch, epochLoss);
                     }
 
                     //Filenames are deterministic, so upsert to guarantee one record per file
                     //(a resumed run can recreate the same epoch/loss filename).
                     var checkpointEntry = await UpsertCheckpointAsync(
-                        db,
+                        dbFactory,
                         model.TransformerModelId,
                         $"checkpoints/{transformerModelName}/",
                         checkpointFilename,
@@ -478,6 +641,7 @@ public static class TrainingJobExtensions
         {
             //Training always ends, whatever the outcome, and the in-memory guard is
             //released so the job can later be resumed (rebuilt from its checkpoint).
+            stream?.Dispose();
             model.EndTraining();
             jobManager.Remove(job.EntryId);
         }
@@ -496,7 +660,7 @@ public static class TrainingJobExtensions
     /// or created when the file is seen for the first time.
     /// </summary>
     private static async Task<TrainingCheckpointEntry> UpsertCheckpointAsync(
-        AppDbContext db,
+        IDbContextFactory<AppDbContext> dbFactory,
         Guid transformerModelId,
         string filepath,
         string filename,
@@ -504,6 +668,7 @@ public static class TrainingJobExtensions
         float loss,
         long fileSize)
     {
+        await using var db = await dbFactory.CreateDbContextAsync();
         var entry = await db.TrainingCheckpoints
             .FirstOrDefaultAsync(x => x.Filepath == filepath && x.Filename == filename);
 

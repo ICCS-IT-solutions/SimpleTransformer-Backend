@@ -51,6 +51,14 @@ namespace SimpleTransformer
                 Environment.Exit(ok ? 0 : 1);
             }
 
+            // Token-cache (.stbin) round-trip + streaming parity:
+            // dotnet run -- --tokencache-selftest
+            if (args.Contains("--tokencache-selftest"))
+            {
+                bool ok = SimpleTransformer.AccelerationEngine.TokenCacheSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
             // Vulkan backend bring-up (no server start): dotnet run -- --vulkan-selftest
             if (args.Contains("--vulkan-selftest"))
             {

@@ -213,6 +213,14 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 jobDirectory,
                 "training-data.txt");
 
+            // Pre-tokenized id stream beside the text: encoded ONCE here so
+            // every epoch/resume streams u16/u32 ids instead of re-running BPE
+            // over a giant string. Header pins vocab id + size for staleness
+            // detection in RunTrainingLoop.
+            var tokenCachePath = Path.Combine(
+                jobDirectory,
+                "training-data.stbin");
+
             var sourceFileNames = new List<string>();
             Guid? trainingCorpusId = null;
             string corpusSummary;
@@ -350,7 +358,60 @@ namespace SimpleTransformer.Api.Endpoints.Services
             corpusSummary = $"Corpus: {report.DocumentsOut} documents ({report.CharsOut} chars) from " +
                 $"{fileCount} file(s); {report.DuplicatesRemoved} duplicates removed, " +
                 $"{report.FilteredByLength + report.FilteredEmpty} filtered.";
+
             } // end upload path
+
+            // Encode the corpus to the .stbin id stream NOW (one doc at a time)
+            // so training/resume never re-runs the tokenizer over a giant string.
+            // Placed AFTER the if/else so both the upload path and the
+            // saved-corpus path (which both land in filePath) get a cache.
+            // Uses the JOB's vocabulary artifact, not the live server tokenizer:
+            // the live one is whatever vocabulary.json was loaded at startup and
+            // may differ from the pinned job vocab. Tokenizer type comes from the
+            // job's VocabularyEntry (WordLevel / Bpe need their own algorithm;
+            // SentencePiece is the default); BPE merges are not persisted by the
+            // compiler, so a BPE job without merges falls back to greedy
+            // longest-match over its vocab.
+            try
+            {
+                var jobVocabEntry = await db.Vocabularies
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x => x.EntryId == req.VocabularyId);
+                var artifact = jobVocabEntry != null ? VocabularyArtifacts.TryLoad(jobVocabEntry) : null;
+                if (artifact == null)
+                {
+                    Log.Warning("Token cache skipped for job {JobId}: vocabulary artifact unreadable.", jobId);
+                }
+                else
+                {
+                    ITokenizer jobTokenizer = (jobVocabEntry!.TokenizerType, _tokenizer) switch
+                    {
+                        (SimpleTransformer.Model.Tokenizer.TokenizerType.WordLevel, _) =>
+                            new SimpleTransformer.Model.Tokenizer.WordLevelTokenizer(artifact),
+                        (SimpleTransformer.Model.Tokenizer.TokenizerType.Bpe, _) =>
+                            // Merges are not stored by BpeVocabularyCompiler; the
+                            // tokenizer below falls back to greedy longest-match.
+                            new GreedySubwordTokenizerAdapter(artifact),
+                        _ => new SimpleTransformer.Model.Tokenizer.SentencePieceTokenizer(artifact),
+                    };
+                    var count = TokenCacheIO.Write(
+                        tokenCachePath,
+                        TokenCacheIO.ReadDocuments(filePath),
+                        jobTokenizer.Encode,
+                        (int)jobVocabEntry.TokenizerType,
+                        artifact.Count,
+                        req.VocabularyId).TokenCount;
+                    Log.Information("Token cache wrote {Tokens} ids ({Dtype}) for job {JobId}.",
+                        count, TokenCache.DtypeFor(artifact.Count), jobId);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Text path still works via legacy ReadAllText fallback in
+                // RunTrainingLoop; a corrupt cache must never block job creation.
+                Log.Warning(ex, "Token cache build failed for job {JobId}; training will use text fallback.", jobId);
+                try { if (File.Exists(tokenCachePath)) File.Delete(tokenCachePath); } catch { }
+            }
 
             var job = new TrainingJobEntry
             {
