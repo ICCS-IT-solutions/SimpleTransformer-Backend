@@ -30,6 +30,18 @@ namespace SimpleTransformer.Api
                 AccelerationEngine.GpuVulkan.VulkanMemorySettings.HostBudgetBytesOverride =
                     _configManager.GetAs<long>("host_memory_budget_mb", 0, "Vulkan") * 1024L * 1024L;
 
+                //How long a recorded Vulkan batch may take to complete before the
+                //waiting caller gives up. A wedged batch then surfaces as a clear
+                //error in seconds instead of stalling a training job for minutes.
+                //Raise it on devices where first-run shader compilation or very
+                //large batches legitimately take longer.
+                int dispatchTimeoutMs = _configManager.GetAs<int>("dispatch_timeout_ms", 30000, "Vulkan");
+                if (dispatchTimeoutMs > 0)
+                {
+                    AccelerationEngine.GpuVulkan.VulkanKernelLauncher.DispatchTimeoutMs =
+                        dispatchTimeoutMs;
+                }
+
                 SQLitePCL.Batteries.Init();
 
                 var builder = WebApplication.CreateBuilder();

@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using SimpleTransformer.Model;
 
 namespace SimpleTransformer.AccelerationEngine
@@ -132,9 +133,17 @@ namespace SimpleTransformer.AccelerationEngine
             Console.WriteLine("--- Checkpoint mode isolation ---");
             bool checkpointOk = CheckpointModeIsolation(config, trainingConfig);
 
+            // 9. Batch-path TrainStep: multi-layer model, resident weights, real
+            // MiniBatch inputs. This is the shape that exposed the backward-path
+            // deadlock the small parity model above could not.
             Console.WriteLine();
-            Console.WriteLine($"Results: {(parityOk && trajectoryOk && predictOk && batchingOk && checkpointOk ? "PASS" : "FAIL")}.");
-            return parityOk && trajectoryOk && predictOk && batchingOk && checkpointOk;
+            Console.WriteLine("--- Batch-path TrainStep (multi-layer, resident weights) ---");
+            bool batchStepOk = CheckRealisticTrainStep(trainingConfig);
+
+            Console.WriteLine();
+            bool smokeOk = parityOk && trajectoryOk && predictOk && batchingOk && checkpointOk && batchStepOk;
+            Console.WriteLine($"Results: {(smokeOk ? "PASS" : "FAIL")}.");
+            return smokeOk;
         }
 
         /// <summary>
@@ -207,6 +216,111 @@ namespace SimpleTransformer.AccelerationEngine
             }
 
             return allOk;
+        }
+
+        /// <summary>
+        /// Drives TrainStep on the batch path a real training job uses: a
+        /// multi-layer model whose weights live in VRAM, fed from MiniBatch
+        /// inputs.
+        /// </summary>
+        /// <remarks>
+        /// The parity model above is single-sampled and small enough that every op
+        /// stages and uploads, and each upload splits the open device batch. That
+        /// masked a backward-path deadlock: LinearLayer.BackwardBatch fans out to
+        /// Parallel.For, so a batch scope held across it wedges every worker until
+        /// the dispatch timeout kills the job - which is how a real 12-layer job
+        /// failed. This case runs the batch path with several layers and resident
+        /// weights, and asserts the steps return, stay finite and never lean on
+        /// the foreign-thread escape hatch.
+        /// </remarks>
+        private static bool CheckRealisticTrainStep(TrainingConfig trainingConfig)
+        {
+            var config = new TransformerConfig
+            {
+                VocabSize = 256,
+                EmbeddingSize = 128,
+                NumLayers = 6,
+                NumHeads = 4,
+                FeedForwardSize = 512,
+                MaxSequenceLength = 64
+            };
+
+            var batchConfig = new TrainingConfig
+            {
+                Optimizer = trainingConfig.Optimizer,
+                LearningRate = trainingConfig.LearningRate,
+                BatchSize = 8,
+                DropLast = true
+            };
+
+            const int sampleCount = 16;
+            const int sequenceLength = 64;
+            var random = new Random(11);
+
+            using var model = new TransformerModel(
+                Guid.NewGuid(), config, batchConfig, useQLora: true);
+
+            var samples = new List<TrainingSample>(sampleCount);
+            for (int i = 0; i < sampleCount; i++)
+            {
+                var input = new Tensor(sequenceLength);
+                var target = new Tensor(sequenceLength);
+                for (int t = 0; t < sequenceLength; t++)
+                {
+                    input[t] = random.Next(config.VocabSize);
+                    target[t] = random.Next(config.VocabSize);
+                }
+
+                samples.Add(new TrainingSample { Input = input, Target = target });
+            }
+
+            var batches = TrainingDataExtensions.CreateMiniBatches(model, samples);
+            Console.WriteLine(
+                $"  {model.Backend.Name}: {config.NumLayers} layers, d={config.EmbeddingSize}, " +
+                $"seq {sequenceLength}, batch {batchConfig.BatchSize} -> {batches.Count} batch(es)");
+
+            int splitsBefore = GpuVulkan.VulkanKernelLauncher.ForeignBatchSplits;
+            bool completed = true;
+            bool allFinite = true;
+            string failure = "none";
+            long slowestMs = 0;
+
+            try
+            {
+                int step = 0;
+                foreach (var batch in batches)
+                {
+                    step++;
+                    var watch = Stopwatch.StartNew();
+                    float loss = model.TrainStep(batch.Inputs, batch.Targets);
+                    watch.Stop();
+
+                    slowestMs = Math.Max(slowestMs, watch.ElapsedMilliseconds);
+                    if (!IsFinite(loss))
+                        allFinite = false;
+
+                    Console.WriteLine(
+                        $"  step {step}: loss {loss:G6} in {watch.ElapsedMilliseconds} ms");
+                }
+            }
+            catch (Exception ex)
+            {
+                completed = false;
+                failure = ex.GetBaseException().Message;
+                Console.WriteLine($"  [FAIL] TrainStep threw: {failure}");
+            }
+
+            //A foreign-thread split means some scope was held across a fan-out.
+            //The steps would still be correct, but the training path must not
+            //depend on that escape hatch: it is the signature of the deadlock.
+            bool noScopeMisuse =
+                GpuVulkan.VulkanKernelLauncher.ForeignBatchSplits == splitsBefore;
+
+            bool ok = completed && allFinite && noScopeMisuse;
+            Console.WriteLine(
+                $"  completed={completed} all finite={allFinite} no scope misuse={noScopeMisuse} " +
+                $"slowest {slowestMs} ms : {ok}");
+            return ok;
         }
 
         /// <summary>

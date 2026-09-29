@@ -70,7 +70,10 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
     /// <para>
     /// Explicit batching: <see cref="BeginBatch"/> / <see cref="EndBatch"/>
     /// record everything in the scope into one submission. Thread-affine; the
-    /// owner only blocks at <see cref="EndBatch"/>.
+    /// owner only blocks at <see cref="EndBatch"/>. An op recorded by another
+    /// thread inside the scope splits the batch (submit + complete) rather than
+    /// waiting on the owner, so holding a scope across a Parallel.For fan-out
+    /// costs extra submissions instead of deadlocking the job.
     /// </para>
     /// <para>
     /// Batching removes the round trips BETWEEN ops, not the one correctness
@@ -90,7 +93,31 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         // batch overlaps execution of the batch already in flight.
         private const int SlotCount = 2;
         private const ulong FenceTimeoutNanos = 30_000_000_000UL;  // 30 s
-        private const int DispatchTimeoutMillis = 120_000;
+
+        /// <summary>
+        /// Max time a recorded batch may take to complete before the waiting
+        /// caller gives up, in ms. Diagnoses a wedged batch in seconds rather
+        /// than stalling a training job for two minutes; raise it from config
+        /// (<c>[Vulkan] dispatch_timeout_ms</c>) on devices where first-run
+        /// shader compilation or a very large batch legitimately takes longer.
+        /// Guards <see cref="WaitForCompletion"/>, the in-flight drain and the
+        /// idle wait.
+        /// </summary>
+        public static int DispatchTimeoutMs { get; set; } = 30_000;
+
+        /// <summary>
+        /// Number of times an op was recorded on a thread that does not own the
+        /// open explicit batch (see <see cref="RunOp"/>). Non-zero means a scope
+        /// was held across a Parallel.For fan-out; reported once per process.
+        /// </summary>
+        private static int _foreignBatchSplits;
+
+        /// <summary>
+        /// Number of ops split out of a batch scope owned by another thread (see
+        /// <see cref="RunOp"/>). Tests use this to prove a fan-out inside a scope
+        /// really did reach the guard rather than being rescued by an upload.
+        /// </summary>
+        internal static int ForeignBatchSplits => Volatile.Read(ref _foreignBatchSplits);
 
         /// <summary>
         /// What the last command recorded into the open batch was; the next
@@ -877,6 +904,22 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     // waiting here would deadlock against ourselves.
                     wait = false;
                 }
+                else if (_explicitDepth > 0)
+                {
+                    // Someone else's explicit batch. Waiting would deadlock: the
+                    // owner is normally blocked in the Parallel.For that spawned
+                    // this worker, so only the owner could ever reach EndBatch.
+                    // Split the batch here - the same close-and-submit
+                    // CopyBufferSync performs - so this op is submitted and its
+                    // fence completed while the owner's scope stays open. Ops
+                    // recorded afterwards simply reopen a fresh command buffer,
+                    // so EndBatch is unaffected; the only cost is that the
+                    // owner's coalescing is broken up. This branch exists so a
+                    // scope mistakenly held across a fan-out degrades into extra
+                    // submissions instead of wedging the job until the timeout.
+                    WarnForeignBatchLocked();
+                    (seq, owned) = CloseAndSubmitLocked();
+                }
             }
             if (VulkanPhaseProfile.Enabled)
                 VulkanPhaseProfile.RecordDispatch(Stopwatch.GetTimestamp() - t0);
@@ -896,6 +939,25 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// <summary>True when no op is preparing and no explicit scope is open.</summary>
         private bool ShouldCloseLocked() =>
             _explicitDepth == 0 && _pendingPrep == 0 && _openRecords > 0;
+
+        /// <summary>
+        /// Reports (once per process) that a worker recorded into a batch scope
+        /// owned by another thread, which means the scope was held across a
+        /// Parallel.For fan-out. Correctness is preserved by splitting the batch
+        /// in <see cref="RunOp"/>, but the intended batching is lost - so this is
+        /// always a caller bug worth naming.
+        /// </summary>
+        private void WarnForeignBatchLocked()
+        {
+            if (Interlocked.Increment(ref _foreignBatchSplits) != 1)
+                return;
+
+            Console.WriteLine(
+                $"[GpuVulkan] op recorded on thread {Environment.CurrentManagedThreadId} inside a batch " +
+                $"scope owned by thread {_explicitOwner}: splitting the batch to avoid a deadlock. " +
+                "BeginBatchScope is thread-affine - do not hold one across a Parallel.For fan-out " +
+                "(further occurrences are silent).");
+        }
 
         /// <summary>
         /// Ensures a command buffer is open for recording, rotating to the other
@@ -1024,7 +1086,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (seq < 0 || seq <= _completedSeq)
                 return;
 
-            long deadline = Environment.TickCount64 + DispatchTimeoutMillis;
+            long deadline = Environment.TickCount64 + DispatchTimeoutMs;
             lock (_dispatchGate)
             {
                 while (_completedSeq < seq)
@@ -1032,7 +1094,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     long remaining = deadline - Environment.TickCount64;
                     if (remaining <= 0)
                         throw new TimeoutException(
-                            $"Vulkan batch {seq} did not complete within {DispatchTimeoutMillis} ms.");
+                            $"Vulkan batch {seq} did not complete within {DispatchTimeoutMs} ms.");
                     Monitor.Wait(_dispatchGate, (int)Math.Min(remaining, 50));
                 }
             }
@@ -1047,7 +1109,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
         private void WaitForInflightDrainLocked()
         {
-            long deadline = Environment.TickCount64 + DispatchTimeoutMillis;
+            long deadline = Environment.TickCount64 + DispatchTimeoutMs;
             while (_inflightBatches > 0)
             {
                 long remaining = deadline - Environment.TickCount64;
@@ -1059,7 +1121,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
         private void WaitForIdle()
         {
-            long deadline = Environment.TickCount64 + DispatchTimeoutMillis;
+            long deadline = Environment.TickCount64 + DispatchTimeoutMs;
             lock (_dispatchGate)
             {
                 while (_inflightBatches > 0 || _openRecords > 0)

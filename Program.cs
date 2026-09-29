@@ -36,6 +36,20 @@ namespace SimpleTransformer
                 AccelerationEngine.GpuVulkan.VulkanPhaseProfile.Enabled = true;
             }
 
+            // Per-step training profiler: dotnet run -- --train-profile
+            // Enables VulkanPhaseProfile plus one [train-profile] log line per
+            // TrainStep (phase split + Vulkan deltas). Off by default.
+            if (args.Contains("--train-profile"))
+            {
+                AccelerationEngine.GpuVulkan.VulkanPhaseProfile.Enabled = true;
+                SimpleTransformer.Model.TrainingStepProfile.Enabled = true;
+
+                // Diagnostic flags exit below before the server path configures
+                // Serilog, and Serilog's default logger drops everything, so the
+                // profile lines would vanish. Bring the sinks up here instead.
+                ConfigureLogging();
+            }
+
 
             // Backend parity self-test (no server start): dotnet run -- --backend-selftest
             if (args.Contains("--backend-selftest"))
@@ -97,6 +111,30 @@ namespace SimpleTransformer
                 Environment.Exit(0);
             }
 
+            ConfigureLogging();
+
+            //Inject the model via constructor DI 
+            var server = new Server();
+            
+            //Start the server
+            server.Start();
+        }
+
+        private static bool _loggingConfigured;
+
+        /// <summary>
+        /// Single place that decides where log lines go: console plus a rolling
+        /// daily file. Used by the server start path and by diagnostic flags
+        /// (<c>--train-profile</c>) that must emit logs before the server runs.
+        /// Idempotent, so a diagnostic flag can bring the sinks up early without
+        /// the server path opening a second file sink on the same log.
+        /// </summary>
+        private static void ConfigureLogging()
+        {
+            if (_loggingConfigured)
+                return;
+
+            _loggingConfigured = true;
             Log.Logger = new LoggerConfiguration()
                 .MinimumLevel.Information()
                 .WriteTo.Console()
@@ -104,12 +142,6 @@ namespace SimpleTransformer
                     "logs/server-.log",
                     rollingInterval: RollingInterval.Day)
                 .CreateLogger();
-
-            //Inject the model via constructor DI 
-            var server = new Server();
-            
-            //Start the server
-            server.Start();
         }
     }
 }

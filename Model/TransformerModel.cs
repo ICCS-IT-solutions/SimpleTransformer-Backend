@@ -563,19 +563,41 @@ namespace SimpleTransformer.Model
             TensorBase? auxOutput = null;
             TensorBase? gradient = null;
 
+            // Per-step profiler: one bool check when disabled (default), one
+            // log line per step when enabled via --train-profile.
+            bool profiling = TrainingStepProfile.Enabled;
+            using var stepProfile = profiling
+                ? TrainingStepProfile.Begin(_workspace.Backend)
+                : default(TrainingStepProfile.StepScope);
+
             try
             {
                 // 1. Forward Pass
+                long tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 (prediction, auxOutput) = Forward(inputs);
+                if (profiling) stepProfile.MarkForward(Stopwatch.GetTimestamp() - tPhase);
 
                 // 2. Compute Loss & Initial Backprop Gradient
+                tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 float loss = _loss.Forward(prediction, expectedOutputs);
                 gradient = _loss.Backward(prediction, expectedOutputs);
+                if (profiling) stepProfile.MarkLossBackward(Stopwatch.GetTimestamp() - tPhase);
 
-                // 3. Backpropagate through Model
+                // 3. Backpropagate through Model.
+                // Deliberately NOT wrapped in BeginBatchScope: Backward fans out
+                // to Parallel.For workers inside LinearLayer.BackwardBatch, and a
+                // scope is thread-affine, so holding one across the fan-out makes
+                // workers wait on a batch only the (blocked) owner can submit.
+                // That deadlocked until the dispatch timeout killed the job. This
+                // path relies on the launcher's automatic wave coalescing
+                // (OpStart/OpFinish) instead. CPU backends are unaffected either
+                // way.
+                tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 Backward(gradient);
+                if (profiling) stepProfile.MarkModelBackward(Stopwatch.GetTimestamp() - tPhase);
 
-                // 4. Clip ALL parameter gradients globally
+                // 4. Clip ALL parameter gradients globally + NaN validation.
+                tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 ClipGradients(1.0f);
 
                 // 5. Verify no gradients contain NaN before updating weights
@@ -586,9 +608,13 @@ namespace SimpleTransformer.Model
                         DiagonisticUtilities.AssertNoNaN(p.Gradient, "Gradient contains NaN prior to optimizer step.");
                     }
                 }
+                if (profiling) stepProfile.MarkClipValidate(Stopwatch.GetTimestamp() - tPhase);
 
-                // 6. Step optimizer
+                // 6. Step optimizer (scalar CPU loop today: weights/gradients
+                // stay host-current; device copies refreshed in step 8).
+                tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 _optimizer.Step(Parameters);
+                if (profiling) stepProfile.MarkOptimizer(Stopwatch.GetTimestamp() - tPhase);
 
                 // 7. Verify no weights became NaN after optimizer step
                 foreach (var p in Parameters)

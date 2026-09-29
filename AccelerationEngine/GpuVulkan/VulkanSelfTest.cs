@@ -564,6 +564,70 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     $"({perSubmit:F2} per submission, largest batch {gpu.MaxBatchSize})");
                 Report("Parallel wave coalesced", submits < dispatches ? 0f : 1f, 0f);
             }
+            // ---- Misuse guard: a batch scope held across a fan-out -----------
+            // A batch scope is thread-affine. Holding one across a Parallel.For
+            // fan-out used to deadlock: a worker recorded into the owner's open
+            // batch, could not close it, and waited on a submission that only the
+            // owner - itself blocked inside the fan-out - could make. The job then
+            // hung until the dispatch timeout killed it. The launcher now splits
+            // the batch for the foreign thread, so both the op's result and the
+            // fact that this returns are pinned here.
+            {
+                const int ops = 8;
+                var inputs = new Tensor[ops];
+                var expected = new Tensor[ops];
+                for (int i = 0; i < ops; i++)
+                {
+                    inputs[i] = Rand(16, 16);
+                    expected[i] = (Tensor)inputs[i].Clone();
+                    reference.ScaleInPlace(expected[i], 2f);
+                }
+
+                int splitsBefore = VulkanKernelLauncher.ForeignBatchSplits;
+                long submitsBefore = gpu.SubmitCount;
+                bool returned = true;
+                string failure = "none";
+                try
+                {
+                    using (gpu.BeginBatchScope())
+                    {
+                        // Task.Run blocks the caller, so this op is recorded by a
+                        // pool thread while the scope belongs to this one - the
+                        // deterministic form of the deadlock. Parallel.For may
+                        // decide to run inline on the caller, so it follows rather
+                        // than leading.
+                        var worker = Task.Run(() => gpu.ScaleInPlace(inputs[0], 2f));
+                        worker.GetAwaiter().GetResult();
+
+                        // The training shape: LinearLayer.BackwardBatch fans out
+                        // exactly like this inside whatever scope its caller holds.
+                        Parallel.For(1, ops, i => gpu.ScaleInPlace(inputs[i], 2f));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    returned = false;
+                    failure = ex.GetBaseException().Message;
+                }
+
+                Report("Scope across fan-out returns", returned ? 0f : 1f, 0f);
+                if (!returned)
+                    Console.WriteLine($"  [INFO] scope across fan-out: {failure}");
+
+                Report("Foreign-thread op split the scope",
+                    VulkanKernelLauncher.ForeignBatchSplits > splitsBefore ? 0f : 1f, 0f);
+
+                float worst = 0f;
+                for (int i = 0; i < ops; i++)
+                    worst = MathF.Max(worst, MaxDiff(expected[i], inputs[i]));
+                Report("Scope across fan-out parity", worst, 1e-5f);
+
+                Console.WriteLine(
+                    $"  [INFO] scope across fan-out: {gpu.SubmitCount - submitsBefore} submissions " +
+                    $"for {ops} ops (foreign-thread ops split the batch)");
+            }
+
+
 
             Console.WriteLine(
                 $"  [INFO] totals: {gpu.DispatchCount} dispatches in {gpu.SubmitCount} submissions, " +

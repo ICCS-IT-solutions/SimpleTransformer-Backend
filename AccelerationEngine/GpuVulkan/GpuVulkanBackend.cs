@@ -556,9 +556,10 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         /// submits it and blocks until it completes. Model code brackets a
         /// sequential op chain (attention score chain, feed-forward pair) with
         /// this so one fence wait covers the whole chain instead of one wait
-        /// per op. Thread-affine: open and dispose on the same thread, and
-        /// never hold a scope across a Parallel.For fan-out (workers would
-        /// deadlock against the owner's pending-prep wait).
+        /// per op. Thread-affine: open and dispose on the same thread. Holding a
+        /// scope across a Parallel.For fan-out is a bug - it forfeits the
+        /// coalescing and logs a one-off warning - but it no longer deadlocks:
+        /// the launcher splits the batch for the foreign thread and completes it.
         /// </summary>
         public IDisposable BeginBatchScope()
         {
