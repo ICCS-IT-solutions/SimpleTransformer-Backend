@@ -26,7 +26,7 @@ namespace SimpleTransformer.AccelerationEngine
                     ["hello"] = 5, ["world"] = 6, ["foo"] = 7, ["bar"] = 8,
                 });
                 var tokenizer = new WordLevelTokenizer(vocab);
-                var vocabId = Guid.NewGuid();
+                var vocabId = TokenCache.Fingerprint(vocab);
                 string dir = Path.Combine(Path.GetTempPath(), "stbin-" + Guid.NewGuid());
                 Directory.CreateDirectory(dir);
 
@@ -154,7 +154,7 @@ namespace SimpleTransformer.AccelerationEngine
                 "65536 boundary switches to u32");
             Check(TokenCache.BytesPerToken(TokenCache.DType.U16) == 2, "u16 = 2 bytes");
             Check(h.VocabSize == vocab.Count, "vocab size recorded");
-            Check(h.VocabId == vocabId, "vocab id recorded");
+            Check(h.TokenizerFingerprint == vocabId, "fingerprint recorded");
             Check(h.TokenizerType == (int)TokenizerType.WordLevel, "tokenizer type recorded");
             Check(h.DocCount == docs.Length, "doc count recorded");
             // "hello world" -> 4 ids, "foo bar hello" -> 5 (bos/eos per doc).
@@ -168,8 +168,16 @@ namespace SimpleTransformer.AccelerationEngine
 
             var reread = TokenCache.ReadHeader(bin);
             Check(reread.TokenCount == h.TokenCount && reread.Dtype == h.Dtype &&
-                reread.VocabId == h.VocabId && reread.BodyCrc32 == h.BodyCrc32,
+                reread.TokenizerFingerprint == h.TokenizerFingerprint && reread.BodyCrc32 == h.BodyCrc32,
                 "header round-trips through EncodeHeader/ReadHeader");
+
+            // The magic must read STKN in FILE order. A uint32 can round-trip
+            // perfectly while the bytes are reversed, so assert the raw bytes.
+            var head = new byte[4];
+            using (var fs = File.OpenRead(bin)) { fs.Read(head, 0, 4); }
+            Check(head[0] == (byte)'S' && head[1] == (byte)'T' &&
+                head[2] == (byte)'K' && head[3] == (byte)'N',
+                $"file starts with ASCII STKN in that byte order (got {Convert.ToHexString(head)})");
         }
 
 
@@ -487,7 +495,7 @@ namespace SimpleTransformer.AccelerationEngine
                 tokenizer.Type, vocab.Count, Guid.NewGuid());
             Check(h2.TokenCount == 0 && h2.DocCount == 0, "empty corpus writes an empty body");
             Throws<InvalidOperationException>(
-                () => TokenCache.Validate(h2, h2.VocabId, vocab.Count, (int)tokenizer.Type),
+                () => TokenCache.Validate(h2, h2.TokenizerFingerprint, vocab.Count, (int)tokenizer.Type),
                 "empty cache is rejected by Validate (nothing to train on)");
         }
 

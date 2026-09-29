@@ -18,17 +18,22 @@ namespace SimpleTransformer.Api.Endpoints.Services
         private readonly IDbContextFactory<AppDbContext> _dbFactory;
         private readonly ConfigManager _configManager;
         private readonly ITokenizer _tokenizer;
+        // The singleton vocabulary the ITokenizer was built from. Only used to
+        // fingerprint the id space for the pre-tokenized cache header.
+        private readonly Vocabulary _vocabulary;
         private ModelManager _modelManager;
         private readonly TrainingJobManager _jobManager;
 
         public TrainingService(
             ITokenizer tokenizer, 
+            Vocabulary vocabulary,
             ConfigManager configManager, 
             IDbContextFactory<AppDbContext> dbFactory,  
             ModelManager modelManager,
             TrainingJobManager jobManager)
         {
             _tokenizer = tokenizer;
+            _vocabulary = vocabulary;
             _configManager = configManager;
             _dbFactory = dbFactory;
             _modelManager = modelManager;
@@ -400,7 +405,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                         jobTokenizer.Encode,
                         (int)jobVocabEntry.TokenizerType,
                         artifact.Count,
-                        req.VocabularyId).TokenCount;
+                        TokenCache.Fingerprint(artifact)).TokenCount;
                     Log.Information("Token cache wrote {Tokens} ids ({Dtype}) for job {JobId}.",
                         count, TokenCache.DtypeFor(artifact.Count), jobId);
                 }
@@ -1053,6 +1058,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     modelEntry: modelEntry,
                     dbFactory: _dbFactory,
                     tokenizer: _tokenizer,
+                    tokenizerVocabulary: _vocabulary,
                     jobManager: _jobManager));
 
             //Publish the live task before observing it: a pause/stop arriving just

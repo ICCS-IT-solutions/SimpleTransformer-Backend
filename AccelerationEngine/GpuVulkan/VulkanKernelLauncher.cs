@@ -492,7 +492,36 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             FlushCore();
         }
 
-        // ---- public dispatch entry points ------------------------------------
+        /// <summary>
+        /// Submits and waits for anything recorded but not yet sent, so the caller
+        /// may safely read results that were produced by recorded work. Unlike
+        /// <see cref="Flush"/>, this also runs inside an explicitly open batch: the
+        /// records recorded so far are submitted early and later ops reopen a fresh
+        /// command buffer, so <c>EndBatch</c> is unaffected.
+        /// <para>
+        /// This is required by every op that hands its result straight back to the
+        /// caller: inside an explicit batch <see cref="RunOp"/> deliberately does
+        /// not wait (EndBatch is the completer), so without this the read-back
+        /// would return the pooled buffer's previous contents - a silent wrong
+        /// answer rather than an error.
+        /// </para>
+        /// </summary>
+        public void EnsureRecordedWorkComplete()
+        {
+            if (_disposed)
+                return;
+
+            Fence? owned = null;
+            long seq = -1;
+            lock (_dispatchGate)
+            {
+                if (_openRecords == 0)
+                    return; // nothing recorded since the last submit
+                (seq, owned) = CloseAndSubmitLocked();
+            }
+            Complete(owned, seq);
+        }
+
 
         public void Dispatch(VulkanKernel kernel, VulkanBuffer[] buffers, uint n, float alpha)
             => RunOp(() => RecordScalar(kernel, buffers, n, alpha));
@@ -547,6 +576,37 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             if (sizeBytes == 0 || _disposed)
                 return;
             RunOp(() => RecordCopyBuffer(source, destination, sizeBytes));
+        }
+
+        /// <summary>
+        /// Records the copy and blocks until the device has executed it, so the
+        /// caller may immediately recycle or overwrite <paramref name="source"/>.
+        /// <see cref="CopyBuffer"/> alone is not sufficient for that: inside an
+        /// explicitly open batch (<see cref="BeginBatch"/>) <see cref="RunOp"/>
+        /// only records and returns while the transfer is still queued, so a
+        /// source handed back to the staging pool can be re-rented and
+        /// overwritten before the copy runs - the destination would then capture
+        /// another op's payload (or untouched allocator memory) instead of the
+        /// bytes that were uploaded. Submitting here splits the open batch in
+        /// two: the caller's scope stays open, later ops reopen a fresh command
+        /// buffer, and <c>EndBatch</c> is unaffected. Use this for one-off
+        /// transfers whose source buffer is recycled straight afterwards.
+        /// </summary>
+        public void CopyBufferSync(VulkanBuffer source, VulkanBuffer destination, ulong sizeBytes)
+        {
+            if (sizeBytes == 0 || _disposed)
+                return;
+
+            Fence? owned = null;
+            long seq = -1;
+            lock (_dispatchGate)
+            {
+                EnsureOpenLocked();
+                RecordCopyBuffer(source, destination, sizeBytes);
+                DispatchCount++;
+                (seq, owned) = CloseAndSubmitLocked();
+            }
+            Complete(owned, seq);
         }
 
         // ---- recording (runs with _dispatchGate held, batch open) ------------

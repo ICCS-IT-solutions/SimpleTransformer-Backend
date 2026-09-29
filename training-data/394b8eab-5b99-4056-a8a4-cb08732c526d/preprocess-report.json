@@ -1,0 +1,25 @@
+{
+  "DocumentsIn": 1,
+  "DocumentsOut": 1,
+  "CharsIn": 198875,
+  "CharsOut": 198874,
+  "DuplicatesRemoved": 0,
+  "FilteredByLength": 0,
+  "FilteredEmpty": 0,
+  "Files": [
+    {
+      "FileName": "smoke-corpus.txt",
+      "ResolvedFormat": "Txt",
+      "DocumentsIn": 1,
+      "DocumentsOut": 1
+    }
+  ],
+  "Warnings": [],
+  "Samples": [
+    {
+      "FileName": "smoke-corpus.txt",
+      "Original": "golden ends why blows sky yesterday no later sand near yes field. trees ends why where until now maybe lazy sand when over and. field dark blue under lazy and ends sing runs white over wind. and day near near red blows near beneath no white tall barn. beneath house until sing sand how where sky birds yesterday where white. then with sing blue quick day wind no there fox lazy and. over sky wind under with river into but no fox fence through. and birds when trees fence old through jumps soft on ne\u2026",
+      "Cleaned": "golden ends why blows sky yesterday no later sand near yes field. trees ends why where until now maybe lazy sand when over and. field dark blue under lazy and ends sing runs white over wind. and day near near red blows near beneath no white tall barn. beneath house until sing sand how where sky birds yesterday where white. then with sing blue quick day wind no there fox lazy and. over sky wind under with river into but no fox fence through. and birds when trees fence old through jumps soft on ne\u2026"
+    }
+  ]
+}

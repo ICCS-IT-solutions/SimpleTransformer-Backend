@@ -176,6 +176,46 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 }
             }
 
+            // ---- Regression: results read back inside a batch scope ----------
+            // RunOp records without waiting while an explicit batch scope is
+            // open (EndBatch is the completer), so an op that hands its result
+            // straight back to the caller must complete the recorded work
+            // first - otherwise the read-back returns the pooled buffer's
+            // previous contents and the answer is silently wrong. Registering a
+            // resident weight inside a scope has the same hazard for the
+            // one-time upload, so both shapes are pinned here.
+            {
+                using var a = Rand(5, 17);
+
+                using var w = Rand(17, 13);
+                var referenceW = new Tensor(17, 13);
+                Array.Copy(w.Data, referenceW.Data, w.Data.Length);
+                using var expected = new Tensor(5, 13);
+                reference.MatMul(a, referenceW, expected);
+
+                using var inScope = new Tensor(5, 13);
+                using (gpu.BeginBatchScope())
+                    gpu.MatMul(a, w, inScope);
+                Report("MatMul inside batch scope", MaxDiff(expected, inScope), 2e-3f);
+
+                using var w2 = Rand(17, 13);
+                var referenceW2 = new Tensor(17, 13);
+                Array.Copy(w2.Data, referenceW2.Data, w2.Data.Length);
+                using var expected2 = new Tensor(5, 13);
+                reference.MatMul(a, referenceW2, expected2);
+
+                using var registered = new Tensor(5, 13);
+                bool promoted;
+                using (gpu.BeginBatchScope())
+                {
+                    promoted = gpu.TryRegisterResidentWeights(w2, "selftest-scope-weights");
+                    gpu.MatMul(a, w2, registered);
+                }
+                Report("Resident register+MatMul in scope",
+                    promoted ? MaxDiff(expected2, registered) : 1f, 2e-3f);
+                gpu.ReleaseResidentWeights(w2);
+            }
+
             Tensor Rand(int rows, int cols)
             {
                 var t = new Tensor(rows, cols);

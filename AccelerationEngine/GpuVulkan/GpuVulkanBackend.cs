@@ -157,7 +157,15 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 {
                     staging = _pool.Rent(elementCount);
                     staging.Upload(tensor.ReadOnlySpan[..elementCount]);
-                    _launcher.CopyBuffer(staging, device, bytes);
+                    //Must complete before the staging buffer is recycled below:
+                    //registration runs inside an open batch scope (the layer's
+                    //first Forward), where CopyBuffer would only record the copy
+                    //and leave it queued - the pool would then hand this same
+                    //buffer to the next op, which overwrites the payload the
+                    //queued copy is about to read. The device copy would capture
+                    //another tensor's bytes (or untouched allocator memory) and
+                    //every MatMul binding it would feed garbage into the model.
+                    _launcher.CopyBufferSync(staging, device, bytes);
                 }
                 catch
                 {
@@ -276,7 +284,11 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             {
                 staging = _pool.Rent(elementCount);
                 staging.Upload(tensor.ReadOnlySpan[..elementCount]);
-                _launcher.CopyBuffer(staging, device, (ulong)elementCount * 4UL);
+                //Same ordering requirement as TryRegisterResidentWeights: the
+                //staging buffer goes back to the pool in the finally below, so
+                //the queued copy must have run by then or it would read whatever
+                //the next renter wrote into it and corrupt the resident weights.
+                _launcher.CopyBufferSync(staging, device, (ulong)elementCount * 4UL);
                 return true;
             }
             catch
@@ -870,8 +882,17 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             buf.CommitUpload(count);
         }
 
-        private static void UnpackBuffer(VulkanBuffer buf, TensorBase t, int count)
+        /// <summary>
+        /// Copies a completed device result into the host tensor. The producing
+        /// dispatch may still be queued when we are inside an explicit batch
+        /// scope (there <see cref="VulkanKernelLauncher.RunOp"/> records without
+        /// waiting, on purpose), so the batch is completed first - otherwise the
+        /// read-back returns whatever the pooled buffer held before this op and
+        /// the caller silently gets a wrong answer.
+        /// </summary>
+        private void UnpackBuffer(VulkanBuffer buf, TensorBase t, int count)
         {
+            _launcher?.EnsureRecordedWorkComplete();
             if (VulkanPhaseProfile.Enabled)
             {
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();

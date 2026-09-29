@@ -53,8 +53,8 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
             BatchCount = (int)(full + (rem == 0 || drop ? 0 : 1));
         }
 
-        public void Validate(Guid vocabId, ITokenizer tokenizer) =>
-            TokenCache.Validate(_header, vocabId, tokenizer.VocabularySize, (int)tokenizer.Type);
+        public void Validate(Guid fingerprint, ITokenizer tokenizer) =>
+            TokenCache.Validate(_header, fingerprint, tokenizer.VocabularySize, (int)tokenizer.Type);
 
         /// <summary>
         /// Shuffled epoch stream with ZERO-COPY batches: every yielded

@@ -16,7 +16,7 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
             Func<string, int[]> encode,
             int tokenizerType,
             int vocabSize,
-            Guid vocabId)
+            Guid tokenizerFingerprint)
         {
             var dtype = TokenCache.DtypeFor(vocabSize);
             int bpt = TokenCache.BytesPerToken(dtype);
@@ -70,7 +70,7 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
                 VocabSize = vocabSize,
                 TokenCount = tokenCount,
                 DocCount = docCount,
-                VocabId = vocabId,
+                TokenizerFingerprint = tokenizerFingerprint,
                 BodyCrc32 = crc,
             };
             fs.Seek(0, SeekOrigin.Begin);

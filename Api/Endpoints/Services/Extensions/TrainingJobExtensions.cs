@@ -119,6 +119,7 @@ public static class TrainingJobExtensions
         TrainingJobControl control,
         IDbContextFactory<AppDbContext> dbFactory,
         ITokenizer tokenizer,
+        Vocabulary tokenizerVocabulary,
         TrainingJobManager jobManager     
     )
     {
@@ -145,7 +146,7 @@ public static class TrainingJobExtensions
                 // garbage silently. Live-tokenizer mismatch also falls back to
                 // text with a warning rather than training wrong.
                 var header = TokenCache.ReadHeader(cachePath);
-                TokenCache.Validate(header, job.VocabularyId, tokenizer.VocabularySize, (int)tokenizer.Type);
+                TokenCache.Validate(header, TokenCache.Fingerprint(tokenizerVocabulary), tokenizerVocabulary.Count, (int)tokenizer.Type);
                 stream = new StreamingBatchSource(cachePath, window, batchSize, dropLast);
                 streamSamples = stream.SampleCount;
                 streamBatches = stream.BatchCount;
