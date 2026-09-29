@@ -111,6 +111,30 @@ namespace SimpleTransformer
                 Environment.Exit(0);
             }
 
+            // Memory pressure valve self-test (no server start):
+            // dotnet run -- --memory-valve-selftest
+            // Exercises the quota clamp and the whole escalation ladder from
+            // synthetic samples, so the policy is verified without having to
+            // drive a real heap to 95% first.
+            if (args.Contains("--memory-valve-selftest"))
+            {
+                try
+                {
+                    // Apply the real config when present, so the self-test
+                    // exercises the same bounds the server would run with.
+                    var cfg = new Config.ConfigManager();
+                    cfg.LoadFromFile("config/config.ini");
+                    Server.ApplyMemoryPressureSettings(cfg);
+                }
+                catch
+                {
+                    // No config available - fall back to the defaults.
+                }
+
+                bool ok = SimpleTransformer.Model.MemoryPressureSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
             ConfigureLogging();
 
             //Inject the model via constructor DI 

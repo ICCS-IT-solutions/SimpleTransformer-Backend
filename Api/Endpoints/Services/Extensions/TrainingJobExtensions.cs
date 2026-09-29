@@ -542,8 +542,20 @@ public static class TrainingJobExtensions
 
                     //One-line memory snapshot so VRAM fill-up is visible per epoch
                     //in both the log and the frontend job message (empty on CPU
-                    //backends, which have no device memory to report).
+                    //backends, which have no device memory to report). The host
+                    //figure is always present when the memory valve is enabled,
+                    //and is the one that matters for the "reaches 95% and
+                    //slows to a crawl" case: device memory is separately budgeted
+                    //by [Vulkan] and cannot grow unbounded.
                     string memory = model.Backend.DescribeMemoryUsage();
+                    string hostMemory = model.DescribeMemoryPressure();
+
+                    // Device telemetry is empty on CPU backends, and host
+                    // telemetry is "memory valve off" when disabled, so join
+                    // whatever is actually present rather than assuming either.
+                    memory = string.Join(" | ",
+                        new[] { memory, hostMemory }.Where(s => !string.IsNullOrEmpty(s)));
+
                     job.Message = string.IsNullOrEmpty(memory)
                         ? $"Epoch {epoch + 1} of {totalEpochs} completed."
                         : $"Epoch {epoch + 1} of {totalEpochs} completed. {memory}";

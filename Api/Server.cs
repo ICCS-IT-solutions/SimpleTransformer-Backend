@@ -9,6 +9,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
 using SimpleTransformer.Api.Endpoints.Factories;
 using SimpleTransformer.Api.ManagementEngine;
+using settings = SimpleTransformer.Model.MemoryPressureSettings;
 
 namespace SimpleTransformer.Api
 {
@@ -41,6 +42,14 @@ namespace SimpleTransformer.Api
                     AccelerationEngine.GpuVulkan.VulkanKernelLauncher.DispatchTimeoutMs =
                         dispatchTimeoutMs;
                 }
+
+                //Host-memory pressure relief for the managed heap. The [Vulkan]
+                //budgets above cover unmanaged device buffers only; model weights,
+                //AdamW moments, gradients and pooled activations all live on the
+                //managed heap and are what a long run actually exhausts. Pushed
+                //here, before any model is constructed, so the statics are set
+                //before the first TrainStep samples them.
+                ApplyMemoryPressureSettings(_configManager);
 
                 SQLitePCL.Batteries.Init();
 
@@ -156,6 +165,46 @@ namespace SimpleTransformer.Api
             {
                 Log.Warning($"{ex.Message}\nStack trace: {ex.StackTrace}");
             }
+        }
+
+        /// <summary>
+        /// Reads the <c>[Memory]</c> section into <see cref="Model.MemoryPressureSettings"/>.
+        /// Public and static so the diagnostic entry points
+        /// (<c>--memory-valve-selftest</c>) apply the same config the server would
+        /// rather than testing defaults.
+        /// </summary>
+        public static void ApplyMemoryPressureSettings(ConfigManager configManager)
+        {
+            const long mb = 1024L * 1024L;
+
+            settings.Enabled = configManager.GetAs<bool>("enabled", true, "Memory");
+            settings.MaxQuotaBytes = Math.Max(0L, configManager.GetAs<long>("max_quota_mb", 0, "Memory")) * mb;
+            settings.MinQuotaBytes = Math.Max(0L, configManager.GetAs<long>("min_quota_mb", 0, "Memory")) * mb;
+            settings.LowerBoundPercent = configManager.GetAs<double>("lower_bound_percent", 70.0, "Memory");
+            settings.UpperBoundPercent = configManager.GetAs<double>("upper_bound_percent", 85.0, "Memory");
+            settings.CheckEveryNSteps = configManager.GetAs<int>("check_every_n_steps", 25, "Memory");
+            settings.MinCooldownSteps = configManager.GetAs<int>("min_cooldown_steps", 250, "Memory");
+            settings.WorkspaceRetainPercent = configManager.GetAs<double>("workspace_retain_percent", 50.0, "Memory");
+            settings.WorkspaceCapFractionOfQuota = configManager.GetAs<double>("workspace_cap_fraction_of_quota", 0.35, "Memory");
+            settings.AllowBlockingCompact = configManager.GetAs<bool>("allow_blocking_compact", true, "Memory");
+
+            long physical = System.GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            long resolved = Model.MemoryPressureValve.ResolveQuotaBytes(
+                settings.MaxQuotaBytes,
+                settings.MinQuotaBytes,
+                physical);
+
+            Log.Information(
+                "Memory valve: {State}, quota {Quota:F0} MiB (configured {Configured:F0}, machine {Physical:F0} MiB), band {Lower:F0}-{Upper:F0}%, every {Every} steps, cooldown {Cooldown}, pool cap {PoolCap:P0} of quota.",
+                settings.Enabled ? "enabled" : "disabled",
+                resolved / mb,
+                settings.MaxQuotaBytes / mb,
+                physical / mb,
+                settings.LowerBoundPercent,
+                settings.UpperBoundPercent,
+                settings.CheckEveryNSteps,
+                settings.MinCooldownSteps,
+                settings.WorkspaceCapFractionOfQuota);
         }
 
         public class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>

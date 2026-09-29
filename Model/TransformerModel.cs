@@ -28,6 +28,13 @@ namespace SimpleTransformer.Model
         public bool IsTraining => _isTraining;
         public bool CanInfer => !_isTraining;
         /// <summary>
+        /// Decides when this model's memory pressure needs relieving. One per
+        /// model, so the latch and cooldown apply per training run rather than
+        /// per step.
+        /// </summary>
+        private readonly MemoryPressureValve _memoryValve = new();
+
+        /// <summary>
         /// The acceleration backend currently driving this model's training and prediction math.
         /// </summary>
         public IAccelerationBackend Backend => _workspace.Backend;
@@ -634,6 +641,14 @@ namespace SimpleTransformer.Model
                 // CPU backends no-op.
                 _workspace.Backend.TrimIdleMemory();
 
+                // 10. Host memory pressure valve. Runs after the cheap unmanaged
+                // trim above, so the first rung has already had its effect. The
+                // workspace pool at this point holds the tensors returned by
+                // *earlier* steps (each step's finally-Reset), which are idle and
+                // therefore eligible for trimming; this step's own activations
+                // are still borrowed and are never touched.
+                ApplyMemoryRelief();
+
                 return loss;
             }
             finally
@@ -654,6 +669,95 @@ namespace SimpleTransformer.Model
             {
                 disposable.Dispose();
             }
+        }
+
+        /// <summary>
+        /// Executes whatever relief the memory valve has asked for. The valve
+        /// itself only decides; the actions live here because they need the
+        /// workspace and the backend, which the policy deliberately does not
+        /// hold references to.
+        /// </summary>
+        private void ApplyMemoryRelief()
+        {
+            MemoryReliefLevel level = _memoryValve.Tick();
+
+            if (level == MemoryReliefLevel.None)
+                return;
+
+            const double mib = 1024.0 * 1024.0;
+
+            switch (level)
+            {
+                case MemoryReliefLevel.TrimDevicePools:
+                    // Step 9 already ran TrimIdleMemory this step, so the cheap
+                    // rung is satisfied by construction. Logged rather than
+                    // repeated so the escalation history stays visible. Reads
+                    // the sample the valve already took - no second syscall.
+                    Log.Debug(
+                        "Memory valve: trimmed idle device pools at {Pct:F0}% of system memory.",
+                        _memoryValve.LastSample.UsedFraction * 100.0);
+                    break;
+
+                case MemoryReliefLevel.TrimWorkspace:
+                {
+                    long before = _workspace.RetainedBytes;
+                    int dropped = _workspace.TrimRetainedTo(RetainedTarget(before));
+
+                    // Gen-0, non-blocking: enough to hand the released arrays
+                    // back without stalling the training thread.
+                    GC.Collect(0, GCCollectionMode.Forced, blocking: false, compacting: false);
+
+                    Log.Warning(
+                        "Memory valve: released {Dropped} pooled activations ({Before:F0} -> {After:F0} MiB) under pressure. {Status}",
+                        dropped, before / mib, _workspace.RetainedBytes / mib, _memoryValve.Describe());
+                    break;
+                }
+
+                case MemoryReliefLevel.Compact:
+                {
+                    // Hard floor: keep a quarter of what the pool holds rather
+                    // than the configured retain percent, because at this point
+                    // the cheap rungs have already failed to bring usage down.
+                    long before = _workspace.RetainedBytes;
+                    int dropped = _workspace.TrimRetainedTo(before / 4);
+
+                    // The only rung that reclaims a fragmented multi-gigabyte
+                    // heap, and the only one that blocks. Rate-limited by the
+                    // valve's latch and cooldown, so it cannot run per step.
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+
+                    Log.Warning(
+                        "Memory valve: COMPACT at {Pct:F0}% of system memory; released {Dropped} pooled activations ({Before:F0} -> {After:F0} MiB). Raise [Memory] max_quota_mb or lower batch_size if this repeats. {Status}",
+                        _memoryValve.LastSample.UsedFraction * 100.0,
+                        dropped, before / mib, _workspace.RetainedBytes / mib, _memoryValve.Describe());
+                    break;
+                }
+            }
+        }
+
+        /// <summary>Bytes the workspace pool should be trimmed down to.</summary>
+        private static long RetainedTarget(long retained)
+        {
+            double percent = Math.Clamp(MemoryPressureSettings.WorkspaceRetainPercent, 0.0, 100.0);
+            return (long)(retained * percent / 100.0);
+        }
+
+        /// <summary>
+        /// One-line host-memory telemetry, for the per-epoch log and the
+        /// frontend job message. Complements
+        /// <see cref="IAccelerationBackend.DescribeMemoryUsage"/>, which reports
+        /// device-side memory only.
+        /// </summary>
+        public string DescribeMemoryPressure()
+        {
+            if (!MemoryPressureSettings.Enabled)
+                return "memory valve off";
+
+            const double mib = 1024.0 * 1024.0;
+            return $"{_memoryValve.Describe()}; " +
+                   $"activation pool {_workspace.RetainedBytes / mib:F0} MiB " +
+                   $"across {_workspace.PooledTensorCount} tensors " +
+                   $"({_workspace.PooledShapeCount} shapes)";
         }
 
         /// <summary>

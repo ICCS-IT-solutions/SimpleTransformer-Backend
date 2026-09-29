@@ -8,6 +8,39 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <!--Garbage collection-->
+  <!--
+    Training is long-running and memory-bound, not request-throughput-bound, so
+    the ASP.NET Core default of Server GC is close to the worst case here: it
+    allocates one GC heap per core, which costs a large fixed overhead and makes
+    the gen-2 collections the memory valve may need far more expensive. The
+    training loop is effectively single-threaded, so a single Workstation heap is
+    both cheaper and easier to reason about.
+  -->
+  <PropertyGroup>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+  </PropertyGroup>
+
+  <!--
+    Last-resort backstop that needs no code: the runtime's own ceiling on the
+    GC heap. Past this the GC goes aggressive on its own. Set in tandem with
+    [Memory] max_quota_mb in config.ini - the quota drives the graceful valve
+    (trim pooled activations first, which is cheap), and this guarantees a hard
+    stop behind it so a genuine leak degrades into slowness rather than an OOM.
+    Expressed as a percent of physical memory so it scales with the host.
+
+    Emitted through RuntimeHostConfigurationOption rather than the bare
+    GCHeapHardLimitPercent property: that property is not part of the SDK's
+    known-property list for this TFM, so it silently produced no
+    System.GC.HeapHardLimitPercent entry in runtimeconfig.json and the backstop
+    was not actually active. The explicit item is written verbatim and is
+    verifiable in the generated runtimeconfig.json.
+  -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.HeapHardLimitPercent" Value="90" />
+  </ItemGroup>
+
   <!-- <PropertyGroup>
       <PublishAot>true</PublishAot>
       <RuntimeIdentifier>win-x64</RuntimeIdentifier>
