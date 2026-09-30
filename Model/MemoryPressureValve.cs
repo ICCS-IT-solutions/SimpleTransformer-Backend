@@ -33,7 +33,7 @@ namespace SimpleTransformer.Model
         Compact = 3
     }
 
-    /// <summary>One observation of process memory pressure.</summary>
+    /// <summary>One observation of process-plus-system memory pressure.</summary>
     public readonly struct MemoryPressureSample
     {
         /// <summary>
@@ -55,14 +55,35 @@ namespace SimpleTransformer.Model
         /// <summary>Resolved quota after clamping. See <c>ResolveQuotaBytes</c>.</summary>
         public readonly long QuotaBytes;
 
-        /// <summary>Fraction of physical memory committed, clamped to [0, 1].</summary>
+        /// <summary>Fraction of physical memory committed by this process, clamped to [0, 1].</summary>
         public readonly double UsedFraction;
+
+        /// <summary>
+        /// Machine-wide committed bytes (GCMemoryInfo.MemoryLoadBytes). Covers
+        /// other processes, the page cache and driver allocations that
+        /// PrivateBytes cannot see. Falls back to PrivateBytes when the runtime
+        /// reports no figure (0 on some containers).
+        /// </summary>
+        public readonly long SystemUsedBytes;
+
+        /// <summary>Fraction of physical memory committed machine-wide, clamped to [0, 1].</summary>
+        public readonly double SystemUsedFraction;
+
+        /// <summary>
+        /// The fraction the valve gates on: the worse of the process and system
+        /// readings, or the process reading alone when
+        /// <see cref="MemoryPressureSettings.MonitorSystemPressure"/> is false.
+        /// </summary>
+        public double EffectiveFraction => MemoryPressureSettings.MonitorSystemPressure
+            ? Math.Max(UsedFraction, SystemUsedFraction)
+            : UsedFraction;
 
         public MemoryPressureSample(
             long privateBytes,
             long managedHeapBytes,
             long physicalBytes,
-            long quotaBytes)
+            long quotaBytes,
+            long systemUsedBytes = -1)
         {
             PrivateBytes = privateBytes;
             ManagedHeapBytes = managedHeapBytes;
@@ -70,6 +91,11 @@ namespace SimpleTransformer.Model
             QuotaBytes = quotaBytes;
             UsedFraction = physicalBytes > 0
                 ? Math.Clamp((double)privateBytes / physicalBytes, 0.0, 1.0)
+                : 0.0;
+            long sys = systemUsedBytes < 0 ? privateBytes : systemUsedBytes;
+            SystemUsedBytes = sys;
+            SystemUsedFraction = physicalBytes > 0
+                ? Math.Clamp((double)sys / physicalBytes, 0.0, 1.0)
                 : 0.0;
         }
 
@@ -177,7 +203,9 @@ namespace SimpleTransformer.Model
         /// <summary>Samples process memory. Safe to call at any cadence.</summary>
         public MemoryPressureSample Sample()
         {
-            long physical = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            var gcInfo = GC.GetGCMemoryInfo();
+            long physical = gcInfo.TotalAvailableMemoryBytes;
+            long systemUsed = gcInfo.MemoryLoadBytes;
             long managed = GC.GetTotalMemory(forceFullCollection: false);
             long privateBytes = 0;
 
@@ -197,6 +225,9 @@ namespace SimpleTransformer.Model
                 }
             }
 
+            if (systemUsed <= 0)
+                systemUsed = privateBytes;
+
             return new MemoryPressureSample(
                 privateBytes,
                 managed,
@@ -204,7 +235,8 @@ namespace SimpleTransformer.Model
                 ResolveQuotaBytes(
                     MemoryPressureSettings.MaxQuotaBytes,
                     MemoryPressureSettings.MinQuotaBytes,
-                    physical));
+                    physical),
+                systemUsed);
         }
 
         /// <summary>
@@ -239,7 +271,7 @@ namespace SimpleTransformer.Model
 
             _ticksSinceRelief++;
 
-            double usedPct = sample.UsedFraction * 100.0;
+            double usedPct = sample.EffectiveFraction * 100.0;
             double lower = Math.Clamp(MemoryPressureSettings.LowerBoundPercent, 1.0, 100.0);
             double upper = Math.Clamp(
                 Math.Max(MemoryPressureSettings.UpperBoundPercent, lower),
@@ -301,7 +333,7 @@ namespace SimpleTransformer.Model
                 : "unknown";
 
             return $"host {s.PrivateBytes / mib:F0} of {physical} " +
-                   $"({s.UsedFraction * 100:F0}%, quota {s.QuotaBytes / mib:F0} MiB), " +
+                   $"(proc {s.UsedFraction * 100:F0}%, sys {s.SystemUsedFraction * 100:F0}%, quota {s.QuotaBytes / mib:F0} MiB), " +
                    $"managed heap {s.ManagedHeapBytes / mib:F0} MiB, " +
                    $"{_reliefCount} reliefs (last {_lastRelief})";
         }

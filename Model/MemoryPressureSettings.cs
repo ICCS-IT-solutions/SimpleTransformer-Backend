@@ -21,6 +21,16 @@ namespace SimpleTransformer.Model
         public static bool Enabled { get; set; } = true;
 
         /// <summary>
+        /// Whether the valve also watches machine-wide memory load
+        /// (GCMemoryInfo.MemoryLoadBytes) and fires on the worse of the
+        /// process and system readings. True because a box can be pushed into
+        /// swap by other processes, the page cache or driver allocations this
+        /// process never sees. Set false on noisy shared hosts where only this
+        /// process should be allowed to trigger relief.
+        /// </summary>
+        public static bool MonitorSystemPressure { get; set; } = true;
+
+        /// <summary>
         /// Ceiling for this process, in bytes, that the valve treats as
         /// "full". 0 = auto (80% of the memory container the runtime reports,
         /// clamped to [1 GiB, 48 GiB]). Always clamped to

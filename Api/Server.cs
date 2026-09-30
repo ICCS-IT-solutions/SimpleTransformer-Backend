@@ -9,10 +9,13 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
 using SimpleTransformer.Api.Endpoints.Factories;
 using SimpleTransformer.Api.ManagementEngine;
-using settings = SimpleTransformer.Model.MemoryPressureSettings;
+using MemSettings = SimpleTransformer.Model.MemoryPressureSettings;
 
 namespace SimpleTransformer.Api
 {
+    // Host-memory pressure relief: the valve gates on max(process, system)
+    // load (see MemoryPressureValve), preemptively releasing pooled resources
+    // and letting the GC reclaim before the box reaches swap.
     public class Server
     {
         private static ConfigManager _configManager = new ConfigManager();
@@ -177,34 +180,36 @@ namespace SimpleTransformer.Api
         {
             const long mb = 1024L * 1024L;
 
-            settings.Enabled = configManager.GetAs<bool>("enabled", true, "Memory");
-            settings.MaxQuotaBytes = Math.Max(0L, configManager.GetAs<long>("max_quota_mb", 0, "Memory")) * mb;
-            settings.MinQuotaBytes = Math.Max(0L, configManager.GetAs<long>("min_quota_mb", 0, "Memory")) * mb;
-            settings.LowerBoundPercent = configManager.GetAs<double>("lower_bound_percent", 70.0, "Memory");
-            settings.UpperBoundPercent = configManager.GetAs<double>("upper_bound_percent", 85.0, "Memory");
-            settings.CheckEveryNSteps = configManager.GetAs<int>("check_every_n_steps", 25, "Memory");
-            settings.MinCooldownSteps = configManager.GetAs<int>("min_cooldown_steps", 250, "Memory");
-            settings.WorkspaceRetainPercent = configManager.GetAs<double>("workspace_retain_percent", 50.0, "Memory");
-            settings.WorkspaceCapFractionOfQuota = configManager.GetAs<double>("workspace_cap_fraction_of_quota", 0.35, "Memory");
-            settings.AllowBlockingCompact = configManager.GetAs<bool>("allow_blocking_compact", true, "Memory");
+            MemSettings.Enabled = configManager.GetAs<bool>("enabled", true, "Memory");
+            MemSettings.MonitorSystemPressure = configManager.GetAs<bool>("monitor_system_pressure", true, "Memory");
+            MemSettings.MaxQuotaBytes = Math.Max(0L, configManager.GetAs<long>("max_quota_mb", 0, "Memory")) * mb;
+            MemSettings.MinQuotaBytes = Math.Max(0L, configManager.GetAs<long>("min_quota_mb", 0, "Memory")) * mb;
+            MemSettings.LowerBoundPercent = configManager.GetAs<double>("lower_bound_percent", 70.0, "Memory");
+            MemSettings.UpperBoundPercent = configManager.GetAs<double>("upper_bound_percent", 85.0, "Memory");
+            MemSettings.CheckEveryNSteps = configManager.GetAs<int>("check_every_n_steps", 25, "Memory");
+            MemSettings.MinCooldownSteps = configManager.GetAs<int>("min_cooldown_steps", 250, "Memory");
+            MemSettings.WorkspaceRetainPercent = configManager.GetAs<double>("workspace_retain_percent", 50.0, "Memory");
+            MemSettings.WorkspaceCapFractionOfQuota = configManager.GetAs<double>("workspace_cap_fraction_of_quota", 0.35, "Memory");
+            MemSettings.AllowBlockingCompact = configManager.GetAs<bool>("allow_blocking_compact", true, "Memory");
 
             long physical = System.GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
             long resolved = Model.MemoryPressureValve.ResolveQuotaBytes(
-                settings.MaxQuotaBytes,
-                settings.MinQuotaBytes,
+                MemSettings.MaxQuotaBytes,
+                MemSettings.MinQuotaBytes,
                 physical);
 
             Log.Information(
-                "Memory valve: {State}, quota {Quota:F0} MiB (configured {Configured:F0}, machine {Physical:F0} MiB), band {Lower:F0}-{Upper:F0}%, every {Every} steps, cooldown {Cooldown}, pool cap {PoolCap:P0} of quota.",
-                settings.Enabled ? "enabled" : "disabled",
+                "Memory valve: {State} (system monitor {SysMon}), quota {Quota:F0} MiB (configured {Configured:F0}, machine {Physical:F0} MiB), band {Lower:F0}-{Upper:F0}% of max(proc, sys), every {Every} steps, cooldown {Cooldown}, pool cap {PoolCap:P0} of quota.",
+                MemSettings.Enabled ? "enabled" : "disabled",
+                MemSettings.MonitorSystemPressure ? "on" : "off",
                 resolved / mb,
-                settings.MaxQuotaBytes / mb,
+                MemSettings.MaxQuotaBytes / mb,
                 physical / mb,
-                settings.LowerBoundPercent,
-                settings.UpperBoundPercent,
-                settings.CheckEveryNSteps,
-                settings.MinCooldownSteps,
-                settings.WorkspaceCapFractionOfQuota);
+                MemSettings.LowerBoundPercent,
+                MemSettings.UpperBoundPercent,
+                MemSettings.CheckEveryNSteps,
+                MemSettings.MinCooldownSteps,
+                MemSettings.WorkspaceCapFractionOfQuota);
         }
 
         public class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>

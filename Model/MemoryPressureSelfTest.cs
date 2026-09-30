@@ -86,8 +86,9 @@ namespace SimpleTransformer.Model
                 MemoryPressureSettings.MinCooldownSteps = 5;
                 MemoryPressureSettings.AllowBlockingCompact = true;
 
-                MemoryPressureSample At(double pct) =>
-                    new((long)(physical * pct / 100.0), 0, physical, physical);
+                MemoryPressureSample At(double procPct, double sysPct = -1) =>
+                    new((long)(physical * procPct / 100.0), 0, physical, physical,
+                        sysPct < 0 ? -1 : (long)(physical * sysPct / 100.0));
 
                 Check("below band does nothing",
                     valve.Evaluate(At(50.0)) == MemoryReliefLevel.None);
@@ -108,6 +109,56 @@ namespace SimpleTransformer.Model
             }
 
             Console.WriteLine();
+            Console.WriteLine("-- System memory load (max of proc, sys) --");
+            {
+                bool savedMon = MemoryPressureSettings.MonitorSystemPressure;
+                int savedCooldown = MemoryPressureSettings.MinCooldownSteps;
+                MemoryPressureSettings.MonitorSystemPressure = true;
+                MemoryPressureSettings.MinCooldownSteps = 5;
+
+                MemoryPressureSample At2(double procPct, double sysPct) =>
+                    new((long)(physical * procPct / 100.0), 0, physical, physical,
+                        (long)(physical * sysPct / 100.0));
+
+                var sysValve = new MemoryPressureValve();
+                Check("low process but hot system still relieves",
+                    sysValve.Evaluate(At2(20.0, 90.0)) == MemoryReliefLevel.Compact);
+
+                var calmValve = new MemoryPressureValve();
+                Check("both low stays quiet",
+                    calmValve.Evaluate(At2(20.0, 30.0)) == MemoryReliefLevel.None);
+
+                var effValve = new MemoryPressureValve();
+                var effSample = At2(20.0, 90.0);
+                Check("effective fraction tracks the system reading",
+                    Math.Abs(effSample.EffectiveFraction - 0.90) < 0.001,
+                    $"{effSample.EffectiveFraction:P1} effective");
+
+                // The latch is driven by the effective (max) reading: a quiet
+                // process on a hot box must not unlatch, so the cooldown keeps
+                // suppressing repeat relief while the system stays hot.
+                var latchValve = new MemoryPressureValve();
+                latchValve.Evaluate(At2(90.0, 90.0));
+                Check("hot system stays latched (repeat suppressed)",
+                    latchValve.Evaluate(At2(10.0, 90.0)) == MemoryReliefLevel.None);
+                latchValve.Evaluate(At2(10.0, 10.0));
+                Check("latch clears once the system cools",
+                    latchValve.Evaluate(At2(90.0, 90.0)) == MemoryReliefLevel.Compact);
+
+                // Monitor toggle: system ignored when off.
+                MemoryPressureSettings.MonitorSystemPressure = false;
+                var offValve = new MemoryPressureValve();
+                Check("system ignored when the monitor is off",
+                    offValve.Evaluate(At2(20.0, 90.0)) == MemoryReliefLevel.None);
+                var offSample = At2(20.0, 90.0);
+                Check("effective fraction equals process when off",
+                    Math.Abs(offSample.EffectiveFraction - 0.20) < 0.001,
+                    $"{offSample.EffectiveFraction:P1} effective");
+
+                MemoryPressureSettings.MonitorSystemPressure = savedMon;
+                MemoryPressureSettings.MinCooldownSteps = savedCooldown;
+            }
+
             Console.WriteLine("-- Anti-thrash latch and cooldown --");
             {
                 var valve = new MemoryPressureValve();
@@ -249,6 +300,7 @@ namespace SimpleTransformer.Model
             {
                 var valve = new MemoryPressureValve();
                 MemoryPressureSample sample = valve.Sample();
+                valve.Evaluate(sample);
 
                 Check("reports a usable memory container", sample.IsUsable,
                     $"{sample.PrivateBytes / (double)Gib:F2} of {sample.PhysicalBytes / (double)Gib:F2} GiB " +
@@ -256,6 +308,12 @@ namespace SimpleTransformer.Model
                 Check("used fraction is a sane proportion",
                     sample.UsedFraction >= 0.0 && sample.UsedFraction <= 1.0,
                     $"{sample.UsedFraction:P1}");
+                Check("system fraction is a sane proportion",
+                    sample.SystemUsedFraction >= 0.0 && sample.SystemUsedFraction <= 1.0,
+                    $"{sample.SystemUsedFraction:P1}");
+                Check("system reading covers at least this process",
+                    sample.SystemUsedBytes >= sample.PrivateBytes || sample.SystemUsedBytes <= 0,
+                    $"{sample.SystemUsedBytes / (double)Mib:F0} MiB system vs {sample.PrivateBytes / (double)Mib:F0} MiB proc");
 
                 Console.WriteLine();
                 Console.WriteLine($"  valve telemetry: {valve.Describe()}");

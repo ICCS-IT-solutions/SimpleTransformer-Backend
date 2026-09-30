@@ -695,7 +695,7 @@ namespace SimpleTransformer.Model
                     // the sample the valve already took - no second syscall.
                     Log.Debug(
                         "Memory valve: trimmed idle device pools at {Pct:F0}% of system memory.",
-                        _memoryValve.LastSample.UsedFraction * 100.0);
+                        _memoryValve.LastSample.EffectiveFraction * 100.0);
                     break;
 
                 case MemoryReliefLevel.TrimWorkspace:
@@ -728,7 +728,7 @@ namespace SimpleTransformer.Model
 
                     Log.Warning(
                         "Memory valve: COMPACT at {Pct:F0}% of system memory; released {Dropped} pooled activations ({Before:F0} -> {After:F0} MiB). Raise [Memory] max_quota_mb or lower batch_size if this repeats. {Status}",
-                        _memoryValve.LastSample.UsedFraction * 100.0,
+                        _memoryValve.LastSample.EffectiveFraction * 100.0,
                         dropped, before / mib, _workspace.RetainedBytes / mib, _memoryValve.Describe());
                     break;
                 }
