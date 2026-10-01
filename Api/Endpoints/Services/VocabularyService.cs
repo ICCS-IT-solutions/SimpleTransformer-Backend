@@ -69,6 +69,40 @@ namespace SimpleTransformer.Api.Endpoints.Services
             };
         }
 
+        public async Task<ApiResponse<bool>> DeleteVocabulary(string vocabularyName)
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync();
+            var vocabEntry = await db.Vocabularies.FirstOrDefaultAsync(v => v.Name == vocabularyName);
+            if (vocabEntry == null)
+            {
+                return new ApiResponse<bool>
+                {
+                    Status = ResponseStatus.Error,
+                    StatusCode = 404,
+                    Message = $"Vocabulary '{vocabularyName}' not found.",
+                    Data = false
+                };
+            }
+
+            db.Vocabularies.Remove(vocabEntry);
+            await db.SaveChangesAsync();
+
+            // Optionally, delete the associated files from disk
+            var vocabPath = Path.Combine(_configManager.GetValue("vocabulary_Compiled_Directory", "Paths"), vocabEntry.TokenizerType.ToString().ToLowerInvariant(), vocabEntry.NumTokens.ToString(), vocabEntry.Name);
+            if (Directory.Exists(vocabPath))
+            {
+                Directory.Delete(vocabPath, true);
+            }
+
+            return new ApiResponse<bool>
+            {
+                Status = ResponseStatus.Success,
+                StatusCode = 200,
+                Message = $"Vocabulary '{vocabularyName}' deleted successfully.",
+                Data = true
+            };
+        }
+
         public async Task<ApiResponse<VocabularyCompilationResponse>> Compile(CompileVocabularyRequest req)
         {
             await using var db = await _dbFactory.CreateDbContextAsync();

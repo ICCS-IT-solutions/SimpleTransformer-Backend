@@ -65,6 +65,11 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
         {
             return await _vocabularyService.UploadFiles(req.Files);
         }
+        [HttpPost("api/v1/vocabulary/{vocabularyName}/delete")]
+        public async Task<ApiResponse<bool>> DeleteVocabulary(string vocabularyName)
+        {
+            return await _vocabularyService.DeleteVocabulary(vocabularyName);
+        }
     }
     public class VocabularyUploadRequest
     {
