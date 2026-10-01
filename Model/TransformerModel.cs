@@ -35,6 +35,49 @@ namespace SimpleTransformer.Model
         private readonly MemoryPressureValve _memoryValve = new();
 
         /// <summary>
+        /// Global optimizer step counter driving the LR schedule. Checkpointed
+        /// (schema v4) so pause/resume reproduces the identical LR curve.
+        /// </summary>
+        private int _globalStep;
+        public int GlobalStep => _globalStep;
+
+        /// <summary>
+        /// Per-run LR policy. Null until <see cref="ConfigureScheduler"/> is
+        /// called by the training loop; when null the optimizer's configured
+        /// base rate is used unchanged (legacy flat-LR path).
+        /// </summary>
+        private LRScheduler? _scheduler;
+        public float CurrentLearningRate => _scheduler != null
+            ? _scheduler.GetLR(Math.Max(0, _globalStep - 1))
+            : _optimizer?.LearningRate ?? TrainingConfig.LearningRate;
+
+        /// <summary>
+        /// Post-resume LR ramp: number of steps blending 0 -&gt; scheduled LR
+        /// (absorbs the fresh-Adam-moments bump), and how many are consumed.
+        /// Transient per run - deliberately NOT checkpointed.
+        /// </summary>
+        private int _resumeRampTotal;
+        private int _resumeRampDone;
+
+        /// <summary>
+        /// Effective LR for the current step: scheduled value, blended from
+        /// ~0 when a post-resume ramp is active.
+        /// </summary>
+        public float GetStepLearningRate()
+        {
+            if (_scheduler == null)
+                return _optimizer?.LearningRate ?? TrainingConfig.LearningRate;
+
+            float scheduled = _scheduler.GetLR(_globalStep);
+            if (_resumeRampDone < _resumeRampTotal)
+            {
+                float blend = (float)(_resumeRampDone + 1) / (_resumeRampTotal + 1);
+                return scheduled * blend;
+            }
+            return scheduled;
+        }
+
+        /// <summary>
         /// The acceleration backend currently driving this model's training and prediction math.
         /// </summary>
         public IAccelerationBackend Backend => _workspace.Backend;
@@ -236,13 +279,62 @@ namespace SimpleTransformer.Model
         /// <summary>
         /// Stream-based serialization: decoupling from direct File API dependencies
         /// </summary>
+        /// <summary>
+        /// Installs the per-run LR schedule. Must be called once by the
+        /// training loop before the first step, with the FULL-RUN step budget
+        /// (total epochs x steps-per-epoch, including already-trained epochs
+        /// on resume); the model's checkpointed <see cref="GlobalStep"/>
+        /// lands mid-curve so pause/resume continues the identical schedule.
+        /// Guessing a remaining-only horizon would leave the restored step
+        /// past the end and pin LR at the floor.
+        /// </summary>
+        /// <param name="totalSteps">Total optimizer steps for the whole run.</param>
+        /// <param name="resumeRewarmupSteps">
+        /// Brief re-warmup applied when resuming mid-schedule (fresh Adam
+        /// moments on trained weights otherwise spike the loss). Implemented
+        /// as a ramp blending 0 -&gt; scheduled LR over the first post-resume
+        /// steps. Pass 0 for genuinely fresh runs.
+        /// </param>
+        public void ConfigureScheduler(int totalSteps, int resumeRewarmupSteps = 0)
+        {
+            if (totalSteps <= 0)
+                throw new ArgumentOutOfRangeException(nameof(totalSteps), "Total steps must be positive.");
+            if (resumeRewarmupSteps < 0)
+                throw new ArgumentOutOfRangeException(nameof(resumeRewarmupSteps), "Resume re-warmup must be non-negative.");
+
+            int warmup = Math.Max(0, TrainingConfig.WarmupSteps);
+
+            _scheduler = new LRScheduler(
+                TrainingConfig.LearningRate,
+                TrainingConfig.MinLearningRate,
+                warmup,
+                totalSteps);
+
+            // Fresh run: no ramp. Resume: ramp the next N steps from ~0 back
+            // to the scheduled value. Not checkpointed: a second resume
+            // simply starts a fresh ramp, which is the safe direction.
+            _resumeRampTotal = (_globalStep > 0) ? resumeRewarmupSteps : 0;
+            _resumeRampDone = 0;
+        }
+
+        /// <summary>
+        /// Clears scheduler state (used by tests / fresh model reuse).
+        /// </summary>
+        public void ClearScheduler()
+        {
+            _scheduler = null;
+            _globalStep = 0;
+            _resumeRampTotal = 0;
+            _resumeRampDone = 0;
+        }
+
         public void SaveCheckpoint(Stream destinationStream, int currentEpoch, float currentLoss)
         {
             using var writer = new BinaryWriter(destinationStream, Encoding.UTF8, leaveOpen: true);
             
             // Fixed 4-byte header (no length prefix)
             writer.Write("STCK"u8); 
-            writer.Write(3); // Schema version (v3 adds the useQLora flag)
+            writer.Write(4); // Schema version (v4 adds the LR scheduler step)
 
             //Add the transformer model id to the checkpoint file 
             writer.Write(TransformerModelId.ToByteArray());
@@ -255,6 +347,10 @@ namespace SimpleTransformer.Model
 
             writer.Write(currentEpoch);
             writer.Write(currentLoss);
+
+            // v4: global LR-schedule step so resume continues the identical
+            // cosine curve instead of restarting at peak LR.
+            writer.Write(_globalStep);
 
             CheckpointConfigExtensions.WriteConfig(writer, Config);
 
@@ -332,10 +428,12 @@ namespace SimpleTransformer.Model
             //v2 predates the useQLora flag. Every v2 checkpoint was written by a
             //QLoRA model (raw training was not reachable), so they are read as
             //QLoRA=true and remain loadable.
-            if (version != 2 && version != 3)
+            //v4 appends the LR scheduler step after (epoch, loss); v2/v3 load
+            //with step 0 (schedule restarts - logged below).
+            if (version != 2 && version != 3 && version != 4)
             {
                 throw new InvalidDataException(
-                    $"Unsupported checkpoint schema version: {version}. Expected 2 or 3.");
+                    $"Unsupported checkpoint schema version: {version}. Expected 2, 3 or 4.");
             }
             //Validate the checkpoint model id against the loaded model
 
@@ -366,6 +464,18 @@ namespace SimpleTransformer.Model
 
             int epoch = reader.ReadInt32();
             float loss = reader.ReadSingle();
+
+            // v4: restore the LR schedule position. v2/v3 have no step field;
+            // the schedule restarts from 0 (warn - resuming old checkpoints
+            // re-warms rather than continuing the cosine curve).
+            int savedGlobalStep = 0;
+            if (version >= 4)
+            {
+                savedGlobalStep = reader.ReadInt32();
+                if (savedGlobalStep < 0)
+                    throw new InvalidDataException(
+                        $"Corrupt checkpoint: negative scheduler step ({savedGlobalStep}).");
+            }
 
             // ------------------------------------------------------------
             // 2. Read checkpoint configuration
@@ -422,12 +532,21 @@ namespace SimpleTransformer.Model
             // ------------------------------------------------------------
 
             model.LoadCheckpointData(loadedParameters);
+            model._globalStep = savedGlobalStep;
+
+            if (version < 4 && savedGlobalStep == 0)
+            {
+                Log.Warning(
+                    "Checkpoint schema v{Version} has no scheduler step; LR schedule restarts from step 0 on resume.",
+                    version);
+            }
 
             Log.Information(
-                "Checkpoint successfully loaded into model {ModelId}. Epoch: {Epoch}, Loss: {Loss}.",
+                "Checkpoint successfully loaded into model {ModelId}. Epoch: {Epoch}, Loss: {Loss}, SchedulerStep: {Step}.",
                 model.TransformerModelId,
                 epoch,
-                loss);
+                loss,
+                savedGlobalStep);
 
             return (epoch, loss);
         }       
@@ -639,10 +758,20 @@ namespace SimpleTransformer.Model
                 }
                 if (profiling) stepProfile.MarkClipValidate(Stopwatch.GetTimestamp() - tPhase);
 
-                // 6. Step optimizer (scalar CPU loop today: weights/gradients
-                // stay host-current; device copies refreshed in step 8).
+                // 6. Step optimizer. The LR schedule owns the rate: apply this
+                // step's value before the optimizer consumes it. Without a
+                // configured schedule the base rate stands (legacy flat LR).
+                // The schedule advances on every completed step - LR is a
+                // function of step index, not of gradient magnitude.
                 tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
+                if (_scheduler != null)
+                {
+                    _optimizer.LearningRate = GetStepLearningRate();
+                    if (_resumeRampDone < _resumeRampTotal)
+                        _resumeRampDone++;
+                }
                 _optimizer.Step(Parameters);
+                _globalStep++;
                 if (profiling) stepProfile.MarkOptimizer(Stopwatch.GetTimestamp() - tPhase);
 
                 // 7. Verify no weights became NaN after optimizer step

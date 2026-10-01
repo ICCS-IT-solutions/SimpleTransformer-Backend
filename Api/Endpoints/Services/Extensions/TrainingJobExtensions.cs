@@ -253,6 +253,30 @@ public static class TrainingJobExtensions
 
         var totalEpochs = startEpoch + (config?.Epochs ?? 10); // Default to 10 epochs if not specified
 
+        // LR schedule budget: one optimizer step per mini-batch per epoch.
+        // The horizon MUST span the full run (totalEpochs x steps), not just
+        // the remaining epochs: the model's checkpointed GlobalStep lands
+        // mid-curve, and a remaining-only horizon would leave it past the end
+        // (LR pinned at the floor). The factory-built model reads the live
+        // TrainingConfig, so peak/warmup/floor come from the current config.
+        int scheduleSteps = Math.Max(1, totalEpochs * Math.Max(1, numBatches));
+        // Brief re-warmup when resuming mid-schedule: Adam moments reset
+        // while weights are trained, so jumping to mid-curve LR spikes the
+        // loss (measured +0.05 at epoch 16). ~10% of WarmupSteps, min 1.
+        // Implemented as a ramp blending 0 -> scheduled LR, so the cosine
+        // curve itself is never distorted.
+        int resumeRewarm = model.GlobalStep > 0
+            ? Math.Max(1, model.TrainingConfig.WarmupSteps / 10)
+            : 0;
+        model.ConfigureScheduler(scheduleSteps, resumeRewarm);
+        Log.Information(
+            "LR schedule: {Steps} total steps, warmup {Warmup}, peak {Peak}, floor {Floor}, resuming at step {AtStep}.",
+            scheduleSteps,
+            model.TrainingConfig.WarmupSteps,
+            model.TrainingConfig.LearningRate,
+            model.TrainingConfig.MinLearningRate,
+            model.GlobalStep);
+
         //Update the job status
         await UpdateJob(dbFactory, job.EntryId, job =>
         {

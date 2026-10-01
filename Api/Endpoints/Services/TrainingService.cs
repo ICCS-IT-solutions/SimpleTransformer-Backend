@@ -947,6 +947,28 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
             var config = configEntry.Config;
 
+            // The model is factory-built from the MODEL's config pointer,
+            // while the loop trains with the JOB's config. If the edit-model
+            // flow repointed the model after this job was created, the two
+            // disagree - and the schedule (peak/warmup/floor) would silently
+            // come from the wrong one. Fail loudly instead of training with
+            // a config the user didn't intend.
+            if (model.TrainingConfig != config)
+            {
+                var liveModelConfig = await db.TrainingConfigs
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x => x.EntryId == modelEntry.TrainingConfigId);
+                string detail = liveModelConfig?.Config != null
+                    ? $" Model now points at LR {liveModelConfig.Config.LearningRate} (job: LR {config.LearningRate})."
+                    : string.Empty;
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "Training job's config no longer matches the model's current training config. Create a new job after editing the model." + detail,
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
             int startEpoch = 0;
 
             //Resume shares the launch with Start. Reloads (or a duplicate click)

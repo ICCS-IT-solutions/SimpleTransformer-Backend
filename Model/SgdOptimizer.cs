@@ -7,7 +7,7 @@ namespace SimpleTransformer.Model
 {
     public class SgdOptimizer : IOptimizer
     {
-        private readonly float _learningRate;
+        public float LearningRate { get; set; }
         private readonly float _momentum;
         private readonly float _weightDecay;
         private readonly bool _useNesterov;
@@ -21,7 +21,7 @@ namespace SimpleTransformer.Model
             float weightDecay = 0.0f, 
             bool useNesterov = false)
         {
-            _learningRate = learningRate;
+            LearningRate = learningRate;
             _momentum = momentum;
             _weightDecay = weightDecay;
             _useNesterov = useNesterov;
@@ -29,6 +29,7 @@ namespace SimpleTransformer.Model
 
         public void Step(IEnumerable<TrainableParameter> parameters)
         {
+            float lr = LearningRate;
             foreach (var param in parameters)
             {
                 if (param?.Value?.Data == null || param?.Gradient?.Data == null)
@@ -40,7 +41,7 @@ namespace SimpleTransformer.Model
                 // Vanilla SGD path (no momentum buffers needed)
                 if (_momentum == 0.0f && _weightDecay == 0.0f)
                 {
-                    UpdateParametersVanillaSimd(values, gradients, _learningRate);
+                    UpdateParametersVanillaSimd(values, gradients, lr);
                     continue;
                 }
 
@@ -57,7 +58,7 @@ namespace SimpleTransformer.Model
                     values, 
                     gradients, 
                     velocity, 
-                    _learningRate, 
+                    lr, 
                     _momentum, 
                     _weightDecay, 
                     _useNesterov);

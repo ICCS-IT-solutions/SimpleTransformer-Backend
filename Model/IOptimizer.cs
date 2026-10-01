@@ -1,23 +1,13 @@
-using System.Reflection.Metadata;
-
 namespace SimpleTransformer.Model
 {
     public interface IOptimizer
     {
+        /// <summary>
+        /// Current learning rate. Owned per-step by the LR scheduler
+        /// (<see cref="LRScheduler"/>); the model sets it before each step.
+        /// </summary>
+        float LearningRate { get; set; }
+
         void Step(IEnumerable<TrainableParameter> layers);
-    }
-
-    public class AdamOptimizer : IOptimizer
-    {
-        private readonly float _learningRate;
-
-        public AdamOptimizer(float learningRate)
-        {
-            _learningRate = learningRate;
-        }
-        public void Step(IEnumerable<TrainableParameter> layers)
-        {
-            
-        }
     }
 }
