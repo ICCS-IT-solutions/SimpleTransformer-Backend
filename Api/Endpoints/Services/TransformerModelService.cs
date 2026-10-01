@@ -52,6 +52,47 @@ namespace SimpleTransformer.Api.Endpoints.Services
             };
         }
 
+        public async Task<ApiResponse<TransformerModelResponse>> DeleteModel(Guid modelId)
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync();
+            var model = await db.TransformerModels.FirstOrDefaultAsync(x => x.EntryId == modelId);
+
+            if (model == null)
+            {
+                return new ApiResponse<TransformerModelResponse>()
+                {
+                    Message = "Model not found in database.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 404
+                };
+            }
+
+            if (model.IsLoaded)
+            {
+                return new ApiResponse<TransformerModelResponse>()
+                {
+                    Message = "Unload the model before deleting it.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            db.TransformerModels.Remove(model);
+            await db.SaveChangesAsync();
+
+            return new ApiResponse<TransformerModelResponse>()
+            {
+                Message = "Model deleted successfully.",
+                Status = ResponseStatus.Success,
+                StatusCode = 200,
+                Data = new TransformerModelResponse
+                {
+                    Message = "Model deleted successfully.",
+                    Status = InteractionStatus.Success
+                }
+            };
+        }
+
         public async Task<ApiResponse<TransformerModelResponse>> GetModels()
         {
             await using var db = await _dbFactory.CreateDbContextAsync();

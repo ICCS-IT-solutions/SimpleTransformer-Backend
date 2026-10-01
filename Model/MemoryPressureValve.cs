@@ -46,6 +46,14 @@ namespace SimpleTransformer.Model
         /// </summary>
         public readonly long PrivateBytes;
 
+        /// <summary>
+        /// Process.WorkingSet64: the part of the private bytes actually
+        /// resident in physical RAM. Reported alongside PrivateBytes because
+        /// committed memory can sit paged out, so the UI can distinguish
+        /// "reserved" from "resident" for this process.
+        /// </summary>
+        public readonly long WorkingSetBytes;
+
         /// <summary>Managed heap size as last known to the GC. No forced collection.</summary>
         public readonly long ManagedHeapBytes;
 
@@ -83,9 +91,11 @@ namespace SimpleTransformer.Model
             long managedHeapBytes,
             long physicalBytes,
             long quotaBytes,
-            long systemUsedBytes = -1)
+            long systemUsedBytes = -1,
+            long workingSetBytes = 0)
         {
             PrivateBytes = privateBytes;
+            WorkingSetBytes = workingSetBytes;
             ManagedHeapBytes = managedHeapBytes;
             PhysicalBytes = physicalBytes;
             QuotaBytes = quotaBytes;
@@ -218,13 +228,17 @@ namespace SimpleTransformer.Model
             long systemUsed = gcInfo.MemoryLoadBytes;
             long managed = GC.GetTotalMemory(forceFullCollection: false);
             long privateBytes = 0;
+            long workingSet = 0;
 
             if (_process != null)
             {
                 try
                 {
+                    //One Refresh() backs both readings - WorkingSet64 is served
+                    //from the same cached snapshot as PrivateMemorySize64.
                     _process.Refresh();
                     privateBytes = _process.PrivateMemorySize64;
+                    workingSet = _process.WorkingSet64;
                 }
                 catch (Exception)
                 {
@@ -232,6 +246,7 @@ namespace SimpleTransformer.Model
                     // Degrade to a managed-heap-only reading rather than
                     // throwing out of a training step.
                     privateBytes = 0;
+                    workingSet = 0;
                 }
             }
 
@@ -246,7 +261,27 @@ namespace SimpleTransformer.Model
                     MemoryPressureSettings.MaxQuotaBytes,
                     MemoryPressureSettings.MinQuotaBytes,
                     physical),
-                systemUsed);
+                systemUsed,
+                workingSet);
+        }
+
+        /// <summary>
+        /// Re-samples into <c>_lastSample</c> so telemetry describes the
+        /// present rather than the valve's last training-step evaluation.
+        /// Called by <c>DescribeMemoryPressure</c>: a freshly loaded model has
+        /// never ticked, and its default sample would otherwise report
+        /// "no memory container reported". Cheap (a couple of syscalls) and
+        /// thread-safe via the same gate as <c>Reset</c>.
+        /// </summary>
+        public void RefreshSample()
+        {
+            if (!MemoryPressureSettings.Enabled)
+                return;
+
+            lock (_gate)
+            {
+                _lastSample = Sample();
+            }
         }
 
         /// <summary>

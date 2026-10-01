@@ -753,6 +753,12 @@ namespace SimpleTransformer.Model
             if (!MemoryPressureSettings.Enabled)
                 return "memory valve off";
 
+            //A freshly loaded model's valve has never evaluated, so its last
+            //sample would be the default (unusable) struct and Describe would
+            //read "no memory container reported"; refresh so status endpoints
+            //and logs describe the machine as it is now.
+            _memoryValve.RefreshSample();
+
             const double mib = 1024.0 * 1024.0;
             return $"{_memoryValve.Describe()}; " +
                    $"activation pool {_workspace.RetainedBytes / mib:F0} MiB " +

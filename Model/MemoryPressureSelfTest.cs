@@ -357,6 +357,10 @@ namespace SimpleTransformer.Model
                 Check("system reading covers at least this process",
                     sample.SystemUsedBytes >= sample.PrivateBytes || sample.SystemUsedBytes <= 0,
                     $"{sample.SystemUsedBytes / (double)Mib:F0} MiB system vs {sample.PrivateBytes / (double)Mib:F0} MiB proc");
+                Check("working set is sane and resident-bounded",
+                    sample.WorkingSetBytes >= 0 &&
+                    sample.WorkingSetBytes <= sample.PhysicalBytes,
+                    $"{sample.WorkingSetBytes / (double)Mib:F0} MiB resident vs {sample.PrivateBytes / (double)Mib:F0} MiB private");
 
                 Console.WriteLine();
                 Console.WriteLine($"  valve telemetry: {valve.Describe()}");

@@ -27,6 +27,13 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
             return await _transformerModelService.GetModel(modelId);
         }
 
+        
+        [HttpPost("api/v1/models/{modelId}/delete")] 
+        public async Task<ApiResponse<TransformerModelResponse>> DeleteModel([FromRoute] Guid modelId)
+        {
+            return await _transformerModelService.DeleteModel(modelId);
+        }
+
         [HttpGet("api/v1/models/list")] 
         public async Task<ApiResponse<TransformerModelResponse>> GetModels()
         {

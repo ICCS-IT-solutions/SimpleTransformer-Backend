@@ -53,10 +53,13 @@ namespace SimpleTransformer.Api.Endpoints.Controllers
                     host = new
                     {
                         sample.PrivateBytes,
+                        sample.WorkingSetBytes,
                         sample.ManagedHeapBytes,
                         sample.PhysicalBytes,
                         sample.QuotaBytes,
-                        usedPercent = Math.Round(sample.EffectiveFraction * 100.0, 1),
+                        //The valve gates on max(proc, sys); the Process line is
+                        //the process share alone, so the two are distinct figures.
+                        usedPercent = Math.Round(sample.UsedFraction * 100.0, 1),
                         systemUsedPercent = Math.Round(sample.SystemUsedFraction * 100.0, 1),
                         availableMiB = Math.Round(sample.PhysicalBytes / mib, 0)
                     }
