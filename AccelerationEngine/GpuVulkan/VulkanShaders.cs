@@ -145,6 +145,10 @@ void main() {
     for (uint c = 0u; c < p.cols; c++) {
         uint i = r * p.cols + c;
         float v = x[i];
+        // Saturate extreme inputs (host SIMD does the same).
+        if (isnan(v)) { continue; }
+        if (v >= 12.0) { x[i] = v; continue; }
+        if (v <= -12.0) { x[i] = 0.0; continue; }
         float t = tanh(0.7978845608 * (v + 0.044715 * v * v * v));
         x[i] = 0.5 * v * (1.0 + t);
     }
@@ -161,6 +165,11 @@ void main() {
     for (uint c = 0u; c < p.cols; c++) {
         uint i = row * p.cols + c;
         float v = a[i];
+        // Saturate extreme inputs (host SIMD does the same): avoids v^3
+        // overflow (Inf) which then yields NaN via 0.5*v*(1+tanh(Inf)).
+        if (isnan(v)) { r[i] = v; continue; }
+        if (v >= 12.0) { r[i] = v; continue; }
+        if (v <= -12.0) { r[i] = 0.0; continue; }
         float t = tanh(0.7978845608 * (v + 0.044715 * v * v * v));
         r[i] = 0.5 * v * (1.0 + t);
     }

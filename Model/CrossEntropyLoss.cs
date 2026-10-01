@@ -84,11 +84,19 @@ namespace SimpleTransformer.Model
 
                 ReadOnlySpan<float> rowLogits = predData.Slice(r * cols, cols);
 
-                // Safe Max Calculation ignoring -Inf
+                // Safe Max Calculation ignoring -Inf. +Inf/NaN poison the
+                // exp/sum chain below (val - +Inf = NaN), so detect them here
+                // where the row/token context is available for the message.
                 float maxVal = float.MinValue;
                 for (int c = 0; c < cols; c++)
                 {
                     float v = rowLogits[c];
+                    if (float.IsNaN(v))
+                        throw new InvalidOperationException(
+                            $"CrossEntropyLoss: NaN logit at row {r} (target {tokenId}). Failing fast instead of emitting NaN loss.");
+                    if (float.IsPositiveInfinity(v))
+                        throw new InvalidOperationException(
+                            $"CrossEntropyLoss: +Inf logit at row {r} (target {tokenId}). Model diverged upstream (logits overflowed).");
                     if (!float.IsNegativeInfinity(v) && v > maxVal)
                         maxVal = v;
                 }
@@ -187,11 +195,18 @@ namespace SimpleTransformer.Model
 
                 ReadOnlySpan<float> rowLogits = predData.Slice(r * cols, cols);
 
-                // Robust max-finding ignoring -Inf logits
+                // Robust max-finding ignoring -Inf logits. +Inf/NaN would make
+                // Exp(val - maxVal) = NaN downstream; fail fast instead.
                 float maxVal = float.MinValue;
                 for (int c = 0; c < cols; c++)
                 {
                     float v = rowLogits[c];
+                    if (float.IsNaN(v))
+                        throw new InvalidOperationException(
+                            $"CrossEntropyLoss backward: NaN logit at row {r} (target {tokenId}).");
+                    if (float.IsPositiveInfinity(v))
+                        throw new InvalidOperationException(
+                            $"CrossEntropyLoss backward: +Inf logit at row {r} (target {tokenId}).");
                     if (!float.IsNegativeInfinity(v) && v > maxVal)
                         maxVal = v;
                 }

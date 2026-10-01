@@ -434,6 +434,11 @@ namespace SimpleTransformer.Model.Extensions
             {
                 float x = data[i];
 
+                // Saturate extreme inputs (see TensorMathSimd.GeluInto).
+                if (float.IsNaN(x)) { data[i] = float.NaN; continue; }
+                if (x >= 12f) { data[i] = x; continue; }
+                if (x <= -12f) { data[i] = 0f; continue; }
+
                 float x2 = x * x;
                 float x3 = x2 * x;
 

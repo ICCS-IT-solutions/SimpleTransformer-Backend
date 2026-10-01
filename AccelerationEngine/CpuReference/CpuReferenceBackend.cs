@@ -177,6 +177,12 @@ namespace SimpleTransformer.AccelerationEngine.CpuReference
 
         private static float Gelu(float value)
         {
+            // Saturate extreme inputs (see TensorMathSimd.GeluInto): for
+            // |x| >= 12 the tanh term is +/-1 to float precision, so
+            // GELU(x) = x (x>0) or 0 (x<0). NaN propagates for diagnostics.
+            if (float.IsNaN(value)) return float.NaN;
+            if (value >= 12f) return value;
+            if (value <= -12f) return 0f;
             float x2 = value * value;
             float x3 = x2 * value;
             float u = Sqrt2OverPi * (value + GeluC * x3);

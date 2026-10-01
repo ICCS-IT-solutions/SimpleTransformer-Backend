@@ -505,6 +505,14 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             Vector<float> vOne = new Vector<float>(1.0f);
             Vector<float> vC0 = new Vector<float>(C0);
             Vector<float> vC1 = new Vector<float>(C1);
+            // Saturation threshold: for |x| >= 12 the tanh term is +/-1 to
+            // float precision, so GELU(x) = x (x>0) or 0 (x<0). Branching
+            // avoids x^3 overflow (Inf) which poisons the tanh approximation
+            // into Inf/Inf = NaN (scalar MathF.Tanh(Inf) = 1 stays finite,
+            // hiding the divergence until this vector path emits NaN).
+            Vector<float> vLim = new Vector<float>(12.0f);
+            Vector<float> vNegLim = new Vector<float>(-12.0f);
+            Vector<float> vZero = Vector<float>.Zero;
 
             // 1. Vectorized Loop (Processes 8/16 floats at a time)
             int simdLim = srcSpan.Length - vectorSize;
@@ -512,15 +520,33 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             {
                 Vector<float> x = new Vector<float>(srcSpan.Slice(i, vectorSize));
 
-                // inner = C1 * (x + C0 * x^3)
-                Vector<float> x3 = x * x * x;
-                Vector<float> inner = vC1 * (x + vC0 * x3);
+                // NaN mask first: Vector.Max seen below follows x86 maxps
+                // semantics (returns the second operand when either is NaN),
+                // so NaN would be clamped to -12 and silently become 0.
+                // Capture it up front and re-inject NaN at the end.
+                Vector<int> nanMask = Vector.OnesComplement(Vector.Equals(x, x));
+
+                // Clamp into the approximation's valid range before cubing.
+                Vector<float> xc = Vector.Min(Vector.Max(x, vNegLim), vLim);
+
+                // inner = C1 * (xc + C0 * xc^3)
+                Vector<float> x3 = xc * xc * xc;
+                Vector<float> inner = vC1 * (xc + vC0 * x3);
 
                 // Vectorized Tanh approximation or component evaluation
                 Vector<float> tanhVal = VectorTanh(inner);
 
-                // res = 0.5 * x * (1.0 + tanhVal)
-                Vector<float> res = vHalf * x * (vOne + tanhVal);
+                // res = 0.5 * xc * (1.0 + tanhVal)
+                Vector<float> res = vHalf * xc * (vOne + tanhVal);
+
+                // Saturate: x >= 12 -> x (also +Inf), x <= -12 -> 0 (-Inf -> 0).
+                res = Vector.ConditionalSelect(
+                    Vector.GreaterThanOrEqual(x, vLim), x,
+                    Vector.ConditionalSelect(
+                        Vector.LessThanOrEqual(x, vNegLim), vZero, res));
+
+                // Re-inject NaN lanes so non-finite inputs stay fail-fast.
+                res = Vector.ConditionalSelect(nanMask, x, res);
 
                 res.CopyTo(dstSpan.Slice(i, vectorSize));
             }
@@ -529,6 +555,9 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             for (; i < srcSpan.Length; i++)
             {
                 float x = srcSpan[i];
+                if (float.IsNaN(x)) { dstSpan[i] = float.NaN; continue; }
+                if (x >= 12f) { dstSpan[i] = x; continue; }
+                if (x <= -12f) { dstSpan[i] = 0f; continue; }
                 float inner = C1 * (x + C0 * x * x * x);
                 dstSpan[i] = 0.5f * x * (1.0f + MathF.Tanh(inner));
             }
@@ -559,6 +588,10 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             var one = new Vector<float>(1f);
             var c = new Vector<float>(0.044715f);
             var s = new Vector<float>(0.7978845608f);
+            // Saturation threshold (see GeluInto): avoids x^3 overflow -> NaN.
+            var lim = new Vector<float>(12.0f);
+            var negLim = new Vector<float>(-12.0f);
+            var zero = Vector<float>.Zero;
 
             // Pin memory reference to completely eliminate bounds checking and slicing overhead
             ref float pData = ref MemoryMarshal.GetReference(data);
@@ -570,8 +603,13 @@ namespace SimpleTransformer.Model.Extensions.Numerics
                 // Vectorized load straight from the memory address
                 Vector<float> x = Vector.LoadUnsafe(ref pData, (uint)i);
 
-                Vector<float> x3 = x * x * x;
-                Vector<float> u = s * (x + c * x3);
+                // NaN mask first (x86 maxps returns the 2nd operand on NaN,
+                // so the clamp below would silently turn NaN into 0).
+                Vector<int> nanMask = Vector.OnesComplement(Vector.Equals(x, x));
+
+                Vector<float> xc = Vector.Min(Vector.Max(x, negLim), lim);
+                Vector<float> x3 = xc * xc * xc;
+                Vector<float> u = s * (xc + c * x3);
 
                 // --- ZERO-ALLOCATION SIMD TANH APPROXIMATION ---
                 // Tanh(u) ≈ sgn(u) * (1 - 1 / (1 + |u| + u^2 + 0.5857 * |u|^3))
@@ -589,7 +627,16 @@ namespace SimpleTransformer.Model.Extensions.Numerics
                 // ------------------------------------------------
 
                 // Final GELU combination step
-                Vector<float> result = half * x * (one + approxTanh);
+                Vector<float> result = half * xc * (one + approxTanh);
+
+                // Saturate extreme lanes: x >= 12 -> x, x <= -12 -> 0.
+                result = Vector.ConditionalSelect(
+                    Vector.GreaterThanOrEqual(x, lim), x,
+                    Vector.ConditionalSelect(
+                        Vector.LessThanOrEqual(x, negLim), zero, result));
+
+                // Re-inject NaN lanes so non-finite inputs stay fail-fast.
+                result = Vector.ConditionalSelect(nanMask, x, result);
 
                 // Direct memory store back into the tensor buffer
                 Vector.StoreUnsafe(result, ref pData, (uint)i);
@@ -600,6 +647,9 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             {
                 ref float xRef = ref Unsafe.Add(ref pData, i);
                 float x = xRef;
+                if (float.IsNaN(x)) { xRef = float.NaN; continue; }
+                if (x >= 12f) { xRef = x; continue; }
+                if (x <= -12f) { xRef = 0f; continue; }
                 float u = 0.7978845608f * (x + 0.044715f * x * x * x);
                 xRef = 0.5f * x * (1f + MathF.Tanh(u));
             }

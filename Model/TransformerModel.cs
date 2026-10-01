@@ -587,6 +587,13 @@ namespace SimpleTransformer.Model
                 // 2. Compute Loss & Initial Backprop Gradient
                 tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 float loss = _loss.Forward(prediction, expectedOutputs);
+                // A non-finite loss means activations already diverged (logits
+                // overflowed to Inf/NaN upstream). Failing here preserves the
+                // last good optimizer state instead of backpropping NaN into
+                // every parameter.
+                if (!float.IsFinite(loss))
+                    throw new InvalidOperationException(
+                        $"Non-finite loss {loss} detected during training. Model diverged upstream (logits overflowed); check learning rate and gradient clipping.");
                 gradient = _loss.Backward(prediction, expectedOutputs);
                 if (profiling) stepProfile.MarkLossBackward(Stopwatch.GetTimestamp() - tPhase);
 
@@ -604,8 +611,23 @@ namespace SimpleTransformer.Model
                 if (profiling) stepProfile.MarkModelBackward(Stopwatch.GetTimestamp() - tPhase);
 
                 // 4. Clip ALL parameter gradients globally + NaN validation.
+                // Honor the configured norm (default 1.0); the previous
+                // hardcoded constant ignored TrainingConfig.MaxGradientNorm.
+                // A non-positive setting disables clipping for this step.
                 tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
-                ClipGradients(1.0f);
+                float gradNorm = TrainingConfig.MaxGradientNorm > 0f
+                    ? ClipGradients(TrainingConfig.MaxGradientNorm)
+                    : ClipGradients(float.PositiveInfinity);
+
+                // Non-finite norm (NaN/Inf grads from an overflowed step) makes
+                // every scale factor NaN; stepping would poison all weights.
+                // Skip the step and keep last good weights instead.
+                if (!float.IsFinite(gradNorm))
+                {
+                    Log.Warning("[TrainStep] Non-finite gradient norm detected - skipping optimizer step to preserve last good weights.");
+                    ZeroGradients();
+                    return float.NaN;
+                }
 
                 // 5. Verify no gradients contain NaN before updating weights
                 foreach (var p in Parameters)
@@ -999,20 +1021,25 @@ namespace SimpleTransformer.Model
         {
             double sumSquaredNorm = 0.0;
 
-            // 1. Accumulate squared gradients across ALL trainable parameters
+            // 1. Accumulate squared gradients across ALL trainable parameters.
+            // A single NaN/Inf gradient makes (g*g) NaN/Inf; without an explicit
+            // finite check below, `NaN > maxNorm` is false so clipping is
+            // silently skipped and the optimizer poisons every weight.
             foreach (var param in Parameters)
             {
                 if (param.Gradient == null) continue;
-                
+
                 ReadOnlySpan<float> gData = param.Gradient.Data.AsSpan();
                 for (int i = 0; i < gData.Length; i++)
                 {
                     float g = gData[i];
-                    sumSquaredNorm += g * g;
+                    if (!float.IsFinite(g))
+                        return float.NaN;
+                    sumSquaredNorm += (double)g * g;
                 }
             }
 
-            float totalNorm = MathF.Sqrt((float)sumSquaredNorm);
+            float totalNorm = (float)Math.Sqrt(sumSquaredNorm);
 
             // 2. Scale gradients if global norm exceeds maxNorm
             if (totalNorm > maxNorm)
