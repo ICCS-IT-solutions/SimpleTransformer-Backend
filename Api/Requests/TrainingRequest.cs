@@ -56,6 +56,7 @@ namespace SimpleTransformer.Api.Requests
         //When using a file, store the path here in order to pass it to the training service
         public string? InputFilePath { get; set; } = string.Empty;
         public required Guid TransformerModelId { get; set; }
+        public required Guid TrainingConfigId { get; set; }
         public Guid VocabularyId { get; set; }
         public Guid? PreviousCheckpointId { get; set; }
         public string? PreviousCheckpoint { get; set; } = string.Empty;
@@ -69,6 +70,9 @@ namespace SimpleTransformer.Api.Requests
         public List<IFormFile> TextFiles { get; set; } = new();
         public Guid? TrainingCorpusId { get; set; }
         public required Guid TransformerModelId { get; set; }
+        //Selected training configuration. Must match the model's pinned config
+        //(validated in TrainingService) so job and model never disagree.
+        public required Guid TrainingConfigId { get; set; }
         public Guid VocabularyId { get; set; }
         public Guid? PreviousCheckpointId { get; set; }
         public string? PreviousCheckpoint { get; set; } = string.Empty;

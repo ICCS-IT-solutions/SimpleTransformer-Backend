@@ -40,6 +40,37 @@ namespace SimpleTransformer.Api.Endpoints.Services
             _jobManager = jobManager;
         }
 
+        //Validate-only policy: the job must reference the training config the
+        //model is pinned to. The model is factory-built from that config while
+        //the training loop would read the job's config, so anything else would
+        //be refused by the config-match guard at start; fail fast at creation.
+        private static ApiResponse<TrainingResponse>? ValidateRequestedTrainingConfig(
+            Guid requestedConfigId,
+            TransformerModelEntry modelEntry)
+        {
+            if (requestedConfigId == Guid.Empty)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "Training config id must be provided.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            if (requestedConfigId != modelEntry.TrainingConfigId)
+            {
+                return new ApiResponse<TrainingResponse>
+                {
+                    Message = "Selected training config does not match the model's pinned training config. Update the model's config first.",
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 400
+                };
+            }
+
+            return null;
+        }
+
         public async Task<ApiResponse<TrainingResponse>> CreateJob(TrainingRequest req)
         {
             await using var db = await _dbFactory.CreateDbContextAsync();
@@ -53,6 +84,15 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     Status = ResponseStatus.Failure,
                     StatusCode = 404
                 };
+            }
+
+            //The model is factory-built from its pinned training config, so a job
+            //requesting any other config would be refused at start (see the config
+            //match guard in StartTrainingJob). Reject it up front instead.
+            var configProblem = ValidateRequestedTrainingConfig(req.TrainingConfigId, modelEntry);
+            if (configProblem != null)
+            {
+                return configProblem;
             }
 
             //If the model is not loaded, training can't be done
@@ -100,7 +140,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 Name = $"Training job {DateTime.UtcNow}",
                 EntryId = Guid.NewGuid(),                
                 Status = TrainingJobStatus.Pending,
-                TrainingConfigId = modelEntry.TrainingConfigId,
+                TrainingConfigId = req.TrainingConfigId,
                 TransformerConfigId = modelEntry.TransformerConfigId,
                 TransformerModelId = modelEntry.EntryId,
                 Message = "Training job created.",
@@ -169,6 +209,14 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     Status = ResponseStatus.Failure,
                     StatusCode = 404
                 };
+            }
+
+            //Same contract as CreateJob: the job must use the model's pinned
+            //training config, so mismatched selections fail here, not at start.
+            var configProblem = ValidateRequestedTrainingConfig(req.TrainingConfigId, modelEntry);
+            if (configProblem != null)
+            {
+                return configProblem;
             }
 
             if (!modelEntry.IsLoaded)
@@ -425,7 +473,7 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 Status = TrainingJobStatus.Pending,
 
                 TransformerConfigId = modelEntry.TransformerConfigId,
-                TrainingConfigId = modelEntry.TrainingConfigId,
+                TrainingConfigId = req.TrainingConfigId,
                 TransformerModelId = modelEntry.EntryId,
                 VocabularyId = req.VocabularyId,
 
