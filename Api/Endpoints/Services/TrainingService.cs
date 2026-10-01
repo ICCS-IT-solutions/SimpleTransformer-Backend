@@ -996,12 +996,18 @@ namespace SimpleTransformer.Api.Endpoints.Services
             var config = configEntry.Config;
 
             // The model is factory-built from the MODEL's config pointer,
-            // while the loop trains with the JOB's config. If the edit-model
-            // flow repointed the model after this job was created, the two
-            // disagree - and the schedule (peak/warmup/floor) would silently
-            // come from the wrong one. Fail loudly instead of training with
-            // a config the user didn't intend.
-            if (model.TrainingConfig != config)
+            // while the loop trains with the JOB's config. Two ways they can
+            // disagree - fail loudly instead of training with a config the
+            // user didn't intend:
+            //   1. The edit-model flow repointed the model at another config
+            //      after this job was created (ids differ).
+            //   2. Same config id, but the row was edited after the model was
+            //      loaded, so the model's in-memory snapshot is stale.
+            // Compare ids and serialised values - NEVER object references:
+            // the snapshot and the freshly-read row come from different
+            // DbContext instances, so `model.TrainingConfig != config` would
+            // be true even when both sides are byte-for-byte identical.
+            if (job.TrainingConfigId != modelEntry.TrainingConfigId)
             {
                 var liveModelConfig = await db.TrainingConfigs
                     .AsNoTracking()
@@ -1012,6 +1018,21 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 return new ApiResponse<TrainingProgressResponse>
                 {
                     Message = "Training job's config no longer matches the model's current training config. Create a new job after editing the model." + detail,
+                    Status = ResponseStatus.Failure,
+                    StatusCode = 409
+                };
+            }
+
+            //Same pinned config, but its contents changed since the model was
+            //loaded. The schedule (peak/warmup/floor) would read the stale
+            //snapshot while the loop reads the fresh row; reloading the model
+            //rebuilds the snapshot from the row, so point there instead of at
+            //job creation (a new job would hit the same guard).
+            if (JsonSerializer.Serialize(model.TrainingConfig) != JsonSerializer.Serialize(config))
+            {
+                return new ApiResponse<TrainingProgressResponse>
+                {
+                    Message = "The model's training config has been edited since the model was loaded. Reload the model, then start the job again.",
                     Status = ResponseStatus.Failure,
                     StatusCode = 409
                 };
