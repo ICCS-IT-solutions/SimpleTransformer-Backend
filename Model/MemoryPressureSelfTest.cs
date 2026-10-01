@@ -191,6 +191,49 @@ namespace SimpleTransformer.Model
             }
 
             Console.WriteLine();
+            Console.WriteLine("-- Frontend reset --");
+            {
+                int savedCooldown = MemoryPressureSettings.MinCooldownSteps;
+                bool savedEnabled = MemoryPressureSettings.Enabled;
+                MemoryPressureSettings.MinCooldownSteps = 5;
+                MemoryPressureSettings.Enabled = true;
+
+                var valve = new MemoryPressureValve();
+
+                MemoryPressureSample At(double pct) =>
+                    new((long)(physical * pct / 100.0), 0, physical, physical);
+
+                // Drive the valve into the latched-and-cooling-down state a run
+                // that failed under pressure would leave behind.
+                valve.Evaluate(At(90.0));
+                Check("latched valve stays quiet inside the cooldown",
+                    valve.Evaluate(At(90.0)) == MemoryReliefLevel.None);
+
+                // The point of the reset: the next excursion after the frontend
+                // pressed the button gets the full ladder immediately.
+                valve.Reset();
+                Check("reset re-arms the ladder at once",
+                    valve.Evaluate(At(90.0)) == MemoryReliefLevel.Compact);
+
+                // Reset also clears the telemetry counters by default...
+                valve.Reset();
+                valve.Evaluate(At(50.0)); // seed a usable sample for Describe
+                Check("reset clears the relief counter",
+                    valve.Describe().Contains("0 reliefs"),
+                    valve.Describe());
+
+                // ...and can be told to keep them as the run's history.
+                valve.Evaluate(At(90.0));
+                valve.Reset(clearCounters: false);
+                Check("reset can retain the relief counter",
+                    valve.Describe().Contains("1 reliefs"),
+                    valve.Describe());
+
+                MemoryPressureSettings.MinCooldownSteps = savedCooldown;
+                MemoryPressureSettings.Enabled = savedEnabled;
+            }
+
+            Console.WriteLine();
             Console.WriteLine("-- Blocking compact gate --");
             {
                 MemoryPressureSettings.AllowBlockingCompact = false;

@@ -761,6 +761,48 @@ namespace SimpleTransformer.Model
         }
 
         /// <summary>
+        /// Frontend-triggered recovery for the memory pressure valve (POST
+        /// api/v1/memory/reset). Two halves:
+        /// <list type="bullet">
+        /// <item>
+        /// The valve's latch, cooldown and counters are cleared, so a retry
+        /// gets the full escalation ladder instead of history from the run
+        /// that failed under pressure.
+        /// </item>
+        /// <item>
+        /// When <paramref name="relieveNow"/> is true, the same actions the
+        /// Compact rung takes happen immediately: drop idle device pools, trim
+        /// the activation pool to a quarter of what it holds, and force a
+        /// blocking, compacting gen-2 collection. The collection can stall a
+        /// running training job, which is why callers may turn it off.
+        /// </item>
+        /// </list>
+        /// Returns the refreshed <see cref="DescribeMemoryPressure"/> telemetry.
+        /// </summary>
+        public string ResetMemoryPressure(bool relieveNow = true)
+        {
+            _memoryValve.Reset();
+
+            if (!relieveNow)
+                return DescribeMemoryPressure();
+
+            const double mib = 1024.0 * 1024.0;
+
+            _workspace.Backend.TrimIdleMemory();
+
+            long before = _workspace.RetainedBytes;
+            int dropped = _workspace.TrimRetainedTo(before / 4);
+
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+
+            Log.Warning(
+                "Memory valve: manual RESET released {Dropped} pooled activations ({Before:F0} -> {After:F0} MiB) and compacted on request. {Status}",
+                dropped, before / mib, _workspace.RetainedBytes / mib, _memoryValve.Describe());
+
+            return DescribeMemoryPressure();
+        }
+
+        /// <summary>
         /// Re-uploads every trainable parameter into its existing VRAM-resident
         /// device copy. Called after in-place weight updates (optimizer step,
         /// checkpoint hydration) so the resident MatMul path never binds stale

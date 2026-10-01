@@ -637,6 +637,23 @@ public static class TrainingJobExtensions
                 job.DateCompleted = DateTime.UtcNow;
             });
         }
+        catch (OutOfMemoryException ex)
+        {
+            //OOM is the one failure the frontend has a recovery action for:
+            //the memory valve may still be latched from the excursion that
+            //killed the run, so report it distinctly and point the UI at the
+            //reset action (POST api/v1/memory/reset) instead of a generic
+            //failure the user cannot act on.
+            Log.Error(ex, "Training job {JobId} ran out of host memory.", job.EntryId);
+
+            await UpdateJob(dbFactory, job.EntryId, job =>
+            {
+                job.Status = TrainingJobStatus.Failed;
+                job.Message = "Model training failed: out of host memory. Reset the memory valve before retrying.";
+                job.Error = ex.Message;
+                job.DateCompleted = DateTime.UtcNow;
+            });
+        }
         catch (Exception ex)
         {
             //Without this a faulting loop left the job reading as Running forever.

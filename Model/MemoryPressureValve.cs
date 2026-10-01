@@ -139,6 +139,13 @@ namespace SimpleTransformer.Model
         private MemoryReliefLevel _lastRelief = MemoryReliefLevel.None;
         private MemoryPressureSample _lastSample;
 
+        // Guards the mutable bookkeeping above. The training thread is the
+        // normal writer (Tick/Evaluate), but the frontend-triggered Reset
+        // arrives on an HTTP thread while a run may be in flight, so every
+        // read-modify-write of this state goes through this one gate. Cheap:
+        // the hot path only reaches it after Tick's modulo short-circuit.
+        private readonly object _gate = new();
+
         public MemoryPressureValve()
         {
             try
@@ -154,7 +161,10 @@ namespace SimpleTransformer.Model
             }
         }
 
-        public MemoryPressureSample LastSample => _lastSample;
+        public MemoryPressureSample LastSample
+        {
+            get { lock (_gate) { return _lastSample; } }
+        }
 
         /// <summary>Resolves the configured quota into a usable ceiling, in bytes.</summary>
         public long QuotaBytes
@@ -250,10 +260,14 @@ namespace SimpleTransformer.Model
                 return MemoryReliefLevel.None;
 
             int interval = Math.Max(1, MemoryPressureSettings.CheckEveryNSteps);
-            if (++_tick % interval != 0)
-                return MemoryReliefLevel.None;
+            lock (_gate)
+            {
+                if (++_tick % interval != 0)
+                    return MemoryReliefLevel.None;
 
-            return Evaluate(Sample());
+                // Re-entrant: Evaluate takes the same gate.
+                return Evaluate(Sample());
+            }
         }
 
         /// <summary>
@@ -263,6 +277,19 @@ namespace SimpleTransformer.Model
         /// samples instead of a real heap.
         /// </summary>
         public MemoryReliefLevel Evaluate(MemoryPressureSample sample)
+        {
+            lock (_gate)
+                return EvaluateLocked(sample);
+        }
+
+        /// <summary>
+        /// The policy body behind <see cref="Evaluate"/>. Callers must hold
+        /// <see cref="_gate"/>: the frontend-triggered <c>Reset</c> mutates the
+        /// same latch and cooldown fields from an HTTP thread, so every
+        /// read-modify-write of them goes through that one lock. Split out so
+        /// the public signature (and its doc) stays stable for the self-test.
+        /// </summary>
+        private MemoryReliefLevel EvaluateLocked(MemoryPressureSample sample)
         {
             _lastSample = sample;
 
@@ -314,6 +341,42 @@ namespace SimpleTransformer.Model
         }
 
         /// <summary>
+        /// Re-arms the valve from outside the training loop (frontend trigger:
+        /// POST api/v1/memory/reset). Clears the anti-thrash latch and the
+        /// cooldown so the next excursion gets the full escalation ladder
+        /// again, rewinds the sampling cadence so the next training step
+        /// evaluates immediately, and takes a fresh sample for telemetry.
+        /// Without this, a run that failed under pressure can leave the latch
+        /// set, and a healthy retry would then run with relief suppressed.
+        /// Safe to call from an HTTP thread while a run is in flight.
+        /// </summary>
+        /// <param name="clearCounters">
+        /// True to also zero the "N reliefs" telemetry; false to keep the
+        /// history while still re-arming the latch.
+        /// </param>
+        public void Reset(bool clearCounters = true)
+        {
+            lock (_gate)
+            {
+                _latched = false;
+                _ticksSinceRelief = 0;
+
+                // Land on the last tick of the interval so the very next
+                // training step samples, instead of waiting out the rest of
+                // the CheckEveryNSteps window.
+                _tick = Math.Max(1, MemoryPressureSettings.CheckEveryNSteps) - 1;
+
+                if (clearCounters)
+                {
+                    _reliefCount = 0;
+                    _lastRelief = MemoryReliefLevel.None;
+                }
+
+                _lastSample = Sample();
+            }
+        }
+
+        /// <summary>
         /// One-line telemetry for logs and the frontend job message, in the
         /// same spirit as <c>IAccelerationBackend.DescribeMemoryUsage</c>.
         /// </summary>
@@ -321,21 +384,24 @@ namespace SimpleTransformer.Model
         {
             const double mib = 1024.0 * 1024.0;
 
-            if (!MemoryPressureSettings.Enabled)
-                return "memory valve off";
+            lock (_gate)
+            {
+                if (!MemoryPressureSettings.Enabled)
+                    return "memory valve off";
 
-            MemoryPressureSample s = _lastSample;
-            if (!s.IsUsable)
-                return "memory valve armed (no memory container reported)";
+                MemoryPressureSample s = _lastSample;
+                if (!s.IsUsable)
+                    return "memory valve armed (no memory container reported)";
 
-            string physical = s.PhysicalBytes > 0
-                ? $"{s.PhysicalBytes / mib:F0} MiB"
-                : "unknown";
+                string physical = s.PhysicalBytes > 0
+                    ? $"{s.PhysicalBytes / mib:F0} MiB"
+                    : "unknown";
 
-            return $"host {s.PrivateBytes / mib:F0} of {physical} " +
-                   $"(proc {s.UsedFraction * 100:F0}%, sys {s.SystemUsedFraction * 100:F0}%, quota {s.QuotaBytes / mib:F0} MiB), " +
-                   $"managed heap {s.ManagedHeapBytes / mib:F0} MiB, " +
-                   $"{_reliefCount} reliefs (last {_lastRelief})";
+                return $"host {s.PrivateBytes / mib:F0} of {physical} " +
+                       $"(proc {s.UsedFraction * 100:F0}%, sys {s.SystemUsedFraction * 100:F0}%, quota {s.QuotaBytes / mib:F0} MiB), " +
+                       $"managed heap {s.ManagedHeapBytes / mib:F0} MiB, " +
+                       $"{_reliefCount} reliefs (last {_lastRelief})";
+            }
         }
     }
 }
