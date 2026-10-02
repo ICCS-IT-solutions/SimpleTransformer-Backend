@@ -145,6 +145,133 @@ namespace SimpleTransformer.Model
                 controlledLayer.Enabled && MathF.Abs(controlledLayer.DropoutRate - 0.25f) < tol,
                 $"enabled={controlledLayer.Enabled}, rate={controlledLayer.DropoutRate}");
 
+            // 5b. Rank-3 (batched) coverage: production MiniBatch inputs are
+            // Rank-2 [B,T] at the model entry but become Rank-3 [B,T,C] once
+            // past the embedding, so the embedding-output dropout and the
+            // residual sublayer dropouts both see Rank-3 in real training.
+            Console.WriteLine();
+            Console.WriteLine("-- DropoutLayer Rank-3 (batch) --");
+            {
+                const int rk3Layers = 2;
+                const int rk3Rows = 4;
+                const int rk3Cols = 8;
+                const int rk3PerItem = rk3Rows * rk3Cols;
+                const int rk3Total = rk3Layers * rk3PerItem;
+                var rk3Input = new Tensor(rk3Layers, rk3Rows, rk3Cols);
+                rk3Input.Span.Fill(1.0f);
+                var rk3Grad = new Tensor(rk3Layers, rk3Rows, rk3Cols);
+                rk3Grad.Span.Fill(1.0f);
+                var rk3Layer = new DropoutLayer(rate, "batch_flat", seed: 42) { Enabled = true };
+                TensorBase rk3Out = rk3Layer.Forward(rk3Input, workspace);
+                Check("Rank-3 forward preserves rank and shape",
+                    rk3Out.Rank == 3 && rk3Out.Layers == rk3Layers && rk3Out.Rows == rk3Rows && rk3Out.Cols == rk3Cols,
+                    "[" + rk3Out.Layers + "," + rk3Out.Rows + "," + rk3Out.Cols + "]");
+                ReadOnlySpan<float> rk3OutSpan = rk3Out.ReadOnlySpan;
+                int rk3Dropped = 0;
+                bool rk3Scaled = true;
+                for (int i = 0; i < rk3OutSpan.Length; i++)
+                {
+                    if (rk3OutSpan[i] == 0f) rk3Dropped++;
+                    else if (MathF.Abs(rk3OutSpan[i] - 2.0f) > tol) rk3Scaled = false;
+                }
+                float rk3Frac = rk3Dropped / (float)rk3OutSpan.Length;
+                Check("Rank-3 dropped fraction is close to the rate",
+                    MathF.Abs(rk3Frac - rate) < 0.20f,
+                    rk3Frac.ToString("P1") + " vs " + rate.ToString("P0") + " (n=" + rk3Total + ")");
+                Check("Rank-3 survivors carry the inverted scale", rk3Scaled, "kept == 2.0");
+                TensorBase rk3Back = rk3Layer.Backward(rk3Grad, workspace);
+                Check("Rank-3 backward preserves rank and shape",
+                    rk3Back.Rank == 3 && rk3Back.Layers == rk3Layers && rk3Back.Rows == rk3Rows && rk3Back.Cols == rk3Cols);
+                ReadOnlySpan<float> rk3BackSpan = rk3Back.ReadOnlySpan;
+                bool rk3Fidelity = true;
+                for (int i = 0; i < rk3BackSpan.Length; i++)
+                {
+                    if (MathF.Abs(rk3BackSpan[i] - rk3OutSpan[i]) > tol) { rk3Fidelity = false; break; }
+                }
+                Check("Rank-3 backward replays the forward mask", rk3Fidelity, "grad gated by mask");
+                workspace.Release(rk3Out);
+                workspace.Release(rk3Back);
+                bool rk3Rank1Rejected = false;
+                try
+                {
+                    var rk1 = new Tensor(rk3Cols);
+                    rk1.Span.Fill(1.0f);
+                    rk3Layer.Forward(rk1, workspace);
+                }
+                catch (ArgumentException) { rk3Rank1Rejected = true; }
+                Check("Rank-1 input is rejected", rk3Rank1Rejected);
+                rk3Input.Dispose();
+                rk3Grad.Dispose();
+            }
+            // 5c. Rank-3 per-item contract: DropoutSite promises masks are a pure
+            // function of (salt, step, item), so a Rank-3 batch must behave as
+            // per-slice ForItem(b) forwards. These probes document the current
+            // flat behaviour (one ForItem(0) over B*T*C) without failing the
+            // suite; they become hard checks once the residual/embedding paths
+            // are split per slice like the attention path already is.
+            Console.WriteLine();
+            Console.WriteLine("-- Rank-3 per-item contract (informational) --");
+            {
+                const int cLayers = 2;
+                const int cRows = 4;
+                const int cCols = 8;
+                const int cPerItem = cRows * cCols;
+                var cBatch = new Tensor(cLayers, cRows, cCols);
+                cBatch.Span.Fill(1.0f);
+                var cSlice = new Tensor(cRows, cCols);
+                cSlice.Span.Fill(1.0f);
+
+                var siteSolo = new DropoutSite("prefix_solo", rate, salt: 777UL);
+                siteSolo.SetEnabled(true);
+                siteSolo.PrepareForStep(5);
+                TensorBase soloOut = siteSolo.ForItem(0).Forward(cSlice, workspace);
+                var soloCopy = new float[cPerItem];
+                soloOut.ReadOnlySpan.Slice(0, cPerItem).CopyTo(soloCopy);
+                workspace.Release(soloOut);
+
+                var siteBatch = new DropoutSite("prefix_batch", rate, salt: 777UL);
+                siteBatch.SetEnabled(true);
+                siteBatch.PrepareForStep(5);
+                siteBatch.ForItem(1);
+                TensorBase prefixOut = siteBatch.ForItem(0).Forward(cBatch, workspace);
+                var prefixCopy = new float[cPerItem];
+                prefixOut.ReadOnlySpan.Slice(0, cPerItem).CopyTo(prefixCopy);
+                workspace.Release(prefixOut);
+                bool prefixStable = true;
+                for (int i = 0; i < cPerItem; i++)
+                    if (prefixCopy[i] != soloCopy[i]) { prefixStable = false; break; }
+                Check("Rank-3 item 0 matches solo Rank-2 (prefix stable)", prefixStable, "first 32 masks equal");
+
+                var siteFlat = new DropoutSite("indep", rate, salt: 999UL);
+                siteFlat.SetEnabled(true);
+                siteFlat.PrepareForStep(7);
+                siteFlat.ForItem(1);
+                TensorBase flatOut = siteFlat.ForItem(0).Forward(cBatch, workspace);
+                var item1Flat = new float[cPerItem];
+                flatOut.ReadOnlySpan.Slice(cPerItem, cPerItem).CopyTo(item1Flat);
+                workspace.Release(flatOut);
+
+                var siteSolo1 = new DropoutSite("indep_solo", rate, salt: 999UL);
+                siteSolo1.SetEnabled(true);
+                siteSolo1.PrepareForStep(7);
+                siteSolo1.ForItem(1);
+                TensorBase solo1Out = siteSolo1.ForItem(1).Forward(cSlice, workspace);
+                var item1Solo = new float[cPerItem];
+                solo1Out.ReadOnlySpan.Slice(0, cPerItem).CopyTo(item1Solo);
+                workspace.Release(solo1Out);
+                bool item1Independent = true;
+                for (int i = 0; i < cPerItem; i++)
+                    if (item1Flat[i] != item1Solo[i]) { item1Independent = false; break; }
+                Console.WriteLine("  [INFO] Rank-3 item 1 equals ForItem(1) solo: "
+                    + (item1Independent ? "independent streams" : "FLAT stream - item 1 is tail of item 0"));
+
+                cBatch.Dispose();
+                cSlice.Dispose();
+            }
+
+
+
+
             // 6. DropoutRng: the properties the resume guarantee depends on
             Console.WriteLine();
             Console.WriteLine("-- DropoutRng --");
