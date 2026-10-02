@@ -27,8 +27,25 @@ namespace SimpleTransformer.Model
         {
             return prediction.Rank switch
             {
-                2 => BackwardSequence(prediction, target),
-                3 => BackwardBatch(prediction, target),
+                2 => BackwardSequenceOffPool(prediction, target),
+                3 => BackwardBatchOffPool(prediction, target),
+                _ => throw new ArgumentException("Prediction must be rank 2 or rank 3.")
+            };
+        }
+
+        /// <summary>
+        /// Workspace-pooled backward: borrows the gradient from the pool instead
+        /// of `new Tensor(...)`, so a training step allocates nothing here. The
+        /// caller (TrainStep's finally-Reset) reclaims it with the rest of the
+        /// step's activations.
+        /// </summary>
+        public TensorBase Backward(TensorBase prediction, TensorBase target, TensorWorkspace workspace)
+        {
+            ArgumentNullException.ThrowIfNull(workspace);
+            return prediction.Rank switch
+            {
+                2 => BackwardSequence(prediction, target, workspace),
+                3 => BackwardBatch(prediction, target, workspace),
                 _ => throw new ArgumentException("Prediction must be rank 2 or rank 3.")
             };
         }
@@ -129,7 +146,7 @@ namespace SimpleTransformer.Model
             return (totalLoss, validTokens);
         }
 
-        private TensorBase BackwardBatch(TensorBase prediction, TensorBase target)
+        private TensorBase BackwardBatchOffPool(TensorBase prediction, TensorBase target)
         {
             TensorUtilitiesSimd.ValidatePredictionAndTarget(prediction, target);
             TensorBase gradient = new Tensor(prediction.Layers, prediction.Rows, prediction.Cols);
@@ -149,17 +166,45 @@ namespace SimpleTransformer.Model
             {
                 TensorBase predictionSlice = TensorUtilitiesSimd.GetLayer(prediction, batch);
                 TensorBase targetSlice = TensorUtilitiesSimd.GetRow(target, batch);
+                TensorBase gradSlice = TensorUtilitiesSimd.GetLayer(gradient, batch);
 
-                TensorBase gradSlice = BackwardSequenceInternal(predictionSlice, targetSlice, scale);
-                TensorUtilitiesSimd.SetLayer(gradient, batch, gradSlice);
+                BackwardSequenceInto(predictionSlice, targetSlice, gradSlice, scale);
             }
 
             return gradient;
         }
 
-        private TensorBase BackwardSequence(TensorBase prediction, TensorBase target)
+        private TensorBase BackwardBatch(TensorBase prediction, TensorBase target, TensorWorkspace workspace)
         {
-            ReadOnlySpan<float> targetData = target.Data.AsSpan();
+            TensorUtilitiesSimd.ValidatePredictionAndTarget(prediction, target);
+            // Borrowed (already cleared by the pool): fully overwritten below.
+            TensorBase gradient = workspace.BorrowLike(prediction);
+
+            ReadOnlySpan<float> targetData = target.ReadOnlySpan;
+            int totalValidTokens = 0;
+            for (int i = 0; i < targetData.Length; i++)
+            {
+                if ((int)targetData[i] != _ignoreIndex)
+                    totalValidTokens++;
+            }
+
+            float scale = totalValidTokens > 0 ? 1f / totalValidTokens : 0f;
+
+            for (int batch = 0; batch < prediction.Layers; batch++)
+            {
+                TensorBase predictionSlice = TensorUtilitiesSimd.GetLayer(prediction, batch);
+                TensorBase targetSlice = TensorUtilitiesSimd.GetRow(target, batch);
+                TensorBase gradSlice = TensorUtilitiesSimd.GetLayer(gradient, batch);
+
+                BackwardSequenceInto(predictionSlice, targetSlice, gradSlice, scale);
+            }
+
+            return gradient;
+        }
+
+        private TensorBase BackwardSequence(TensorBase prediction, TensorBase target, TensorWorkspace workspace)
+        {
+            ReadOnlySpan<float> targetData = target.ReadOnlySpan;
             int validTokens = 0;
             for (int i = 0; i < targetData.Length; i++)
             {
@@ -168,39 +213,51 @@ namespace SimpleTransformer.Model
             }
 
             float scale = validTokens > 0 ? 1f / validTokens : 0f;
-            return BackwardSequenceInternal(prediction, target, scale);
+            // Borrowed (already cleared by the pool): fully overwritten below.
+            TensorBase gradient = workspace.BorrowLike(prediction);
+            BackwardSequenceInto(prediction, target, gradient, scale);
+            return gradient;
         }
 
-        private TensorBase BackwardSequenceInternal(TensorBase prediction, TensorBase target, float scale)
+        /// <summary>
+        /// Writes the softmax-cross-entropy gradient into a caller-provided
+        /// buffer. Stride-aware: rows are addressed through Offset/Stride so
+        /// pooled buffers and TensorView slices work, not just owned Tensors.
+        /// Every row is fully written (ignored rows are zeroed), so callers may
+        /// pass a borrowed buffer without pre-clearing.
+        /// </summary>
+        private void BackwardSequenceInto(TensorBase prediction, TensorBase target, TensorBase gradient, float scale)
         {
             TensorUtilitiesSimd.ValidatePredictionAndTarget(prediction, target);
 
             int rows = prediction.Rows;
             int cols = prediction.Cols;
 
-            TensorBase gradient = new Tensor(rows, cols);
-
-            ReadOnlySpan<float> predData = prediction.Data.AsSpan();
-            ReadOnlySpan<float> targetData = target.Data.AsSpan();
-            Span<float> gradData = gradient.Data.AsSpan();
+            ReadOnlySpan<float> predBuffer = prediction.Buffer.AsSpan();
+            ReadOnlySpan<float> targetBuffer = target.Buffer.AsSpan();
+            Span<float> gradBuffer = gradient.Buffer.AsSpan();
 
             for (int r = 0; r < rows; r++)
             {
-                int tokenId = (int)targetData[r];
-                Span<float> rowGrad = gradData.Slice(r * cols, cols);
+                int predRowOffset = prediction.Offset + r * prediction.Stride;
+                int gradRowOffset = gradient.Offset + r * gradient.Stride;
+                // Target is Rank-1 (sequence: Stride == 1, Offset == 0) or a
+                // Rank-2 row view from GetRow (length Cols, Stride == Cols,
+                // Offset == row * parent.Stride): logical index r maps to
+                // Offset + r for both, NOT Offset + r * Stride.
+                int tokenId = (int)targetBuffer[target.Offset + r];
 
-                // If token is padding/ignored, leave gradient row as 0s
+                // Padding/ignored rows contribute nothing: zero the row.
                 if (tokenId == _ignoreIndex)
+                {
+                    gradBuffer.Slice(gradRowOffset, cols).Clear();
                     continue;
+                }
 
-                ReadOnlySpan<float> rowLogits = predData.Slice(r * cols, cols);
-
-                // Robust max-finding ignoring -Inf logits. +Inf/NaN would make
-                // Exp(val - maxVal) = NaN downstream; fail fast instead.
                 float maxVal = float.MinValue;
                 for (int c = 0; c < cols; c++)
                 {
-                    float v = rowLogits[c];
+                    float v = predBuffer[predRowOffset + c];
                     if (float.IsNaN(v))
                         throw new InvalidOperationException(
                             $"CrossEntropyLoss backward: NaN logit at row {r} (target {tokenId}).");
@@ -215,38 +272,46 @@ namespace SimpleTransformer.Model
                 float sumExp = 0f;
                 for (int c = 0; c < cols; c++)
                 {
-                    float val = rowLogits[c];
+                    float val = predBuffer[predRowOffset + c];
                     if (float.IsNegativeInfinity(val) || val <= -1e20f)
                     {
-                        rowGrad[c] = 0f;
+                        gradBuffer[gradRowOffset + c] = 0f;
                         continue;
                     }
 
                     float p = MathF.Exp(val - maxVal);
-                    rowGrad[c] = p;
+                    gradBuffer[gradRowOffset + c] = p;
                     sumExp += p;
                 }
 
                 float invSum = sumExp > 0f ? 1f / sumExp : 0f;
 
                 for (int c = 0; c < cols; c++)
-                {
-                    if (rowGrad[c] != 0f)
-                    {
-                        rowGrad[c] *= invSum;
-                    }
-                }
+                    gradBuffer[gradRowOffset + c] *= invSum;
 
-                // dL/dz = (p_i - 1) for target class
-                rowGrad[tokenId] -= 1f;
+                // dL/dz = (p_i - 1) for target class, scaled by 1/N_valid.
+                gradBuffer[gradRowOffset + tokenId] -= 1f;
 
-                // Scale by 1 / N_valid_tokens across batch
                 for (int c = 0; c < cols; c++)
-                {
-                    rowGrad[c] *= scale;
-                }
+                    gradBuffer[gradRowOffset + c] *= scale;
+            }
+        }
+
+        private TensorBase BackwardSequenceOffPool(TensorBase prediction, TensorBase target)
+        {
+            ReadOnlySpan<float> targetData = target.Data.AsSpan();
+            int validTokens = 0;
+            for (int i = 0; i < targetData.Length; i++)
+            {
+                if ((int)targetData[i] != _ignoreIndex)
+                    validTokens++;
             }
 
+            float scale = validTokens > 0 ? 1f / validTokens : 0f;
+            // Legacy off-pool path: kept for the interface default and any
+            // non-training callers. Training uses the workspace overload.
+            var gradient = new Tensor(prediction.Rows, prediction.Cols);
+            BackwardSequenceInto(prediction, target, gradient, scale);
             return gradient;
         }
     }

@@ -259,76 +259,147 @@ namespace SimpleTransformer.Model
                     dropoutControl.CollectDropoutSites(_dropoutSites);
             }
         }
+
+        /// <summary>
+        /// Embedding-output dropout split per batch item so each mask is a pure
+        /// function of (salt, step, item). Rank-2 (single sequence) uses item 0;
+        /// Rank-3 applies ForItem(b) per slice like the attention path.
+        /// </summary>
+        private TensorBase ApplyEmbeddingDropout(TensorBase input, TensorWorkspace workspace)
+        {
+            if (input.Rank == 2)
+                return _embeddingDropout.ForItem(0).Forward(input, workspace);
+
+            if (input.Rank != 3)
+                throw new ArgumentException($"Embedding dropout expects rank 2 or rank 3. Got Rank {input.Rank}.");
+
+            TensorBase output = workspace.BorrowLike(input);
+            for (int b = 0; b < input.Layers; b++)
+            {
+                TensorBase inSlice = TensorUtilitiesSimd.GetLayer(input, b);
+                TensorBase droppedSlice = _embeddingDropout.ForItem(b).Forward(inSlice, workspace);
+                TensorUtilitiesSimd.SetLayer(output, b, droppedSlice);
+                workspace.Release(droppedSlice);
+            }
+
+            return output;
+        }
+
+        /// <summary>
+        /// Pushes a gradient back through the matching per-item embedding masks.
+        /// </summary>
+        private TensorBase BackwardEmbeddingDropout(TensorBase gradient, TensorWorkspace workspace)
+        {
+            if (gradient.Rank == 2)
+                return _embeddingDropout.ForItem(0).Backward(gradient, workspace);
+
+            if (gradient.Rank != 3)
+                throw new ArgumentException($"Embedding dropout expects rank 2 or rank 3. Got Rank {gradient.Rank}.");
+
+            TensorBase output = workspace.BorrowLike(gradient);
+            for (int b = 0; b < gradient.Layers; b++)
+            {
+                TensorBase gradSlice = TensorUtilitiesSimd.GetLayer(gradient, b);
+                TensorBase droppedSlice = _embeddingDropout.ForItem(b).Backward(gradSlice, workspace);
+                TensorUtilitiesSimd.SetLayer(output, b, droppedSlice);
+                workspace.Release(droppedSlice);
+            }
+
+            return output;
+        }
         
         public (TensorBase logits, TensorBase hiddenState) Forward(TensorBase input)
         {
-            Log.Information("Starting forward pass through the transformer model...");
+            bool verbose = TrainingStepProfile.Enabled;
+            if (verbose)
+                Log.Information("Starting forward pass through the transformer model...");
             var forwardWatch = Stopwatch.StartNew();
 
-            DiagonisticUtilities.AssertNoNaN(input, "Input contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(input, "Input contains NaN.");
             TensorBase x = _embedding.Forward(input, _workspace);
 
-            DiagonisticUtilities.AssertNoNaN(x, "Embedding contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(x, "Embedding contains NaN.");
             x = _position.Forward(x, _workspace);
 
-            DiagonisticUtilities.AssertNoNaN(x, "Positional encoding contains NaN.");
-            x = _embeddingDropout.ForItem(0).Forward(x, _workspace);
-            DiagonisticUtilities.AssertNoNaN(x, "Embedding dropout contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(x, "Positional encoding contains NaN.");
+            x = ApplyEmbeddingDropout(x, _workspace);
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(x, "Embedding dropout contains NaN.");
 
-            foreach (var layer in _layers)
+            for (int layerIndex = 0; layerIndex < _layers.Count; layerIndex++)
             {
+                var layer = _layers[layerIndex];
                 var layerWatch = Stopwatch.StartNew();
-                var layerIndex = _layers.IndexOf(layer);
                 x = layer.Forward(x, _workspace);
-                Log.Information($"Forward pass through layer {layerIndex} ({layer.GetType().Name}) completed in {layerWatch.ElapsedMilliseconds} ms.");
                 layerWatch.Stop();
-                DiagonisticUtilities.AssertNoNaN(x, $"Transformer layer {layerIndex} contains NaN.");
+                if (verbose)
+                {
+                    Log.Information($"Forward pass through layer {layerIndex} ({layer.GetType().Name}) completed in {layerWatch.ElapsedMilliseconds} ms.");
+                    DiagonisticUtilities.AssertNoNaN(x, $"Transformer layer {layerIndex} contains NaN.");
+                }
             }
 
             TensorBase hiddenState = x;
-            DiagonisticUtilities.AssertNoNaN(hiddenState, "Hidden state contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(hiddenState, "Hidden state contains NaN.");
 
             TensorBase logits = _outputProjection.Forward(hiddenState, _workspace);
-            DiagonisticUtilities.AssertNoNaN(logits, "Logits contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(logits, "Logits contains NaN.");
 
             forwardWatch.Stop();
-            Log.Information($"Forward pass completed in {forwardWatch.ElapsedMilliseconds} ms.");
+            if (verbose)
+                Log.Information($"Forward pass completed in {forwardWatch.ElapsedMilliseconds} ms.");
 
             return (logits, hiddenState);
         }
 
         public void Backward(TensorBase gradient)
         {
-            Log.Information("Starting backward pass through the transformer model...");
+            bool verbose = TrainingStepProfile.Enabled;
+            if (verbose)
+                Log.Information("Starting backward pass through the transformer model...");
             var backwardWatch = Stopwatch.StartNew();
-            DiagonisticUtilities.AssertNoNaN(gradient, "Gradient contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(gradient, "Gradient contains NaN.");
 
             gradient = _outputProjection.Backward(gradient, _workspace);
-            DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through output projection contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through output projection contains NaN.");
 
             for (int i = _layers.Count - 1; i >= 0; i--)
             {
                 var thislayer = _layers[i];
                 var layerWatch = Stopwatch.StartNew();
-                
+
                 gradient = _layers[i].Backward(gradient, _workspace);
                 layerWatch.Stop();
-                Log.Information($"Backward pass through layer {i} ({thislayer.GetType().Name}) completed in {layerWatch.ElapsedMilliseconds} ms.");
-                DiagonisticUtilities.AssertNoNaN(gradient, $"Gradient after backward pass through layer {i} contains NaN.");
+                if (verbose)
+                {
+                    Log.Information($"Backward pass through layer {i} ({thislayer.GetType().Name}) completed in {layerWatch.ElapsedMilliseconds} ms.");
+                    DiagonisticUtilities.AssertNoNaN(gradient, $"Gradient after backward pass through layer {i} contains NaN.");
+                }
             }
 
-            gradient = _embeddingDropout.ForItem(0).Backward(gradient, _workspace);
-            DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through embedding dropout contains NaN.");
+            gradient = BackwardEmbeddingDropout(gradient, _workspace);
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through embedding dropout contains NaN.");
 
             gradient = _position.Backward(gradient, _workspace);
-            DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through positional encoding contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through positional encoding contains NaN.");
 
             gradient = _embedding.Backward(gradient, _workspace);
-            DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through embedding contains NaN.");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through embedding contains NaN.");
 
             // REMOVED: _embedding.ClipGradients(1.0f); -> Handled globally in TrainStep!
             backwardWatch.Stop();
-            Log.Information($"Backward pass completed in {backwardWatch.ElapsedMilliseconds} ms.");
+            if (verbose)
+                Log.Information($"Backward pass completed in {backwardWatch.ElapsedMilliseconds} ms.");
         }
 
         public (int nextTokenId, int[] allTokenIds, TensorBase logits, TensorBase probabilities, TensorBase hiddenState) Predict(TensorBase input)
@@ -806,7 +877,7 @@ namespace SimpleTransformer.Model
                 if (!float.IsFinite(loss))
                     throw new InvalidOperationException(
                         $"Non-finite loss {loss} detected during training. Model diverged upstream (logits overflowed); check learning rate and gradient clipping.");
-                gradient = _loss.Backward(prediction, expectedOutputs);
+                gradient = _loss.Backward(prediction, expectedOutputs, _workspace);
                 if (profiling) stepProfile.MarkLossBackward(Stopwatch.GetTimestamp() - tPhase);
 
                 // 3. Backpropagate through Model.
@@ -897,12 +968,12 @@ namespace SimpleTransformer.Model
             }
             finally
             {
-                // Clean up transient forward & loss tensors for this step
+                // Clean up transient forward & loss tensors for this step.
+                // The loss gradient is workspace-borrowed (pooled with the
+                // step's activations), so Reset() reclaims it: do NOT dispose.
                 DisposeIfDisposable(prediction);
                 DisposeIfDisposable(auxOutput);
                 _workspace.Reset();
-                // If _loss.Backward returns a cached tensor managed internally by _loss, 
-                // DO NOT dispose it here. Otherwise, dispose if it's transient:
             }
             
         }

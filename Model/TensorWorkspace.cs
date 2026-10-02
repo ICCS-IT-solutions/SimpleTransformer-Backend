@@ -152,7 +152,10 @@ namespace SimpleTransformer.Model
             if (_pool.TryGetValue(key, out var bag) && bag.TryTake(out tensor))
             {
                 // Leaving the pool: the bytes are now owned by the caller again
-                // and must stop counting against the cap.
+                // and must stop counting against the cap. Clear-on-borrow is the
+                // single zeroing point: Reset() deliberately does NOT clear, so
+                // each activation is memsets exactly once per step instead of
+                // twice (borrow + return).
                 Interlocked.Add(ref _retainedBytes, -FootprintOf(tensor));
                 Interlocked.Decrement(ref _pooledTensorCount);
                 tensor.Clear();
@@ -255,8 +258,10 @@ namespace SimpleTransformer.Model
         }
         
         /// <summary>
-        /// Reclaims all borrowed tensors from the current pass, clears their memory,
-        /// and returns them to the pool for reuse in the next step.
+        /// Reclaims all borrowed tensors from the current pass and returns them
+        /// to the pool for reuse in the next step. Deliberately does NOT clear:
+        /// Borrow() clears on take, which is the single zeroing point. Clearing
+        /// here too would memset every activation twice per step.
         /// <para>
         /// This is the bulk path where a whole step's activations land back in the
         /// pool at once, so the cap is enforced here as well as in
@@ -275,10 +280,8 @@ namespace SimpleTransformer.Model
 
                 var tensor = pair.Key.Tensor;
 
-                // Reset data state so previous intermediate results don't bleed over
-                tensor.Clear();
-
-                // Recycle into the pooled bags by shape key
+                // Recycle into the pooled bags by shape key (no Clear: Borrow
+                // clears on the next take, so memory is zeroed exactly once).
                 var key = new TensorShapeKey(tensor.Shape);
                 var bag = _pool.GetOrAdd(key, _ => new ConcurrentBag<TensorBase>());
                 bag.Add(tensor);

@@ -141,6 +141,15 @@ namespace SimpleTransformer
                 bool ok = SimpleTransformer.Model.DropoutSelfTest.RunAndPrint();
                 Environment.Exit(ok ? 0 : 1);
             }
+
+            // Resume exactness self-test (no server start): dotnet run -- --resume-exactness-selftest
+            // Without this flag the unknown argument is ignored and the server
+            // boots instead - which silently hid this test from the CLI.
+            if (args.Contains("--resume-exactness-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.ResumeExactnessSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
             ConfigureLogging();
 
             //Inject the model via constructor DI 

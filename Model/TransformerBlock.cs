@@ -140,33 +140,39 @@ namespace SimpleTransformer.Model
 
         private TensorBase ForwardBatch(TensorBase input, TensorWorkspace workspace)
         {
-            DiagonisticUtilities.AssertNoNaN(input, "Block Input");
+            bool verbose = TrainingStepProfile.Enabled;
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(input, "Block Input");
 
             // 1. Attention Pass
             TensorBase attention = _multiHeadAttention.Forward(input, workspace);
-            DiagonisticUtilities.AssertNoNaN(attention, "Attention Pre-Residual");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(attention, "Attention Pre-Residual");
 
             // 1b. Attention-path dropout (inverted dropout; pass-through at inference)
-            TensorBase droppedAttention = _dropoutAttention.ForItem(0).Forward(attention, workspace);
+            TensorBase droppedAttention = ApplyResidualDropout(_dropoutAttention, attention, workspace);
             workspace.Release(attention);
 
             // 2. Residual Addition 1
             TensorBase attentionResidual = workspace.BorrowLike(droppedAttention);
             TensorMathSimd.ElementWiseAddInto(droppedAttention, input, attentionResidual);
             workspace.Release(droppedAttention);
-            DiagonisticUtilities.AssertNoNaN(attentionResidual, "Attention Post-Residual");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(attentionResidual, "Attention Post-Residual");
 
             // 3. LayerNorm 1
             TensorBase norm1 = _layerNorm1.Forward(attentionResidual, workspace);
             workspace.Release(attentionResidual);
-            DiagonisticUtilities.AssertNoNaN(norm1, "Norm1");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(norm1, "Norm1");
 
             // 4. FeedForward Pass
             TensorBase ff = _feedForward.Forward(norm1, workspace);
-            DiagonisticUtilities.AssertNoNaN(ff, "FeedForward Pre-Residual");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(ff, "FeedForward Pre-Residual");
 
             // 4b. FFN-path dropout (inverted dropout; pass-through at inference)
-            TensorBase droppedFf = _dropoutFeedForward.ForItem(0).Forward(ff, workspace);
+            TensorBase droppedFf = ApplyResidualDropout(_dropoutFeedForward, ff, workspace);
             workspace.Release(ff);
 
             // 5. Residual Addition 2
@@ -174,11 +180,64 @@ namespace SimpleTransformer.Model
             TensorMathSimd.ElementWiseAddInto(droppedFf, norm1, ffResidual);
             workspace.Release(droppedFf);
             workspace.Release(norm1);
-            DiagonisticUtilities.AssertNoNaN(ffResidual, "FeedForward Post-Residual");
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(ffResidual, "FeedForward Post-Residual");
 
             // 6. LayerNorm 2
             TensorBase output = _layerNorm2.Forward(ffResidual, workspace);
             workspace.Release(ffResidual);
+
+            return output;
+        }
+
+        /// <summary>
+        /// Applies per-item residual dropout to a Rank-2 or Rank-3 activation.
+        /// Rank-2 uses item 0; Rank-3 applies ForItem(b) per batch slice so each
+        /// mask is a pure function of (salt, step, item), matching the attention
+        /// dropout path. Pass-through (disabled or rate 0) takes a single fast path.
+        /// </summary>
+        private static TensorBase ApplyResidualDropout(DropoutSite site, TensorBase input, TensorWorkspace workspace)
+        {
+            if (input.Rank == 2)
+                return site.ForItem(0).Forward(input, workspace);
+
+            if (input.Rank != 3)
+                throw new ArgumentException($"Input must be rank 2 or rank 3. Got Rank {input.Rank}.");
+
+            TensorBase output = workspace.BorrowLike(input);
+            int layers = input.Layers;
+            for (int b = 0; b < layers; b++)
+            {
+                TensorBase inSlice = TensorUtilitiesSimd.GetLayer(input, b);
+                TensorBase droppedSlice = site.ForItem(b).Forward(inSlice, workspace);
+                TensorUtilitiesSimd.SetLayer(output, b, droppedSlice);
+                workspace.Release(droppedSlice);
+            }
+
+            return output;
+        }
+
+        /// <summary>
+        /// Pushes a Rank-2 or Rank-3 gradient back through the matching per-item
+        /// dropout masks applied by <see cref="ApplyResidualDropout"/>.
+        /// </summary>
+        private static TensorBase BackwardResidualDropout(DropoutSite site, TensorBase gradient, TensorWorkspace workspace)
+        {
+            if (gradient.Rank == 2)
+                return site.ForItem(0).Backward(gradient, workspace);
+
+            if (gradient.Rank != 3)
+                throw new ArgumentException($"Gradient must be rank 2 or rank 3. Got Rank {gradient.Rank}.");
+
+            TensorBase output = workspace.BorrowLike(gradient);
+            int layers = gradient.Layers;
+            for (int b = 0; b < layers; b++)
+            {
+                TensorBase gradSlice = TensorUtilitiesSimd.GetLayer(gradient, b);
+                TensorBase droppedSlice = site.ForItem(b).Backward(gradSlice, workspace);
+                TensorUtilitiesSimd.SetLayer(output, b, droppedSlice);
+                workspace.Release(droppedSlice);
+            }
 
             return output;
         }
@@ -196,7 +255,8 @@ namespace SimpleTransformer.Model
 
         private TensorBase BackwardSequence(TensorBase gradient, TensorWorkspace workspace)
         {
-            DiagonisticUtilities.AssertNoNaN(gradient, "Block Gradient");
+            if (TrainingStepProfile.Enabled)
+                DiagonisticUtilities.AssertNoNaN(gradient, "Block Gradient");
 
             // 1. Backprop LayerNorm2
             TensorBase dResidual2 = _layerNorm2.Backward(gradient, workspace);
@@ -232,13 +292,15 @@ namespace SimpleTransformer.Model
 
         private TensorBase BackwardBatch(TensorBase gradient, TensorWorkspace workspace)
         {
-            DiagonisticUtilities.AssertNoNaN(gradient, "Block Input Gradient");
+            bool verbose = TrainingStepProfile.Enabled;
+            if (verbose)
+                DiagonisticUtilities.AssertNoNaN(gradient, "Block Input Gradient");
 
             // 1. Backprop LayerNorm2
             TensorBase dFfResidual = _layerNorm2.Backward(gradient, workspace);
 
             // 2. Backprop FFN-path dropout, then FeedForward
-            TensorBase dDroppedFf = _dropoutFeedForward.ForItem(0).Backward(dFfResidual, workspace);
+            TensorBase dDroppedFf = BackwardResidualDropout(_dropoutFeedForward, dFfResidual, workspace);
             TensorBase dFf = _feedForward.Backward(dDroppedFf, workspace);
             workspace.Release(dDroppedFf);
 
@@ -253,7 +315,7 @@ namespace SimpleTransformer.Model
             workspace.Release(dNorm1);
 
             // 5. Backprop attention-path dropout, then MultiHeadAttention
-            TensorBase dDroppedAttention = _dropoutAttention.ForItem(0).Backward(dAttnResidual, workspace);
+            TensorBase dDroppedAttention = BackwardResidualDropout(_dropoutAttention, dAttnResidual, workspace);
             TensorBase dAttention = _multiHeadAttention.Backward(dDroppedAttention, workspace);
             workspace.Release(dDroppedAttention);
 

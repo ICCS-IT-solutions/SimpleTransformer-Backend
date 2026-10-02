@@ -1,5 +1,6 @@
 using System;
 using SimpleTransformer.AccelerationEngine;
+using SimpleTransformer.Model.Extensions.Numerics;
 
 namespace SimpleTransformer.Model
 {
@@ -205,12 +206,10 @@ namespace SimpleTransformer.Model
             }
             // 5c. Rank-3 per-item contract: DropoutSite promises masks are a pure
             // function of (salt, step, item), so a Rank-3 batch must behave as
-            // per-slice ForItem(b) forwards. These probes document the current
-            // flat behaviour (one ForItem(0) over B*T*C) without failing the
-            // suite; they become hard checks once the residual/embedding paths
-            // are split per slice like the attention path already is.
+            // per-slice ForItem(b) forwards. The residual/embedding paths now do
+            // this (like the attention path already did); these are hard checks.
             Console.WriteLine();
-            Console.WriteLine("-- Rank-3 per-item contract (informational) --");
+            Console.WriteLine("-- Rank-3 per-item contract --");
             {
                 const int cLayers = 2;
                 const int cRows = 4;
@@ -242,14 +241,24 @@ namespace SimpleTransformer.Model
                     if (prefixCopy[i] != soloCopy[i]) { prefixStable = false; break; }
                 Check("Rank-3 item 0 matches solo Rank-2 (prefix stable)", prefixStable, "first 32 masks equal");
 
-                var siteFlat = new DropoutSite("indep", rate, salt: 999UL);
-                siteFlat.SetEnabled(true);
-                siteFlat.PrepareForStep(7);
-                siteFlat.ForItem(1);
-                TensorBase flatOut = siteFlat.ForItem(0).Forward(cBatch, workspace);
-                var item1Flat = new float[cPerItem];
-                flatOut.ReadOnlySpan.Slice(cPerItem, cPerItem).CopyTo(item1Flat);
-                workspace.Release(flatOut);
+                // Per-slice contract: item 1 of a Rank-3 batch must equal an
+                // independent ForItem(1) solo forward. This is what the
+                // residual/embedding paths now implement via per-slice ForItem(b).
+                var siteSliced = new DropoutSite("sliced", rate, salt: 999UL);
+                siteSliced.SetEnabled(true);
+                siteSliced.PrepareForStep(7);
+                siteSliced.ForItem(1);
+                TensorBase slicedOut = workspace.BorrowLike(cBatch);
+                for (int b = 0; b < cLayers; b++)
+                {
+                    TensorBase inSlice = TensorUtilitiesSimd.GetLayer(cBatch, b);
+                    TensorBase droppedSlice = siteSliced.ForItem(b).Forward(inSlice, workspace);
+                    TensorUtilitiesSimd.SetLayer(slicedOut, b, droppedSlice);
+                    workspace.Release(droppedSlice);
+                }
+                var item1Sliced = new float[cPerItem];
+                slicedOut.ReadOnlySpan.Slice(cPerItem, cPerItem).CopyTo(item1Sliced);
+                workspace.Release(slicedOut);
 
                 var siteSolo1 = new DropoutSite("indep_solo", rate, salt: 999UL);
                 siteSolo1.SetEnabled(true);
@@ -261,9 +270,8 @@ namespace SimpleTransformer.Model
                 workspace.Release(solo1Out);
                 bool item1Independent = true;
                 for (int i = 0; i < cPerItem; i++)
-                    if (item1Flat[i] != item1Solo[i]) { item1Independent = false; break; }
-                Console.WriteLine("  [INFO] Rank-3 item 1 equals ForItem(1) solo: "
-                    + (item1Independent ? "independent streams" : "FLAT stream - item 1 is tail of item 0"));
+                    if (item1Sliced[i] != item1Solo[i]) { item1Independent = false; break; }
+                Check("Rank-3 item 1 equals ForItem(1) solo (per-item masks)", item1Independent, "independent streams");
 
                 cBatch.Dispose();
                 cSlice.Dispose();
