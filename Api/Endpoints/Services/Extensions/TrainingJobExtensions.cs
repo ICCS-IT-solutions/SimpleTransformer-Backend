@@ -269,6 +269,11 @@ public static class TrainingJobExtensions
             ? Math.Max(1, model.TrainingConfig.WarmupSteps / 10)
             : 0;
         model.ConfigureScheduler(scheduleSteps, resumeRewarm);
+        // Training mutates the in-memory weights, so whatever checkpoint the
+        // inference path last hydrated no longer describes what is in memory.
+        // Invalidate the cache; inference must re-read the selected file
+        // instead of silently serving post-training weights for it.
+        model.LoadedCheckpointId = null;
         Log.Information(
             "LR schedule: {Steps} total steps, warmup {Warmup}, peak {Peak}, floor {Floor}, resuming at step {AtStep}.",
             scheduleSteps,

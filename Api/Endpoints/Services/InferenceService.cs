@@ -1,5 +1,6 @@
 using System.Text;
 using Microsoft.EntityFrameworkCore;
+using Serilog;
 using SimpleTransformer.Api.Endpoints.Factories;
 using SimpleTransformer.Api.ManagementEngine;
 using SimpleTransformer.Api.Requests;
@@ -83,36 +84,46 @@ namespace SimpleTransformer.Api.Endpoints.Services
             // -------------------------------------------------------------
             // Checkpoint Hydration Logic
             // -------------------------------------------------------------
+            // Provenance is tracked for the response: which file (or in-memory
+            // state) produced the output, so a selected checkpoint can be
+            // verified instead of assumed.
+            string weightsSource;
+            string? usedCheckpointFilename = null;
+            int? usedCheckpointEpoch = null;
+            float? usedCheckpointLoss = null;
+
             if (req.TrainingCheckpointId.HasValue)
             {
-                // Only load if the requested checkpoint differs from what is currently in memory
-                if (model.LoadedCheckpointId != req.TrainingCheckpointId.Value)
+                var checkpointEntry = await db.TrainingCheckpoints
+                    .FirstOrDefaultAsync(x => x.EntryId == req.TrainingCheckpointId.Value);
+
+                if (checkpointEntry == null)
                 {
-                    var checkpointEntry = await db.TrainingCheckpoints
-                        .FirstOrDefaultAsync(x => x.EntryId == req.TrainingCheckpointId.Value);
-
-                    if (checkpointEntry == null)
+                    return new ApiResponse<InferenceResponse>
                     {
-                        return new ApiResponse<InferenceResponse>
-                        {
-                            Message = $"Checkpoint {req.TrainingCheckpointId.Value} not found.",
-                            Status = ResponseStatus.Error,
-                            StatusCode = 404
-                        };
-                    }
+                        Message = $"Checkpoint {req.TrainingCheckpointId.Value} not found.",
+                        Status = ResponseStatus.Error,
+                        StatusCode = 404
+                    };
+                }
 
-                    // Ensure checkpoint matches model
-                    if (checkpointEntry.TransformerModelId != Guid.Empty &&
-                        checkpointEntry.TransformerModelId != model.TransformerModelId)
+                // Ensure checkpoint matches model
+                if (checkpointEntry.TransformerModelId != Guid.Empty &&
+                    checkpointEntry.TransformerModelId != model.TransformerModelId)
+                {
+                    return new ApiResponse<InferenceResponse>
                     {
-                        return new ApiResponse<InferenceResponse>
-                        {
-                            Message = "Checkpoint does not belong to the selected model.",
-                            Status = ResponseStatus.Error,
-                            StatusCode = 400
-                        };
-                    }
+                        Message = "Checkpoint does not belong to the selected model.",
+                        Status = ResponseStatus.Error,
+                        StatusCode = 400
+                    };
+                }
 
+                // Only load when the requested checkpoint differs from what is
+                // in memory. Training invalidates the cache, so a hit here is
+                // trustworthy rather than stale post-training weights.
+                if (model.LoadedCheckpointId != checkpointEntry.EntryId)
+                {
                     string fullPath = Path.Combine(checkpointEntry.Filepath, checkpointEntry.Filename);
                     if (!File.Exists(fullPath))
                     {
@@ -128,8 +139,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     {
                         await using var stream = File.OpenRead(fullPath);
                         TransformerModel.LoadCheckpoint(stream, model);
-                        
+
                         model.LoadedCheckpointId = checkpointEntry.EntryId;
+                        Log.Information(
+                            "Inference hydrated checkpoint {File} (epoch {Epoch}, loss {Loss}).",
+                            checkpointEntry.Filename, checkpointEntry.Epoch, checkpointEntry.Loss);
                     }
                     catch (Exception ex)
                     {
@@ -141,7 +155,23 @@ namespace SimpleTransformer.Api.Endpoints.Services
                         };
                     }
                 }
-            }            
+                else
+                {
+                    Log.Information(
+                        "Inference reusing cached checkpoint {File} (epoch {Epoch}, loss {Loss}).",
+                        checkpointEntry.Filename, checkpointEntry.Epoch, checkpointEntry.Loss);
+                }
+
+                weightsSource = "checkpoint";
+                usedCheckpointFilename = checkpointEntry.Filename;
+                usedCheckpointEpoch = checkpointEntry.Epoch;
+                usedCheckpointLoss = checkpointEntry.Loss;
+            }
+            else
+            {
+                weightsSource = "memory";
+                Log.Information("Inference using in-memory weights; no checkpoint selected.");
+            }
 
 
             //Need a way to block inference if training is underway.
@@ -171,7 +201,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
                 {
                     OutputText = string.IsNullOrEmpty(outputText) 
                         ? "Could not generate usable output from the tokens." 
-                        : outputText
+                        : outputText,
+                    WeightsSource = weightsSource,
+                    CheckpointFilename = usedCheckpointFilename,
+                    CheckpointEpoch = usedCheckpointEpoch,
+                    CheckpointLoss = usedCheckpointLoss
                 }
             };
 
