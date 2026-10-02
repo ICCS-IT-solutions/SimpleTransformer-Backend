@@ -37,8 +37,23 @@
 //
 // Phase 5 - Improvements
 // -----------------------
-// □ Dropout
+// ✔ Dropout
+//   Inverted dropout (mask scaled by 1/(1-p)) at three sites: the embedding
+//   output, each attention/feed-forward residual sublayer, and the post-softmax
+//   attention weights. Disabled by default and byte-exact pass-through at
+//   rate 0, so inference behaviour is unchanged. Toggled by
+//   TransformerModel.BeginTraining/EndTraining (which re-read
+//   TrainingConfig.DropoutRate). Verified by `dotnet run -- --dropout-selftest`.
+//   RNG is a project-owned xoshiro256** (Model/DropoutRng.cs), not
+//   System.Random, and masks are keyed per DropoutSite from
+//   (salt, optimizer step, batch item) - so masks are batch-size stable,
+//   immune to an interleaved inference forward, and replay exactly on resume.
 // □ Weight serialization
+//   v4 checkpoints carry weights + gradients + globalStep. Still missing for
+//   exact resume: optimizer state (AdamW m/v/_stepCount, SGD velocity) and the
+//   DropoutSite salts. Planned as a v5 training-state trailer.
+//   Also note: mid-epoch temp checkpoints become the job's resume pointer
+//   (TrainingJobExtensions), so they must carry full state too.
 // □ Unit tests
 // □ Performance profiling
 

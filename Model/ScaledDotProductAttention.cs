@@ -13,11 +13,45 @@ namespace SimpleTransformer.Model
         private readonly List<TensorBase> _lastV = new();
         private readonly List<TensorBase> _lastWeights = new();
 
+        // Attention-weight dropout (Vaswani §5.4). One DropoutSite per
+        // (layer, head); the site hands out one mask-carrying DropoutLayer per
+        // batch item, keyed from (salt, step, item), because the batch path
+        // replays ForwardSequence per slice and Backward must replay each item's
+        // exact mask. _lastDroppedWeights caches the post-dropout weights
+        // actually fed to the output matmul (needed for dV in Backward), while
+        // _lastWeights above keeps the PRE-dropout softmax output for the
+        // softmax Jacobian. Parallel to _lastWeights; entries are null when no
+        // dropout was applied for that item.
+        private readonly DropoutSite _attentionDropout;
+        private readonly List<TensorBase?> _lastDroppedWeights = new();
+        private readonly List<bool> _dropoutApplied = new();
+
         private readonly int _headSize;
 
-        public ScaledDotProductAttention(int headSize)
+        public ScaledDotProductAttention(int headSize, string siteKeyPrefix = "attention")
         {
             _headSize = headSize;
+            _attentionDropout = new DropoutSite($"{siteKeyPrefix}.attn_w", 0.0f);
+        }
+
+        /// <summary>
+        /// The attention-weight dropout site. Exposed so the owning head can
+        /// include it in checkpoint save/load and per-step re-keying.
+        /// </summary>
+        public DropoutSite AttentionDropout => _attentionDropout;
+
+        /// <summary>Dropout rate applied to the softmax weights (attention dropout).</summary>
+        public float DropoutRate
+        {
+            get => _attentionDropout.Rate;
+            set => _attentionDropout.SetRate(value);
+        }
+
+        /// <summary>Train/eval switch. False by default so inference is untouched.</summary>
+        public bool DropoutEnabled
+        {
+            get => _attentionDropout.Enabled;
+            set => _attentionDropout.SetEnabled(value);
         }
 
         public TensorBase Forward(TensorBase q, TensorBase k, TensorBase v, TensorBase? mask, TensorWorkspace workspace)
@@ -45,6 +79,8 @@ namespace SimpleTransformer.Model
                 _lastK.Clear();
                 _lastV.Clear();
                 _lastWeights.Clear();
+                _lastDroppedWeights.Clear();
+                _dropoutApplied.Clear();
             }
 
             _lastQ.Add(q);
@@ -83,10 +119,39 @@ namespace SimpleTransformer.Model
                 workspace.Backend.CopyInto(scores, currentWeights);
                 _lastWeights.Add(currentWeights);
 
-                // 6. Output = SoftmaxWeights * V
-                TensorBase output = workspace.Borrow2D(scores.Rows, v.Cols);
-                workspace.Backend.MatMul(scores, v, output);
+                // 6. Attention-weight dropout: the PRE-dropout weights cached
+                // above stay intact for the softmax Jacobian; only the tensor
+                // fed to the output matmul is dropped.
+                bool applyDropout = DropoutEnabled && DropoutRate > 0f;
+                TensorBase? dropped = null;
 
+                if (applyDropout)
+                {
+                    DropoutLayer dropoutLayer = _attentionDropout.ForItem(batchIndex);
+                    dropoutLayer.SetRate(DropoutRate);   // pick up config changes
+                    dropoutLayer.Enabled = true;         // guarded by applyDropout above
+
+                    dropped = dropoutLayer.Forward(scores, workspace);
+
+                    // Cache the dropped weights for the dV matmul in Backward;
+                    // the mask itself lives inside the per-item DropoutLayer.
+                    Tensor droppedCopy = new Tensor(dropped.Rows, dropped.Cols);
+                    workspace.Backend.CopyInto(dropped, droppedCopy);
+                    _lastDroppedWeights.Add(droppedCopy);
+                }
+                else
+                {
+                    _lastDroppedWeights.Add(null);
+                }
+
+                _dropoutApplied.Add(applyDropout);
+
+                // 7. Output = DroppedWeights * V
+                TensorBase output = workspace.Borrow2D(scores.Rows, v.Cols);
+                workspace.Backend.MatMul(applyDropout ? dropped! : scores, v, output);
+
+                if (dropped != null)
+                    workspace.Release(dropped);
                 workspace.Release(scores);
 
                 return output;
@@ -99,6 +164,8 @@ namespace SimpleTransformer.Model
             _lastK.Clear();
             _lastV.Clear();
             _lastWeights.Clear();
+            _lastDroppedWeights.Clear();
+            _dropoutApplied.Clear();
 
             TensorBase batchOutput = workspace.Borrow3D(q.Layers, q.Rows, v.Cols);
 
@@ -124,7 +191,7 @@ namespace SimpleTransformer.Model
         {
             return outputGradient.Rank switch
             {
-                2 => BackwardSequence(outputGradient, _lastQ[0], _lastK[0], _lastV[0], _lastWeights[0], workspace),
+                2 => BackwardSequence(outputGradient, _lastQ[0], _lastK[0], _lastV[0], _lastWeights[0], batchIndex: 0, workspace),
                 3 => BackwardBatch(outputGradient, workspace),
                 _ => throw new ArgumentException("Gradient must be Rank 2 or 3.")
             };
@@ -136,11 +203,19 @@ namespace SimpleTransformer.Model
             TensorBase k, 
             TensorBase v,
             TensorBase savedWeights,
+            int batchIndex,
             TensorWorkspace workspace)
         {
-            // dV = SoftmaxWeights^T * outputGradient
-            TensorBase weightsTransposed = workspace.Borrow2D(savedWeights.Cols, savedWeights.Rows);
-            workspace.Backend.TransposeInto(savedWeights, weightsTransposed);
+            // dV = WeightsActuallyUsedInForward^T * outputGradient.
+            // Without attention dropout that is the pre-dropout softmax output
+            // (savedWeights); with dropout the forward matmul consumed the
+            // DROPPED weights, so dV must use those (cached per batch item).
+            TensorBase weightsUsedInForward = _dropoutApplied[batchIndex]
+                ? _lastDroppedWeights[batchIndex]!
+                : savedWeights;
+
+            TensorBase weightsTransposed = workspace.Borrow2D(weightsUsedInForward.Cols, weightsUsedInForward.Rows);
+            workspace.Backend.TransposeInto(weightsUsedInForward, weightsTransposed);
 
             TensorBase dV = workspace.Borrow2D(v.Rows, v.Cols);
             workspace.Backend.MatMul(weightsTransposed, outputGradient, dV);
@@ -155,9 +230,24 @@ namespace SimpleTransformer.Model
             workspace.Release(vTransposed);
 
             // dScores = SoftmaxBackward(dWeights, SoftmaxWeights)
+            // When attention dropout was applied, dWeights is the gradient wrt
+            // the DROPPED tensor: push it back through the dropout mask first so
+            // the softmax Jacobian receives the gradient wrt the pre-dropout
+            // weights cached in _lastWeights.
             TensorBase dScores = workspace.Borrow2D(dWeights.Rows, dWeights.Cols);
-            workspace.Backend.SoftmaxBackwardInto(savedWeights, dWeights, dScores);
-            workspace.Release(dWeights);
+
+            if (_dropoutApplied[batchIndex])
+            {
+                TensorBase dWeightsDropped = _attentionDropout.ForItem(batchIndex).Backward(dWeights, workspace);
+                workspace.Backend.SoftmaxBackwardInto(savedWeights, dWeightsDropped, dScores);
+                workspace.Release(dWeightsDropped);
+                workspace.Release(dWeights);
+            }
+            else
+            {
+                workspace.Backend.SoftmaxBackwardInto(savedWeights, dWeights, dScores);
+                workspace.Release(dWeights);
+            }
 
             // Scale dScores back by 1 / Sqrt(headSize)
             workspace.Backend.ScaleInPlace(dScores, 1.0f / MathF.Sqrt(_headSize));
@@ -201,6 +291,7 @@ namespace SimpleTransformer.Model
                     _lastK[b],
                     _lastV[b],
                     _lastWeights[b],
+                    b,
                     workspace);
 
                 TensorUtilitiesSimd.SetLayer(batchDQ, b, dq);

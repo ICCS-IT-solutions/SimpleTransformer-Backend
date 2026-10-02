@@ -6,7 +6,7 @@ using SimpleTransformer.Model.Extensions.Numerics;
 
 namespace SimpleTransformer.Model
 {
-    public class AttentionHead : ITrainableLayer
+    public class AttentionHead : ITrainableLayer, IDropoutControl
     {
         public string Name { get; }
         private readonly ILinearLayer _queryProjection;
@@ -39,7 +39,7 @@ namespace SimpleTransformer.Model
                 _valueProjection = new LinearLayer(embeddingSize, headSize, name: $"{name}.value");
             }
 
-            _attention = new ScaledDotProductAttention(headSize);
+            _attention = new ScaledDotProductAttention(headSize, name);
         }
 
         public TensorBase Forward(TensorBase input, TensorWorkspace workspace) => Forward(input, workspace, null);
@@ -161,6 +161,18 @@ namespace SimpleTransformer.Model
 
             return dInput;
         }
+
+        // Attention-weight dropout control: delegates to the scaled dot-product
+        // attention that owns the softmax-weight dropout.
+        public void SetDropoutEnabled(bool enabled) => _attention.DropoutEnabled = enabled;
+
+        public void SetDropoutRate(float rate) => _attention.DropoutRate = rate;
+
+        public void PrepareDropoutForStep(long step) =>
+            _attention.AttentionDropout.PrepareForStep(step);
+
+        public void CollectDropoutSites(List<DropoutSite> sites) =>
+            sites.Add(_attention.AttentionDropout);
 
         public void ZeroGradients()
         {

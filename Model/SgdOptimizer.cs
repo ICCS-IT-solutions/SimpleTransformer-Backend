@@ -12,8 +12,10 @@ namespace SimpleTransformer.Model
         private readonly float _weightDecay;
         private readonly bool _useNesterov;
 
-        // Tracks velocity buffer per parameter reference
-        private readonly Dictionary<TrainableParameter, Tensor> _velocityState = new();
+        // Tracks the velocity buffer per parameter NAME (not object reference),
+        // so the state survives a resume that rebuilds the parameter objects and
+        // can be keyed into a checkpoint.
+        private readonly Dictionary<string, Tensor> _velocityState = new();
 
         public SgdOptimizer(
             float learningRate, 
@@ -46,10 +48,11 @@ namespace SimpleTransformer.Model
                 }
 
                 // Ensure a velocity buffer exists for this parameter
-                if (!_velocityState.TryGetValue(param, out var velocityTensor))
+                string paramKey = param.Name;
+                if (!_velocityState.TryGetValue(paramKey, out var velocityTensor))
                 {
                     velocityTensor = new Tensor(param.Value.Shape);
-                    _velocityState[param] = velocityTensor;
+                    _velocityState[paramKey] = velocityTensor;
                 }
 
                 float[] velocity = velocityTensor.Data;
@@ -165,6 +168,84 @@ namespace SimpleTransformer.Model
             {
                 values[i] -= learningRate * gradients[i];
             }
+        }
+
+        /// <summary>
+        /// Snapshot of the momentum velocity buffers keyed by parameter name.
+        /// Vanilla SGD (momentum and weight decay both zero) keeps no state, so
+        /// the snapshot is empty and the run is already reproducible.
+        /// </summary>
+        public OptimizerState ExportState()
+        {
+            var entries = new List<OptimizerParamState>(_velocityState.Count);
+
+            foreach (var kvp in _velocityState)
+            {
+                entries.Add(new OptimizerParamState
+                {
+                    Name = kvp.Key,
+                    Velocity = new TensorData
+                    {
+                        Shape = kvp.Value.Shape,
+                        Data = kvp.Value.Data
+                    }
+                });
+            }
+
+            return new OptimizerState
+            {
+                Kind = OptimizerStateKinds.Sgd,
+                StepCount = 0,   // SGD has no bias correction
+                Parameters = entries
+            };
+        }
+
+        public int ImportState(OptimizerState state, IReadOnlyList<TrainableParameter> parameters)
+        {
+            ArgumentNullException.ThrowIfNull(state);
+            ArgumentNullException.ThrowIfNull(parameters);
+
+            if (state.Kind != OptimizerStateKinds.Sgd)
+            {
+                throw new InvalidDataException(
+                    $"Optimizer state was produced by optimizer kind {state.Kind}, " +
+                    $"but this is an SGD optimizer (kind {OptimizerStateKinds.Sgd}).");
+            }
+
+            var expectedShapes = new Dictionary<string, int[]>(parameters.Count);
+            foreach (var p in parameters)
+                expectedShapes[p.Name] = p.Value.Shape;
+
+            ResetState();
+
+            int skipped = 0;
+            foreach (var entry in state.Parameters)
+            {
+                if (entry.Velocity == null ||
+                    !expectedShapes.TryGetValue(entry.Name, out int[]? expectedShape) ||
+                    !ShapeMatches(expectedShape, entry.Velocity.Shape) ||
+                    !entry.Velocity.IsValid)
+                {
+                    skipped++;
+                    continue;
+                }
+
+                var velocity = new Tensor(entry.Velocity.Shape);
+                Array.Copy(entry.Velocity.Data, velocity.Data, velocity.Data.Length);
+                _velocityState[entry.Name] = velocity;
+            }
+
+            return skipped;
+        }
+
+        private static bool ShapeMatches(int[] expected, int[] actual)
+        {
+            if (expected.Length != actual.Length) return false;
+            for (int i = 0; i < expected.Length; i++)
+            {
+                if (expected[i] != actual[i]) return false;
+            }
+            return true;
         }
 
         public void ResetState()

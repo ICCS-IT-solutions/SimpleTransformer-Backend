@@ -7,7 +7,7 @@ using SimpleTransformer.Model.Extensions.Numerics;
 
 namespace SimpleTransformer.Model
 {
-    public class TransformerBlock : ITrainableLayer
+    public class TransformerBlock : ITrainableLayer, IDropoutControl
     {
         public string Name { get; }
 
@@ -15,6 +15,14 @@ namespace SimpleTransformer.Model
         private readonly ITrainableLayer _feedForward;
         private readonly ITrainableLayer _layerNorm1;
         private readonly ITrainableLayer _layerNorm2;
+
+        // Residual dropout (Vaswani §5.4): applied to each sub-layer's output
+        // BEFORE it is added to the skip connection. Disabled by default;
+        // toggled by the model's BeginTraining/EndTraining via IDropoutControl.
+        // Sites (not bare layers) so the mask stream is keyed from a persisted
+        // salt + optimizer step and therefore replays exactly on resume.
+        private readonly DropoutSite _dropoutAttention;
+        private readonly DropoutSite _dropoutFeedForward;
 
         public IEnumerable<TrainableParameter> Parameters
         {
@@ -40,6 +48,7 @@ namespace SimpleTransformer.Model
             ITrainableLayer layerNorm1, 
             ITrainableLayer layerNorm2, 
             bool useQLora = false,
+            float dropoutRate = 0.0f,
             string name = "transformer_block")
         {
             Name = name;
@@ -47,6 +56,45 @@ namespace SimpleTransformer.Model
             _feedForward = feedForward ?? throw new ArgumentNullException(nameof(feedForward));
             _layerNorm1 = layerNorm1 ?? throw new ArgumentNullException(nameof(layerNorm1));
             _layerNorm2 = layerNorm2 ?? throw new ArgumentNullException(nameof(layerNorm2));
+
+            _dropoutAttention = new DropoutSite($"{name}.attn_dropout", dropoutRate);
+            _dropoutFeedForward = new DropoutSite($"{name}.ffn_dropout", dropoutRate);
+        }
+
+        public void SetDropoutEnabled(bool enabled)
+        {
+            _dropoutAttention.SetEnabled(enabled);
+            _dropoutFeedForward.SetEnabled(enabled);
+
+            if (_multiHeadAttention is IDropoutControl attentionControl)
+                attentionControl.SetDropoutEnabled(enabled);
+        }
+
+        public void SetDropoutRate(float rate)
+        {
+            _dropoutAttention.SetRate(rate);
+            _dropoutFeedForward.SetRate(rate);
+
+            if (_multiHeadAttention is IDropoutControl attentionControl)
+                attentionControl.SetDropoutRate(rate);
+        }
+
+        public void PrepareDropoutForStep(long step)
+        {
+            _dropoutAttention.PrepareForStep(step);
+            _dropoutFeedForward.PrepareForStep(step);
+
+            if (_multiHeadAttention is IDropoutControl attentionControl)
+                attentionControl.PrepareDropoutForStep(step);
+        }
+
+        public void CollectDropoutSites(List<DropoutSite> sites)
+        {
+            sites.Add(_dropoutAttention);
+            sites.Add(_dropoutFeedForward);
+
+            if (_multiHeadAttention is IDropoutControl attentionControl)
+                attentionControl.CollectDropoutSites(sites);
         }
 
         // ILayer forward entry point
@@ -62,22 +110,26 @@ namespace SimpleTransformer.Model
 
         private TensorBase ForwardSequence(TensorBase input, TensorWorkspace workspace)
         {
-            // Sub-layer 1: Attention + Residual 1 + Norm 1
+            // Sub-layer 1: Attention + Dropout + Residual 1 + Norm 1
             TensorBase attention = _multiHeadAttention.Forward(input, workspace);
+            TensorBase droppedAttention = _dropoutAttention.ForItem(0).Forward(attention, workspace);
+            workspace.Release(attention);
 
             TensorBase residual1 = workspace.BorrowLike(input);
-            workspace.Backend.ElementWiseAddInto(attention, input, residual1);
-            workspace.Release(attention);
+            workspace.Backend.ElementWiseAddInto(droppedAttention, input, residual1);
+            workspace.Release(droppedAttention);
 
             TensorBase norm1 = _layerNorm1.Forward(residual1, workspace);
             workspace.Release(residual1);
 
-            // Sub-layer 2: FeedForward + Residual 2 + Norm 2
+            // Sub-layer 2: FeedForward + Dropout + Residual 2 + Norm 2
             TensorBase ff = _feedForward.Forward(norm1, workspace);
+            TensorBase droppedFf = _dropoutFeedForward.ForItem(0).Forward(ff, workspace);
+            workspace.Release(ff);
 
             TensorBase residual2 = workspace.BorrowLike(norm1);
-            workspace.Backend.ElementWiseAddInto(ff, norm1, residual2);
-            workspace.Release(ff);
+            workspace.Backend.ElementWiseAddInto(droppedFf, norm1, residual2);
+            workspace.Release(droppedFf);
             workspace.Release(norm1);
 
             TensorBase output = _layerNorm2.Forward(residual2, workspace);
@@ -94,10 +146,14 @@ namespace SimpleTransformer.Model
             TensorBase attention = _multiHeadAttention.Forward(input, workspace);
             DiagonisticUtilities.AssertNoNaN(attention, "Attention Pre-Residual");
 
-            // 2. Residual Addition 1
-            TensorBase attentionResidual = workspace.BorrowLike(attention);
-            TensorMathSimd.ElementWiseAddInto(attention, input, attentionResidual);
+            // 1b. Attention-path dropout (inverted dropout; pass-through at inference)
+            TensorBase droppedAttention = _dropoutAttention.ForItem(0).Forward(attention, workspace);
             workspace.Release(attention);
+
+            // 2. Residual Addition 1
+            TensorBase attentionResidual = workspace.BorrowLike(droppedAttention);
+            TensorMathSimd.ElementWiseAddInto(droppedAttention, input, attentionResidual);
+            workspace.Release(droppedAttention);
             DiagonisticUtilities.AssertNoNaN(attentionResidual, "Attention Post-Residual");
 
             // 3. LayerNorm 1
@@ -109,10 +165,14 @@ namespace SimpleTransformer.Model
             TensorBase ff = _feedForward.Forward(norm1, workspace);
             DiagonisticUtilities.AssertNoNaN(ff, "FeedForward Pre-Residual");
 
-            // 5. Residual Addition 2
-            TensorBase ffResidual = workspace.BorrowLike(ff);
-            TensorMathSimd.ElementWiseAddInto(ff, norm1, ffResidual);
+            // 4b. FFN-path dropout (inverted dropout; pass-through at inference)
+            TensorBase droppedFf = _dropoutFeedForward.ForItem(0).Forward(ff, workspace);
             workspace.Release(ff);
+
+            // 5. Residual Addition 2
+            TensorBase ffResidual = workspace.BorrowLike(droppedFf);
+            TensorMathSimd.ElementWiseAddInto(droppedFf, norm1, ffResidual);
+            workspace.Release(droppedFf);
             workspace.Release(norm1);
             DiagonisticUtilities.AssertNoNaN(ffResidual, "FeedForward Post-Residual");
 
@@ -141,8 +201,10 @@ namespace SimpleTransformer.Model
             // 1. Backprop LayerNorm2
             TensorBase dResidual2 = _layerNorm2.Backward(gradient, workspace);
 
-            // 2. Backprop FeedForward
-            TensorBase dFf = _feedForward.Backward(dResidual2, workspace);
+            // 2. Backprop FFN-path dropout, then FeedForward
+            TensorBase dDroppedFf = _dropoutFeedForward.ForItem(0).Backward(dResidual2, workspace);
+            TensorBase dFf = _feedForward.Backward(dDroppedFf, workspace);
+            workspace.Release(dDroppedFf);
 
             // 3. Split gradient at Residual 2 (FFN path + skip connection)
             TensorBase dNorm1 = workspace.BorrowLike(dFf);
@@ -154,8 +216,10 @@ namespace SimpleTransformer.Model
             TensorBase dResidual1 = _layerNorm1.Backward(dNorm1, workspace);
             workspace.Release(dNorm1);
 
-            // 5. Backprop Attention
-            TensorBase dAttention = _multiHeadAttention.Backward(dResidual1, workspace);
+            // 5. Backprop attention-path dropout, then Attention
+            TensorBase dDroppedAttention = _dropoutAttention.ForItem(0).Backward(dResidual1, workspace);
+            TensorBase dAttention = _multiHeadAttention.Backward(dDroppedAttention, workspace);
+            workspace.Release(dDroppedAttention);
 
             // 6. Split gradient at Residual 1 (Attention path + skip connection)
             TensorBase dInput = workspace.BorrowLike(dAttention);
@@ -173,8 +237,10 @@ namespace SimpleTransformer.Model
             // 1. Backprop LayerNorm2
             TensorBase dFfResidual = _layerNorm2.Backward(gradient, workspace);
 
-            // 2. Backprop FeedForward
-            TensorBase dFf = _feedForward.Backward(dFfResidual, workspace);
+            // 2. Backprop FFN-path dropout, then FeedForward
+            TensorBase dDroppedFf = _dropoutFeedForward.ForItem(0).Backward(dFfResidual, workspace);
+            TensorBase dFf = _feedForward.Backward(dDroppedFf, workspace);
+            workspace.Release(dDroppedFf);
 
             // 3. Split gradient at Residual 2
             TensorBase dNorm1 = workspace.BorrowLike(dFf);
@@ -186,8 +252,10 @@ namespace SimpleTransformer.Model
             TensorBase dAttnResidual = _layerNorm1.Backward(dNorm1, workspace);
             workspace.Release(dNorm1);
 
-            // 5. Backprop MultiHeadAttention
-            TensorBase dAttention = _multiHeadAttention.Backward(dAttnResidual, workspace);
+            // 5. Backprop attention-path dropout, then MultiHeadAttention
+            TensorBase dDroppedAttention = _dropoutAttention.ForItem(0).Backward(dAttnResidual, workspace);
+            TensorBase dAttention = _multiHeadAttention.Backward(dDroppedAttention, workspace);
+            workspace.Release(dDroppedAttention);
 
             // 6. Split gradient at Residual 1
             TensorBase dInput = workspace.BorrowLike(dAttention);

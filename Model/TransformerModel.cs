@@ -19,6 +19,13 @@ namespace SimpleTransformer.Model
         private EmbeddingLayer _embedding = null!;
         private ILinearLayer _outputProjection = null!;
         private PositionalEncodingLayer _position = null!;
+        //Embedding dropout (Vaswani §5.4): applied to the embedding + positional
+        //output. Disabled by default; toggled by BeginTraining/EndTraining.
+        private DropoutSite _embeddingDropout = null!;
+        //Every dropout site in the model, flattened once by BuildModel so the
+        //per-step re-key and checkpoint save/load are a flat walk rather than a
+        //recursive traversal.
+        private readonly List<DropoutSite> _dropoutSites = new();
         private TensorWorkspace _workspace = null!;
         //The acceleration backend that drives all tensor math for this model instance
         //(SIMD, pure managed reference, or GPU backends plugged into IAccelerationBackend).
@@ -175,8 +182,83 @@ namespace SimpleTransformer.Model
             Log.Information($"Transformer model {modelId} ready to be loaded. Use Quantised LoRA: {useQLora}.");
         }
 
-        public void BeginTraining() => _isTraining = true;
-        public void EndTraining() => _isTraining = false;
+        public void BeginTraining()
+        {
+            _isTraining = true;
+            ApplyDropout(enabled: true);
+        }
+
+        public void EndTraining()
+        {
+            _isTraining = false;
+            ApplyDropout(enabled: false);
+        }
+
+        /// <summary>
+        /// Pushes the configured rate and the train/eval switch to every dropout
+        /// site: the embedding output, each block's two residual sub-layer
+        /// outputs, and the attention weights inside every head. The rate is
+        /// re-read here (not just at build time) so a rate changed through
+        /// <see cref="TrainingConfig"/> after construction still takes effect,
+        /// and so a run left with the default rate of 0 is a byte-exact
+        /// pass-through.
+        /// </summary>
+        private void ApplyDropout(bool enabled)
+        {
+            float rate = TrainingConfig.DropoutRate;
+
+            _embeddingDropout.SetRate(rate);
+            _embeddingDropout.SetEnabled(enabled);
+
+            foreach (var layer in _layers)
+            {
+                if (layer is IDropoutControl dropoutControl)
+                {
+                    dropoutControl.SetDropoutRate(rate);
+                    dropoutControl.SetDropoutEnabled(enabled);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Re-keys every dropout site for the current optimizer step, so the masks
+        /// a step sees are a pure function of (site salt, step, batch item).
+        /// <para>
+        /// This is what makes the sequence reproducible: a resumed run restores
+        /// the salts and <see cref="_globalStep"/>, so the identical masks replay;
+        /// a changed batch size cannot perturb item 0's mask; and an interleaved
+        /// inference Forward cannot advance the training stream, because the next
+        /// step re-keys from the step counter rather than continuing a sequence.
+        /// </para>
+        /// Sites that are disabled or at rate 0 are skipped, so the default
+        /// (no dropout) path costs nothing.
+        /// </summary>
+        private void PrepareDropoutForStep()
+        {
+            for (int i = 0; i < _dropoutSites.Count; i++)
+            {
+                DropoutSite site = _dropoutSites[i];
+                if (site.Enabled && site.Rate > 0f)
+                    site.PrepareForStep(_globalStep);
+            }
+        }
+
+        /// <summary>
+        /// Flattens every dropout site in the model (embedding + all blocks) into
+        /// <see cref="_dropoutSites"/>. Called once from BuildModel; site keys are
+        /// architecture-derived and stable, so they survive checkpoint round-trips.
+        /// </summary>
+        private void CollectDropoutSites()
+        {
+            _dropoutSites.Clear();
+            _dropoutSites.Add(_embeddingDropout);
+
+            foreach (var layer in _layers)
+            {
+                if (layer is IDropoutControl dropoutControl)
+                    dropoutControl.CollectDropoutSites(_dropoutSites);
+            }
+        }
         
         public (TensorBase logits, TensorBase hiddenState) Forward(TensorBase input)
         {
@@ -190,6 +272,9 @@ namespace SimpleTransformer.Model
             x = _position.Forward(x, _workspace);
 
             DiagonisticUtilities.AssertNoNaN(x, "Positional encoding contains NaN.");
+            x = _embeddingDropout.ForItem(0).Forward(x, _workspace);
+            DiagonisticUtilities.AssertNoNaN(x, "Embedding dropout contains NaN.");
+
             foreach (var layer in _layers)
             {
                 var layerWatch = Stopwatch.StartNew();
@@ -231,6 +316,9 @@ namespace SimpleTransformer.Model
                 Log.Information($"Backward pass through layer {i} ({thislayer.GetType().Name}) completed in {layerWatch.ElapsedMilliseconds} ms.");
                 DiagonisticUtilities.AssertNoNaN(gradient, $"Gradient after backward pass through layer {i} contains NaN.");
             }
+
+            gradient = _embeddingDropout.ForItem(0).Backward(gradient, _workspace);
+            DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through embedding dropout contains NaN.");
 
             gradient = _position.Backward(gradient, _workspace);
             DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through positional encoding contains NaN.");
@@ -685,6 +773,11 @@ namespace SimpleTransformer.Model
         {
             ZeroGradients();
 
+            // Re-key every dropout site for this step before the forward pass, so
+            // the masks are a pure function of (site salt, step, batch item) and a
+            // resume replays the identical sequence.
+            PrepareDropoutForStep();
+
             TensorBase? prediction = null;
             TensorBase? auxOutput = null;
             TensorBase? gradient = null;
@@ -1063,6 +1156,7 @@ namespace SimpleTransformer.Model
             _outputProjection = useQLora 
             ? new QLoraLinearLayer(Config.EmbeddingSize, Config.VocabSize, useBias: false, name: "lm_head")
             : new LinearLayer(Config.EmbeddingSize, Config.VocabSize, useBias: false, name: "lm_head");
+            _embeddingDropout = new DropoutSite("embedding_dropout", TrainingConfig.DropoutRate);
             _workspace = new TensorWorkspace(_backend);
 
             _loss = new CrossEntropyLoss();
@@ -1137,11 +1231,17 @@ namespace SimpleTransformer.Model
                         feedForward,
                         norm1,
                         norm2,
+                        dropoutRate: TrainingConfig.DropoutRate,
                         name: blockName));
 
                 Log.Information($"Layer {i} constructed in {layerWatch.ElapsedMilliseconds}ms. Total elapsed: {watch.ElapsedMilliseconds}ms.");
                 layerWatch.Restart();
             }
+
+            // Flatten the dropout sites once the architecture is complete, so the
+            // per-step re-key and checkpoint save/load can walk a flat list.
+            CollectDropoutSites();
+
 
             Log.Information($"Transformer architecture initialisation completed in {watch.ElapsedMilliseconds}ms."); 
             watch.Stop();

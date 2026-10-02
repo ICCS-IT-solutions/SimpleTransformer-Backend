@@ -6,7 +6,7 @@ using SimpleTransformer.Model.Extensions.Numerics;
 
 namespace SimpleTransformer.Model
 {
-    public class MultiHeadAttention : ITrainableLayer
+    public class MultiHeadAttention : ITrainableLayer, IDropoutControl
     {
         public string Name { get; }
         private readonly AttentionHead[] _heads;
@@ -188,6 +188,39 @@ namespace SimpleTransformer.Model
                 // Release local workspace buffers
                 workspace.Release(headGradient);
                 workspace.Release(dInputHead);
+            }
+        }
+
+        // Push dropout control down to every head's attention module.
+        public void SetDropoutEnabled(bool enabled)
+        {
+            for (int i = 0; i < _heads.Length; i++)
+            {
+                _heads[i].SetDropoutEnabled(enabled);
+            }
+        }
+
+        public void SetDropoutRate(float rate)
+        {
+            for (int i = 0; i < _heads.Length; i++)
+            {
+                _heads[i].SetDropoutRate(rate);
+            }
+        }
+
+        public void PrepareDropoutForStep(long step)
+        {
+            for (int i = 0; i < _heads.Length; i++)
+            {
+                _heads[i].PrepareDropoutForStep(step);
+            }
+        }
+
+        public void CollectDropoutSites(List<DropoutSite> sites)
+        {
+            for (int i = 0; i < _heads.Length; i++)
+            {
+                _heads[i].CollectDropoutSites(sites);
             }
         }
 

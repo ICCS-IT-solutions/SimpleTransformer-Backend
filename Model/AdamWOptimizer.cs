@@ -114,6 +114,100 @@ namespace SimpleTransformer.Model
             _stepCount = stepCount;
         }
 
+        /// <summary>
+        /// Snapshot of the first/second moments keyed by parameter name (the same
+        /// key the checkpoint's parameter block uses) plus the bias-correction step.
+        /// </summary>
+        public OptimizerState ExportState()
+        {
+            var entries = new List<OptimizerParamState>(_state.Count);
+
+            foreach (var kvp in _state)
+            {
+                entries.Add(new OptimizerParamState
+                {
+                    Name = kvp.Key,
+                    FirstMoment = new TensorData
+                    {
+                        Shape = kvp.Value.FirstMoment.Shape,
+                        Data = kvp.Value.FirstMoment.Data
+                    },
+                    SecondMoment = new TensorData
+                    {
+                        Shape = kvp.Value.SecondMoment.Shape,
+                        Data = kvp.Value.SecondMoment.Data
+                    }
+                });
+            }
+
+            return new OptimizerState
+            {
+                Kind = OptimizerStateKinds.AdamW,
+                StepCount = _stepCount,
+                Parameters = entries
+            };
+        }
+
+        public int ImportState(OptimizerState state, IReadOnlyList<TrainableParameter> parameters)
+        {
+            ArgumentNullException.ThrowIfNull(state);
+            ArgumentNullException.ThrowIfNull(parameters);
+
+            if (state.Kind != OptimizerStateKinds.AdamW)
+            {
+                throw new InvalidDataException(
+                    $"Optimizer state was produced by optimizer kind {state.Kind}, " +
+                    $"but this is an AdamW optimizer (kind {OptimizerStateKinds.AdamW}).");
+            }
+
+            // Expected shape per parameter name, so a corrupt or stale snapshot
+            // cannot install a moment buffer that the update loop would index past.
+            var expectedShapes = new Dictionary<string, int[]>(parameters.Count);
+            foreach (var p in parameters)
+                expectedShapes[p.Name] = p.Value.Shape;
+
+            // Replace any live state rather than merging into it.
+            ResetState();
+
+            // Bias correction resumes at the saved step: zeroing it would mis-scale
+            // the first post-resume steps even though the schedule continues.
+            _stepCount = state.StepCount;
+
+            int skipped = 0;
+            foreach (var entry in state.Parameters)
+            {
+                if (entry.FirstMoment == null || entry.SecondMoment == null ||
+                    !expectedShapes.TryGetValue(entry.Name, out int[]? expectedShape) ||
+                    !ShapeMatches(expectedShape, entry.FirstMoment.Shape) ||
+                    !ShapeMatches(expectedShape, entry.SecondMoment.Shape) ||
+                    !entry.FirstMoment.IsValid || !entry.SecondMoment.IsValid)
+                {
+                    skipped++;
+                    continue;
+                }
+
+                var firstMoment = new Tensor(entry.FirstMoment.Shape);
+                Array.Copy(entry.FirstMoment.Data, firstMoment.Data, firstMoment.Data.Length);
+
+                var secondMoment = new Tensor(entry.SecondMoment.Shape);
+                Array.Copy(entry.SecondMoment.Data, secondMoment.Data, secondMoment.Data.Length);
+
+                _state[entry.Name] = (firstMoment, secondMoment);
+            }
+
+            return skipped;
+        }
+
+        private static bool ShapeMatches(int[] expected, int[] actual)
+        {
+            if (expected.Length != actual.Length) return false;
+            for (int i = 0; i < expected.Length; i++)
+            {
+                if (expected[i] != actual[i]) return false;
+            }
+            return true;
+        }
+
         public void ResetState()
         {
             foreach (var kvp in _state)

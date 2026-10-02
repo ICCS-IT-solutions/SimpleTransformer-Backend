@@ -135,6 +135,12 @@ namespace SimpleTransformer
                 Environment.Exit(ok ? 0 : 1);
             }
 
+            // Dropout layer self-test (no server start): dotnet run -- --dropout-selftest
+            if (args.Contains("--dropout-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.DropoutSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
             ConfigureLogging();
 
             //Inject the model via constructor DI 
