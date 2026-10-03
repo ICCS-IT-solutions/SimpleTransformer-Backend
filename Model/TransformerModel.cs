@@ -49,6 +49,38 @@ namespace SimpleTransformer.Model
         public int GlobalStep => _globalStep;
 
         /// <summary>
+        /// Snapshot of the optimizer's training state (moments/velocity plus
+        /// bias-correction step). Used by the v5 checkpoint writer and by the
+        /// resume-exactness self-test for direct before/after comparison.
+        /// </summary>
+        internal OptimizerState ExportOptimizerState() => _optimizer.ExportState();
+
+        /// <summary>
+        /// The model's training workspace (checkpoint tests exercise the same
+        /// pooled loss-backward path TrainStep uses).
+        /// </summary>
+        internal TensorWorkspace Workspace => _workspace;
+
+        /// <summary>Checkpoint/determinism tests: reach a transformer block.</summary>
+        internal TransformerBlock BlockForTest(int index) => (TransformerBlock)_layers[index];
+
+        /// <summary>Checkpoint/determinism tests: number of transformer blocks.</summary>
+        internal int LayerCount => _layers.Count;
+
+        /// <summary>
+        /// Replaces the live optimizer state (checkpoint tests: wipe control).
+        /// </summary>
+        internal int ImportOptimizerState(OptimizerState state) =>
+            _optimizer.ImportState(
+                state, Parameters as IReadOnlyList<TrainableParameter> ?? Parameters.ToList());
+
+        /// <summary>
+        /// The model's durable dropout sites: architecture-keyed identity plus
+        /// salt/step. Internal so checkpoint round-trip tests can compare salts.
+        /// </summary>
+        internal IReadOnlyList<DropoutSite> DropoutSites => _dropoutSites;
+
+        /// <summary>
         /// Per-run LR policy. Null until <see cref="ConfigureScheduler"/> is
         /// called by the training loop; when null the optimizer's configured
         /// base rate is used unchanged (legacy flat-LR path).
@@ -261,6 +293,53 @@ namespace SimpleTransformer.Model
         }
 
         /// <summary>
+        /// Restores the durable per-site dropout state (salt + keyed step) from
+        /// a v5 checkpoint, matched by <see cref="DropoutSite.Key"/>. Per-item
+        /// mask layers stay derived: a freshly built item reseeds from the
+        /// restored salt, so batch size is irrelevant here.
+        /// <para>
+        /// A site missing from the checkpoint, or a checkpoint key unknown to
+        /// this model, is warned about rather than fatal: config validation has
+        /// already rejected architecture changes before load, so either case
+        /// indicates a keying defect, not a legitimately different model.
+        /// </para>
+        /// </summary>
+        /// <returns>Number of live sites matched and restored.</returns>
+        private int RestoreDropoutSites(IReadOnlyList<CheckpointStateExtensions.DropoutSiteState> saved)
+        {
+            var byKey = new Dictionary<string, CheckpointStateExtensions.DropoutSiteState>(saved.Count);
+            for (int i = 0; i < saved.Count; i++)
+                byKey[saved[i].Key] = saved[i];
+
+            int restored = 0;
+            foreach (DropoutSite site in _dropoutSites)
+            {
+                if (byKey.TryGetValue(site.Key, out var state))
+                {
+                    site.Salt = state.Salt;
+                    site.PrepareForStep(state.Step);
+                    byKey.Remove(site.Key);
+                    restored++;
+                }
+                else
+                {
+                    Log.Warning(
+                        "Dropout site {Key} is absent from the checkpoint; keeping its fresh random salt (mask replay will differ for this site).",
+                        site.Key);
+                }
+            }
+
+            foreach (string unknownKey in byKey.Keys)
+            {
+                Log.Warning(
+                    "Checkpoint carries dropout site {Key} unknown to this model; ignored.",
+                    unknownKey);
+            }
+
+            return restored;
+        }
+
+        /// <summary>
         /// Embedding-output dropout split per batch item so each mask is a pure
         /// function of (salt, step, item). Rank-2 (single sequence) uses item 0;
         /// Rank-3 applies ForItem(b) per slice like the attention path.
@@ -310,6 +389,7 @@ namespace SimpleTransformer.Model
         
         public (TensorBase logits, TensorBase hiddenState) Forward(TensorBase input)
         {
+            MultiHeadAttention.WatchedConcatsForTest.Clear();
             bool verbose = TrainingStepProfile.Enabled;
             if (verbose)
                 Log.Information("Starting forward pass through the transformer model...");
@@ -493,7 +573,10 @@ namespace SimpleTransformer.Model
             
             // Fixed 4-byte header (no length prefix)
             writer.Write("STCK"u8); 
-            writer.Write(4); // Schema version (v4 adds the LR scheduler step)
+            // v5 appends the optimizer + dropout-site training-state trailer
+            // after the parameter block; v2-v4 have no trailer and still load
+            // (with logged restart warnings).
+            writer.Write(5);
 
             //Add the transformer model id to the checkpoint file 
             writer.Write(TransformerModelId.ToByteArray());
@@ -535,9 +618,17 @@ namespace SimpleTransformer.Model
                     WriteTensor(writer, gradData);
                 }
             }
+
+            // v5: training-state trailer. Without it a resume restores weights
+            // but restarts AdamW moments/bias correction at zero and re-salts
+            // every dropout site, so the run leaves the original trajectory
+            // even though the LR schedule picks up correctly.
+            CheckpointStateExtensions.WriteOptimizerState(writer, _optimizer.ExportState());
+            CheckpointStateExtensions.WriteDropoutSiteStates(writer, _dropoutSites);
         }
 
-        private static void WriteTensor(BinaryWriter writer, TensorData tensor)
+        // Shared with CheckpointStateExtensions (v5 trailer tensor I/O).
+        internal static void WriteTensor(BinaryWriter writer, TensorData tensor)
         {
             if (!tensor.IsValid)
             {
@@ -589,10 +680,12 @@ namespace SimpleTransformer.Model
             //QLoRA=true and remain loadable.
             //v4 appends the LR scheduler step after (epoch, loss); v2/v3 load
             //with step 0 (schedule restarts - logged below).
-            if (version != 2 && version != 3 && version != 4)
+            //v5 appends the optimizer + dropout-site training-state trailer
+            //after the parameter block.
+            if (version < 2 || version > 5)
             {
                 throw new InvalidDataException(
-                    $"Unsupported checkpoint schema version: {version}. Expected 2, 3 or 4.");
+                    $"Unsupported checkpoint schema version: {version}. Expected 2, 3, 4 or 5.");
             }
             //Validate the checkpoint model id against the loaded model
 
@@ -693,6 +786,42 @@ namespace SimpleTransformer.Model
             model.LoadCheckpointData(loadedParameters);
             model._globalStep = savedGlobalStep;
 
+            // v5: training-state trailer follows the parameter block on the
+            // stream. Restoring it after hydration keeps the v2-v4 path untouched.
+            OptimizerState? savedOptimizerState = null;
+            List<CheckpointStateExtensions.DropoutSiteState>? savedDropoutSites = null;
+            if (version >= 5)
+            {
+                savedOptimizerState = CheckpointStateExtensions.ReadOptimizerState(reader);
+                savedDropoutSites = CheckpointStateExtensions.ReadDropoutSiteStates(reader);
+            }
+
+            if (savedOptimizerState != null)
+            {
+                var parameterList = model.Parameters as IReadOnlyList<TrainableParameter>
+                    ?? model.Parameters.ToList();
+
+                // A kind mismatch (AdamW snapshot into SGD or vice versa) throws
+                // here: the layouts are not interchangeable, so failing loudly
+                // beats silently restarting the moments.
+                int skippedEntries =
+                    model._optimizer.ImportState(savedOptimizerState, parameterList);
+                if (skippedEntries > 0)
+                {
+                    Log.Warning(
+                        "Optimizer state import skipped {Skipped} of {Total} entries (unknown or shape-mismatched parameters).",
+                        skippedEntries, savedOptimizerState.Parameters.Count);
+                }
+
+                int restoredSites = model.RestoreDropoutSites(savedDropoutSites!);
+                Log.Information(
+                    "v5 training state restored: optimizer kind {Kind}, bias-correction step {StepCount}, dropout sites {Restored}/{Total}.",
+                    savedOptimizerState.Kind,
+                    savedOptimizerState.StepCount,
+                    restoredSites,
+                    savedDropoutSites!.Count);
+            }
+
             if (version < 4 && savedGlobalStep == 0)
             {
                 Log.Warning(
@@ -710,7 +839,8 @@ namespace SimpleTransformer.Model
             return (epoch, loss);
         }       
 
-        private static TensorData ReadTensorOptimized(BinaryReader reader)
+        // Shared with CheckpointStateExtensions (v5 trailer tensor I/O).
+        internal static TensorData ReadTensorOptimized(BinaryReader reader)
         {
             int rank = reader.ReadInt32();
             if (rank <= 0 || rank > 8)

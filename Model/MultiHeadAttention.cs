@@ -11,6 +11,20 @@ namespace SimpleTransformer.Model
         public string Name { get; }
         private readonly AttentionHead[] _heads;
         private readonly ILinearLayer _outputProjection;
+
+        /// <summary>Checkpoint/determinism tests: reach the out-projection.</summary>
+        internal ILinearLayer OutputProjectionForTest => _outputProjection;
+
+        /// <summary>
+        /// Determinism diagnostics: the concatenation buffers created by the
+        /// forwards on this thread, so the workspace can report if anything
+        /// releases one (a use-after-release would let a later borrow overwrite
+        /// Backward's dW operand).
+        /// </summary>
+        internal static readonly System.Collections.Generic.List<TensorBase> WatchedConcatsForTest = new();
+
+        /// <summary>Determinism diagnostics: enable concat use-after-release watching.</summary>
+        internal static bool WatchEnabledForTest;
         private readonly int _embeddingSize;
         private readonly int _headSize;
 
@@ -68,14 +82,17 @@ namespace SimpleTransformer.Model
             
             // Borrow buffer from workspace instead of 'new Tensor(...)'
             TensorBase concatenated = workspace.Borrow2D(rows, _embeddingSize);
+            WatchedConcatsForTest.Add(concatenated);
 
             ComputeForwardSequenceInternal(input, mask, concatenated, workspace);
 
             TensorBase output = _outputProjection.Forward(concatenated, workspace);
 
-            // Release intermediate buffer after projection completes
-            workspace.Release(concatenated);
-
+            // concatenated must stay borrowed: it is _outputProjection's
+            // _lastInput, which Backward reads for dW. Releasing it here let
+            // later same-shape borrows overwrite it behind the cache's back
+            // (use-after-release = nondeterministic gradients). Reclaimed by
+            // the step's workspace Reset.
             return output;
         }
 
@@ -98,9 +115,8 @@ namespace SimpleTransformer.Model
 
             TensorBase output = _outputProjection.Forward(concatenatedBatch, workspace);
 
-            // Release 3D intermediate buffer
-            workspace.Release(concatenatedBatch);
-
+            // concatenatedBatch stays borrowed for _outputProjection's
+            // _lastInput cache (Backward reads it); see ForwardSequence.
             return output;
         }
 

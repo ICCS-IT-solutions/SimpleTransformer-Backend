@@ -54,6 +54,11 @@
 //   DropoutSite salts. Planned as a v5 training-state trailer.
 //   Also note: mid-epoch temp checkpoints become the job's resume pointer
 //   (TrainingJobExtensions), so they must carry full state too.
+//   DONE (v5): trailer carries optimizer m/v/velocity + bias-correction step
+//   and each DropoutSite's salt + keyed step; mid-epoch temp checkpoints use
+//   the same SaveCheckpoint so the resume pointer carries full state too.
+//   v2-v4 stay loadable (optimizer/dropout restart with a logged warning).
+//   Verified by `dotnet run -- --resume-exactness-selftest`.
 // □ Unit tests
 // □ Performance profiling
 

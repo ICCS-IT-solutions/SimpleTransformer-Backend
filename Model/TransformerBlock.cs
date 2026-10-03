@@ -12,6 +12,9 @@ namespace SimpleTransformer.Model
         public string Name { get; }
 
         private readonly ITrainableLayer _multiHeadAttention;
+
+        /// <summary>Checkpoint/determinism tests: reach the attention module.</summary>
+        internal MultiHeadAttention MultiHeadAttentionForTest => (MultiHeadAttention)_multiHeadAttention;
         private readonly ITrainableLayer _feedForward;
         private readonly ITrainableLayer _layerNorm1;
         private readonly ITrainableLayer _layerNorm2;
@@ -130,7 +133,13 @@ namespace SimpleTransformer.Model
             TensorBase residual2 = workspace.BorrowLike(norm1);
             workspace.Backend.ElementWiseAddInto(droppedFf, norm1, residual2);
             workspace.Release(droppedFf);
-            workspace.Release(norm1);
+            // norm1 stays borrowed: it is _feedForward._expand's _lastInput,
+            // which Backward reads for dW. Releasing it here let later
+            // same-shape borrows overwrite it behind the cache's back
+            // (use-after-release = nondeterministic gradients). Reclaimed by
+            // the step's workspace Reset.
+            // (The residual1/residual2 releases are kept: LayerNorm's
+            // _lastInput cache is shape-only and never reads those values.)
 
             TensorBase output = _layerNorm2.Forward(residual2, workspace);
             workspace.Release(residual2);
@@ -179,7 +188,8 @@ namespace SimpleTransformer.Model
             TensorBase ffResidual = workspace.BorrowLike(droppedFf);
             TensorMathSimd.ElementWiseAddInto(droppedFf, norm1, ffResidual);
             workspace.Release(droppedFf);
-            workspace.Release(norm1);
+            // norm1 stays borrowed: _feedForward._expand's _lastInput cache
+            // reads it in Backward (see ForwardSequence). Reclaimed by Reset.
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(ffResidual, "FeedForward Post-Residual");
 

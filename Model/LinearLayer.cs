@@ -31,6 +31,24 @@ namespace SimpleTransformer.Model
 
         private TensorBase? _lastInput;
 
+        /// <summary>Checkpoint/determinism tests: the activation Backward reads.</summary>
+        internal TensorBase? CachedInputForTest => _lastInput;
+
+        /// <summary>
+        /// Determinism diagnostics: the first element of the tensor the last
+        /// Forward actually multiplied against, captured at that instant. If
+        /// this differs from <see cref="CachedInputForTest"/> later, the cached
+        /// buffer was overwritten after the matmul read it.
+        /// </summary>
+        internal float DebugInputHeadAtForward { get; private set; }
+
+        /// <summary>
+        /// Determinism diagnostics: full clone of the tensor the last Forward
+        /// multiplied against, captured at that instant when enabled.
+        /// </summary>
+        internal static bool CaptureInputSnapshotForTest;
+        internal float[]? DebugInputSnapshotForTest { get; private set; }
+
         // VRAM residency (raw training): the weight matrix is a MatMul operand on
         // every forward/backward call, so the Vulkan backend can keep one device
         // copy instead of re-uploading it per call. Registration is attempted once
@@ -131,6 +149,9 @@ namespace SimpleTransformer.Model
                 throw new ArgumentException($"Expected {_inputSize} columns, got {input.Cols}.");
 
             _lastInput = input;
+            DebugInputHeadAtForward = input.ReadOnlySpan[0];
+            if (CaptureInputSnapshotForTest)
+                DebugInputSnapshotForTest = (float[])input.Data.Clone();
 
             // Borrow output buffer from workspace instead of 'new Tensor(...)'
             TensorBase output = workspace.Borrow(

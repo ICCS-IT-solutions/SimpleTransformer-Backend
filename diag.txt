@@ -1,0 +1,83 @@
+Using launch settings from C:\Users\Iain\vscode\llm\SimpleTransformer\SimpleTransformer-Backend\Properties\launchSettings.json...
+=== Resume Exactness Self-Test ===
+
+-- AdamW optimizer state --
+  [PASS] export captures an entry per stepped parameter         kind=0, entries=1
+  [PASS] export captures the bias-correction step               step=5
+  [PASS] import reports nothing skipped                         
+  [PASS] import restores the step count                         5
+  [PASS] a restored AdamW continues bit-for-bit                 weight match after the next step
+  [PASS] a cold AdamW would diverge (test is meaningful)        cold step differs (t=0 vs t=5)
+
+-- AdamW edge cases --
+  [PASS] a never-stepped AdamW exports empty state              entries=0, step=0
+  [PASS] importing empty state is a clean no-op                 
+  [PASS] AdamW rejects an SGD snapshot                          
+  [PASS] shape-mismatched and unknown entries are skipped       skipped=2
+
+-- SGD optimizer state --
+  [PASS] SGD export captures velocity per parameter             kind=1, entries=1
+  [PASS] SGD import reports nothing skipped                     
+  [PASS] a restored SGD continues bit-for-bit                   weight match after the next step
+  [PASS] a cold SGD would diverge (test is meaningful)          momentum buffer lost
+  [PASS] vanilla SGD exports empty state                        
+  [PASS] SGD rejects an AdamW snapshot                          
+
+-- Checkpoint v5 round-trip --
+  [PASS] checkpoints are written at schema v5                   version=5
+  [PASS] the saved optimizer state is non-vacuous               step=4, entries=44
+  [PASS] resume restores the header and global step             epoch=0, loss=0.0000, step=4 vs 4
+  [PASS] resume restores the optimizer state bit-for-bit        kind=0, step=4, entries=44
+  [PASS] resume restores every dropout-site salt                9 sites
+  [PASS] forward replay is deterministic (logits A1 vs A2)      max|diff| = 0
+  [PASS] loss backward is deterministic (dLogits A1 vs A2)      max|diff| = 0
+  [PASS] resumed forward matches (logits A1 vs B)               max|diff| = 0
+  [PASS] resumed loss backward matches (dLogits A1 vs B)        max|diff| = 0
+  [PASS] ZeroGradients clears every gradient buffer             max leftover = 0 at 
+  [INFO] backward determinism (original vs itself)        max|diff| = 0 at , max|g| = 0.44381565
+  [INFO] step-5 gradient replay across resume              max|diff| = 0.40284735 at layers.0.attention.out_proj.weight, max|g| = 0.44381565
+  [INFO] cross profile: layers.0.attention.out_proj.weight=0.40284735, layers.1.attention.out_proj.weight=0.22332188
+  [DIAG] A logits  head = -0.39302382, 0.3363152, -0.6105761, 1.0814502, -0.8155898, 0.2060697
+  [DIAG] A hidden  head = -1.0219238, -1.8108877, 0.26578686, -0.036657244, -1.1435581, 1.2149233
+  [DIAG] A blk0 op input  = -0.7852396, -1.3876313, -0.8734859, 1.1111465, -0.99713206, -0.031921737
+  [DIAG] A blk0 w.row0    = -0.13566071, -0.36540684, -0.21061695, 0.14113896, -0.008663752, -0.40142342
+  [DIAG] A blk1 op input  = -1.9410278, -1.4748887, 0.38521975, -0.04291959, -0.62949806, 0.113064155
+  [DIAG] A blk1 w.row0    = 0.03122214, 0.110022105, -0.3139064, 0.1061987, 0.17220375, -0.20591266
+  [DIAG] A ALIAS blk0.Data==blk1.Data = False
+  [DIAG] A ALIAS blk0.Data==hidden.Data = False
+  [DIAG] A ALIAS blk0.Data==logits.Data = False
+  [DIAG] A blk0 cache active = True, pooled = False, shape=[8,16], dataLen=128
+  [DIAG] A blk0 input@matmul[0] = -0.0696114, cached now[0] = -0.7852396, equal = False
+  [DIAG] B logits  head = -0.39302382, 0.3363152, -0.6105761, 1.0814502, -0.8155898, 0.2060697
+  [DIAG] B hidden  head = -1.0219238, -1.8108877, 0.26578686, -0.036657244, -1.1435581, 1.2149233
+  [DIAG] B blk0 op input  = -0.0696114, 0.58362746, 1.3375409, 1.2817248, 0.5952908, -1.071591
+  [DIAG] B blk0 w.row0    = -0.13566071, -0.36540684, -0.21061695, 0.14113896, -0.008663752, -0.40142342
+  [DIAG] B blk1 op input  = -0.8276115, -0.074438184, -0.09236236, -1.1563122, -0.74617076, 1.4508309
+  [DIAG] B blk1 w.row0    = 0.03122214, 0.110022105, -0.3139064, 0.1061987, 0.17220375, -0.20591266
+  [DIAG] B ALIAS blk0.Data==blk1.Data = False
+  [DIAG] B ALIAS blk0.Data==hidden.Data = False
+  [DIAG] B ALIAS blk0.Data==logits.Data = False
+  [DIAG] B blk0 cache active = True, pooled = False, shape=[8,16], dataLen=128
+  [DIAG] B blk0 input@matmul[0] = -0.0696114, cached now[0] = -0.0696114, equal = True
+  [DIAG] out_proj cache instance pooled at forward end = False
+  [DIAG] out_proj cache instance pooled after backward = False
+  [DIAG] out_proj cache instance pooled at forward end = False
+  [DIAG] out_proj cache instance pooled after backward = False
+  [DIAG] out_proj cache instance pooled at forward end = False
+  [DIAG] out_proj cache instance pooled after backward = False
+  [DIAG] out_proj cache instance pooled at forward end = False
+  [DIAG] out_proj cache instance pooled after backward = False
+  [DIAG] A fwd head = -0.7852396, -1.3876313, -0.8734859, 1.1111465, -0.99713206, -0.031921737
+  [DIAG] B fwd head = -0.0696114, 0.58362746, 1.3375409, 1.2817248, 0.5952908, -1.071591
+  [DIAG] A1 vs A2 = 0, B1 vs B2 = 0
+  [PASS] out_proj cache stable through loss ops (original)      max|diff| = 0
+  [PASS] out_proj cache stable through backward (original)      max|diff| = 0
+  [FAIL] out_proj cache equal across models at forward end      max|diff| = 4.936281
+  [FAIL] out_proj cache equal across models at backward read    max|diff| = 4.936281
+  [PASS] resumed run continues bit-for-bit (dropout active)     loss 4.3383403 vs 4.3383403
+  [INFO] post-step moments continuity                     diverged (max|diff| = 0.013940218 across 44 state tensors (tol 0.0001))
+  [PASS] re-salted control diverges (check is meaningful)       loss 4.3693094 vs 4.3383403
+  [PASS] wiped moments diverge (moment check is meaningful)     max|diff| = 0.033652056 across 44 state tensors (tol 0.0001)
+  [PASS] an AdamW trailer is rejected by an SGD optimizer       
+
+FAILURES PRESENT: 32 passed, 2 failed.

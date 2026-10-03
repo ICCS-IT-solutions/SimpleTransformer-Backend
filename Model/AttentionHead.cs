@@ -71,11 +71,12 @@ namespace SimpleTransformer.Model
                 // 2. Compute attention output
                 TensorBase output = _attention.Forward(q, k, v, mask, workspace);
 
-                // 3. Release intermediate Q, K, V buffers back to workspace pool
-                workspace.Release(q);
-                workspace.Release(k);
-                workspace.Release(v);
-
+                // Q/K/V must stay borrowed: ScaledDotProductAttention caches
+                // them (_lastQ/_lastK/_lastV) and reads them in Backward.
+                // Releasing here let later same-shape borrows clear-and-
+                // overwrite the cached instances (use-after-release), which
+                // made backward gradients intermittently nondeterministic.
+                // The step's workspace Reset reclaims them.
                 return output;
             }
         }
@@ -91,10 +92,8 @@ namespace SimpleTransformer.Model
 
             TensorBase output = _attention.Forward(q, k, v, mask, workspace);
 
-            workspace.Release(q);
-            workspace.Release(k);
-            workspace.Release(v);
-
+            // Q/K/V stay borrowed for Backward's _lastQ/_lastK/_lastV caches
+            // (see ForwardSequence); released by the step's workspace Reset.
             return output;
         }
 

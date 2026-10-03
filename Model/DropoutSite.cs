@@ -37,6 +37,13 @@ namespace SimpleTransformer.Model
         /// </summary>
         public ulong Salt { get; set; }
 
+        /// <summary>
+        /// Optimizer step this site is last keyed for; persisted in the v5
+        /// checkpoint trailer for fidelity. The next TrainStep re-keys from the
+        /// restored global step anyway, so this is informational on resume.
+        /// </summary>
+        public long Step => _step;
+
         public float Rate => _rate;
         public bool Enabled => _enabled;
 

@@ -159,6 +159,7 @@ namespace SimpleTransformer.Model
                 Interlocked.Add(ref _retainedBytes, -FootprintOf(tensor));
                 Interlocked.Decrement(ref _pooledTensorCount);
                 tensor.Clear();
+                WatchCheck(tensor, "borrow");
             }
             else
             {
@@ -250,6 +251,8 @@ namespace SimpleTransformer.Model
             if (!_activeTensors.TryRemove(new TensorEntry(tensor), out _))
                 return;
 
+            WatchCheck(tensor, "release");
+
             var key = new TensorShapeKey(tensor.Shape);
             var bag = _pool.GetOrAdd(key, _ => new ConcurrentBag<TensorBase>());
             bag.Add(tensor);
@@ -280,6 +283,8 @@ namespace SimpleTransformer.Model
 
                 var tensor = pair.Key.Tensor;
 
+                WatchCheck(tensor, "reset");
+
                 // Recycle into the pooled bags by shape key (no Clear: Borrow
                 // clears on the next take, so memory is zeroed exactly once).
                 var key = new TensorShapeKey(tensor.Shape);
@@ -295,6 +300,53 @@ namespace SimpleTransformer.Model
             if (cap > 0 && Interlocked.Read(ref _retainedBytes) > cap)
                 TrimRetainedTo(cap);
         }        
+
+        /// <summary>
+        /// Checkpoint/determinism diagnostics: is this exact tensor instance
+        /// sitting in the idle pool (i.e. recycled while still referenced
+        /// elsewhere by a layer's backward cache)?
+        /// </summary>
+        internal bool IsPooledForTest(TensorBase tensor)
+        {
+            foreach (var bag in _pool.Values)
+            {
+                foreach (TensorBase idle in bag)
+                {
+                    if (ReferenceEquals(idle, tensor))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Checkpoint/determinism diagnostics: is this instance currently a live
+        /// borrow from this workspace?
+        /// </summary>
+        internal bool IsActiveForTest(TensorBase tensor)
+            => _activeTensors.ContainsKey(new TensorEntry(tensor));
+
+        /// <summary>
+        /// Determinism diagnostics: reports the first few times a watched
+        /// concatenation buffer is released/recycled/re-borrowed, with a stack
+        /// trace, so a use-after-release can be localised.
+        /// </summary>
+        private void WatchCheck(TensorBase tensor, string where)
+        {
+            if (!MultiHeadAttention.WatchEnabledForTest ||
+                MultiHeadAttention.WatchedConcatsForTest.Count == 0)
+                return;
+
+            foreach (TensorBase watched in MultiHeadAttention.WatchedConcatsForTest)
+            {
+                if (!ReferenceEquals(watched, tensor))
+                    continue;
+
+                Console.WriteLine($"[WATCH-{where}] a concatenation buffer was touched:");
+                Console.WriteLine(Environment.StackTrace);
+                return;
+            }
+        }
 
         /// <summary>
         /// Evicts idle pooled tensors, largest first, until the pool retains at

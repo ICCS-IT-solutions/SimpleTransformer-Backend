@@ -72,20 +72,17 @@ namespace SimpleTransformer.Model
                 TensorBase activated = _activation.Forward(expanded, workspace);
                 Log.Information($"[FeedForwardLayer.Forward] Finished gelu activation in {forwardWatch.ElapsedMilliseconds} ms.");
 
-                // Release intermediate expansion buffer if GELU created a new tensor
-                if (!ReferenceEquals(expanded, activated))
-                {
-                    workspace.Release(expanded);
-                }
+                // expanded/activated must stay borrowed: GeluLayer._lastInput =
+                // expanded and _project._lastInput = activated, and both are
+                // read by Backward. Releasing them let later same-shape
+                // borrows overwrite the cached instances (use-after-release =
+                // nondeterministic gradients). Reclaimed by workspace Reset.
 
                 // 3. Linear projection: [T, 4C] -> [T, C]
                 forwardWatch.Restart();
                 TensorBase output = _project.Forward(activated, workspace);
                 Log.Information($"[FeedForwardLayer.Forward] Finished linear projection in {forwardWatch.ElapsedMilliseconds} ms.");
                 forwardWatch.Stop();
-
-                // Release intermediate activation buffer after projection finishes
-                workspace.Release(activated);
 
                 return output;
             }
@@ -100,15 +97,10 @@ namespace SimpleTransformer.Model
             TensorBase expanded = _expand.Forward(input, workspace);
             TensorBase activated = _activation.Forward(expanded, workspace);
 
-            if (!ReferenceEquals(expanded, activated))
-            {
-                workspace.Release(expanded);
-            }
+            // expanded/activated stay borrowed for the backward caches
+            // (GeluLayer._lastInput / _project._lastInput); see Forward2D.
 
             TensorBase output = _project.Forward(activated, workspace);
-
-            // Release intermediate activation buffer
-            workspace.Release(activated);
 
             return output;
         }
