@@ -1,4 +1,5 @@
 ﻿using Serilog;
+using Serilog.Events;
 using SimpleTransformer.Api;
 using SimpleTransformer.Model;
 
@@ -142,6 +143,37 @@ namespace SimpleTransformer
                 Environment.Exit(ok ? 0 : 1);
             }
 
+            // Attention softmax-cache recompute self-test (no server start):
+            // dotnet run -- --attention-recompute-selftest
+            // Proves the memory-saving path is bit-identical to caching, since
+            // recompute skips the seq^2 softmax cache only because Backward can
+            // rebuild the identical matrix.
+            if (args.Contains("--attention-recompute-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.AttentionRecomputeSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // Causal attention mask self-test (no server start):
+            // dotnet run -- --causal-mask-selftest
+            // Proves position 0 cannot see the last token, and that the
+            // unmasked control CAN - so the check is not vacuous.
+            if (args.Contains("--causal-mask-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.CausalMaskSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // Temp-checkpoint cadence self-test (no server start):
+            // dotnet run -- --checkpoint-cadence-selftest
+            // The policy is a pure function, so it is verified directly rather
+            // than by driving a training loop.
+            if (args.Contains("--checkpoint-cadence-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.CheckpointCadenceSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
             // Resume exactness self-test (no server start): dotnet run -- --resume-exactness-selftest
             // Without this flag the unknown argument is ignored and the server
             // boots instead - which silently hid this test from the CLI.
@@ -162,11 +194,17 @@ namespace SimpleTransformer
         private static bool _loggingConfigured;
 
         /// <summary>
-        /// Single place that decides where log lines go: console plus a rolling
-        /// daily file. Used by the server start path and by diagnostic flags
-        /// (<c>--train-profile</c>) that must emit logs before the server runs.
-        /// Idempotent, so a diagnostic flag can bring the sinks up early without
-        /// the server path opening a second file sink on the same log.
+        /// Single place that decides where log lines go. Used by the server start
+        /// path and by diagnostic flags (<c>--train-profile</c>) that must emit logs
+        /// before the server runs. Idempotent, so a diagnostic flag can bring the
+        /// sinks up early without the server path opening a second file sink on
+        /// the same log.
+        ///
+        /// Two sinks with deliberately different policies:
+        ///  - Console: errors only. A training loop emits a line per sub-batch, so
+        ///    an information-level console is unusable during a real run and buries
+        ///    the failures that matter. The file keeps full detail.
+        ///  - File: rolling daily, seven files retained (see the filter below).
         /// </summary>
         private static void ConfigureLogging()
         {
@@ -174,13 +212,71 @@ namespace SimpleTransformer
                 return;
 
             _loggingConfigured = true;
-            Log.Logger = new LoggerConfiguration()
-                .MinimumLevel.Information()
-                .WriteTo.Console()
-                .WriteTo.File(
-                    "logs/server-.log",
-                    rollingInterval: RollingInterval.Day)
-                .CreateLogger();
+
+            var config = new LoggerConfiguration()
+                .MinimumLevel.Information();
+
+            ApplySinkPolicy(config);
+
+            Log.Logger = config.CreateLogger();
+        }
+
+        /// <summary>
+        /// Applies the project's sink policy to a logger configuration. Shared by
+        /// the static <see cref="Log.Logger"/> built in <c>Main</c> and by the
+        /// host builder, because <c>builder.Host.UseSerilog()</c> builds its own
+        /// LoggerConfiguration and would otherwise ignore <c>Log.Logger</c> -
+        /// resulting in two loggers writing to the same file with different
+        /// templates and different filters.
+        /// </summary>
+        internal static void ApplySinkPolicy(LoggerConfiguration config)
+        {
+            config
+                //Console: errors only. A training loop emits a line per sub-batch,
+                //so an information-level console is unusable during a real run and
+                //buries the failures that actually matter.
+                .WriteTo.Console(restrictedToMinimumLevel: LogEventLevel.Error)
+
+                //File: full detail, gated by Conditional because the File sink
+                //takes no filterPredicate of its own.
+                .WriteTo.Conditional(
+                    static e => !IsEfCoreInformationNoise(e),
+                    file => file.File(
+                        "logs/server-.log",
+                        rollingInterval: RollingInterval.Day,
+                        //Serilog's default is 31 files; seven daily files is the
+                        //retention window the UI exposes. Pruning happens on
+                        //rollover, so an idle server does not prune until it writes.
+                        retainedFileCountLimit: 7,
+                        //Message renders literally (lj) so EF Core SQL and training
+                        //text stay readable instead of being escaped. {Properties:j}
+                        //carries the training/inference LogContext tags (Component,
+                        //JobId) onto the line - without it the context work would be
+                        //invisible in the file.
+                        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}"));
+        }
+
+        /// <summary>
+        /// True for EF Core's Information-level SQL chatter. EF logs every
+        /// command it executes, and it dominates the log file by volume (6,737
+        /// command dumps against 16 errors on a single day). Warning and above is
+        /// never treated as noise: EF warnings are real diagnostics.
+        /// </summary>
+        internal static bool IsEfCoreInformationNoise(LogEvent logEvent)
+        {
+            if (logEvent.Level >= LogEventLevel.Warning)
+                return false;
+
+            if (!logEvent.Properties.TryGetValue("SourceContext", out var src))
+                return false;
+
+            //SourceContext is a LogEventPropertyValue wrapper, not a raw string,
+            //so it has to be unwrapped before the prefix test.
+            var sourceContext = src?.ToString();
+            return sourceContext != null &&
+                sourceContext.StartsWith(
+                    "Microsoft.EntityFrameworkCore",
+                    StringComparison.Ordinal);
         }
     }
 }

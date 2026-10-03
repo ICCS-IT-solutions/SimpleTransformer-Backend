@@ -19,6 +19,7 @@ namespace SimpleTransformer.AppDb
         public DbSet<TransformerModelEntry> TransformerModels { get; set; } = null!;
         public DbSet<TrainingJobEntry> TrainingJobs { get; set; } = null!;
         public DbSet<TrainingCorpusEntry> TrainingCorpora { get; set; } = null!;
+        public DbSet<FaultEventEntry> FaultEvents { get; set; } = null!;
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -54,6 +55,25 @@ namespace SimpleTransformer.AppDb
             modelBuilder.Entity<TransformerModelEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TrainingJobEntry>().HasKey(x => x.EntryId);
             modelBuilder.Entity<TrainingCorpusEntry>().HasKey(x => x.EntryId);
+            modelBuilder.Entity<FaultEventEntry>().HasKey(x => x.EntryId);
+
+            // ---------------------------------------------------------------------
+            // Fault events
+            // ---------------------------------------------------------------------
+
+            //Fingerprint drives the rollup write path: one lookup per fault to find
+            //the row to increment, so it is indexed. LastSeenAt is indexed because
+            //the viewer lists most-recent-first and prunes on age.
+            modelBuilder.Entity<FaultEventEntry>()
+                .HasIndex(x => x.Fingerprint);
+
+            modelBuilder.Entity<FaultEventEntry>()
+                .HasIndex(x => x.LastSeenAt);
+
+            //Deliberately no FK to TrainingJobs. A fault must outlive the job that
+            //produced it - a job can be deleted long after a run fails, and the
+            //fault record is most valuable exactly when the job is gone. JobId is
+            //stored as a plain string for the same reason.
 
             modelBuilder.Entity<TrainingCorpusEntry>()
                 .HasIndex(x => x.Name)

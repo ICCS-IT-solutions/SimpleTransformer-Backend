@@ -101,20 +101,27 @@ namespace SimpleTransformer.Model
         }
 
         // ILayer forward entry point
-        public TensorBase Forward(TensorBase input, TensorWorkspace workspace)
+        public TensorBase Forward(TensorBase input, TensorWorkspace workspace) => Forward(input, workspace, null);
+
+        /// <summary>
+        /// Forward with an optional attention mask, threaded down to
+        /// ScaledDotProductAttention. A rank-2 mask is position-only (causal) and
+        /// shared by every batch item; a rank-3 mask carries one per item.
+        /// </summary>
+        public TensorBase Forward(TensorBase input, TensorWorkspace workspace, TensorBase? mask)
         {
             return input.Rank switch
             {
-                2 => ForwardSequence(input, workspace),
-                3 => ForwardBatch(input, workspace),
+                2 => ForwardSequence(input, workspace, mask),
+                3 => ForwardBatch(input, workspace, mask),
                 _ => throw new ArgumentException($"Input must be rank 2 or rank 3. Got Rank {input.Rank}.")
             };
         }
 
-        private TensorBase ForwardSequence(TensorBase input, TensorWorkspace workspace)
+        private TensorBase ForwardSequence(TensorBase input, TensorWorkspace workspace, TensorBase? mask)
         {
             // Sub-layer 1: Attention + Dropout + Residual 1 + Norm 1
-            TensorBase attention = _multiHeadAttention.Forward(input, workspace);
+            TensorBase attention = _multiHeadAttention.Forward(input, workspace, mask);
             TensorBase droppedAttention = _dropoutAttention.ForItem(0).Forward(attention, workspace);
             workspace.Release(attention);
 
@@ -147,14 +154,14 @@ namespace SimpleTransformer.Model
             return output;
         }
 
-        private TensorBase ForwardBatch(TensorBase input, TensorWorkspace workspace)
+        private TensorBase ForwardBatch(TensorBase input, TensorWorkspace workspace, TensorBase? mask)
         {
             bool verbose = TrainingStepProfile.Enabled;
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(input, "Block Input");
 
             // 1. Attention Pass
-            TensorBase attention = _multiHeadAttention.Forward(input, workspace);
+            TensorBase attention = _multiHeadAttention.Forward(input, workspace, mask);
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(attention, "Attention Pre-Residual");
 

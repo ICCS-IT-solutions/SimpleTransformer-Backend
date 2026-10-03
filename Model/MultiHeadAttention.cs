@@ -107,7 +107,16 @@ namespace SimpleTransformer.Model
             for (int b = 0; b < layers; b++)
             {
                 TensorBase inputSlice = TensorUtilitiesSimd.GetLayer(input, b);
-                TensorBase? maskSlice = mask != null ? TensorUtilitiesSimd.GetLayer(mask, b) : null;
+                // A causal mask is position-only and identical for every batch
+                // item, so a rank-2 mask is passed straight through. Only a
+                // genuinely per-item mask (e.g. a padding mask expanded to rank 3)
+                // needs slicing.
+                TensorBase? maskSlice = mask switch
+                {
+                    null => null,
+                    var m when m.Rank == 2 => m,
+                    var m => TensorUtilitiesSimd.GetLayer(m, b)
+                };
                 TensorBase concatSlice = TensorUtilitiesSimd.GetLayer(concatenatedBatch, b);
 
                 ComputeForwardSequenceInternal(inputSlice, maskSlice, concatSlice, workspace);

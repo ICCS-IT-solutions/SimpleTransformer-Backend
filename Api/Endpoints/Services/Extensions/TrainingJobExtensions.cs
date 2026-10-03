@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Serilog;
+using Serilog.Context;
 using SimpleTransformer.Api.Endpoints.Services;
 using SimpleTransformer.Api.Endpoints.Services.Extensions;
 using SimpleTransformer.Api.ManagementEngine;
@@ -123,6 +124,18 @@ public static class TrainingJobExtensions
         TrainingJobManager jobManager     
     )
     {
+        //LogContext is AsyncLocal-backed and this loop runs detached via Task.Run
+        //(see TrainingService: "the loop runs detached so the POST returns
+        //immediately"), so a context pushed by the request that started the job
+        //would not survive - and TrainingJobManager.Reset can relaunch a loop from
+        //an unrelated request. Pushing here, inside the loop itself, keeps the
+        //tags attached to the work for its whole lifetime across detach, pause,
+        //resume and relaunch. These flow into every Log call below, including the
+        //per-batch loss lines and the nested Task.Run inside TrainStepAsync.
+        using var componentScope = LogContext.PushProperty("Component", "training");
+        using var jobScope = LogContext.PushProperty("JobId", job.EntryId);
+        using var modelScope = LogContext.PushProperty("ModelId", model.TransformerModelId);
+
         int batchSize = config?.BatchSize ?? model.TrainingConfig.BatchSize;
         bool dropLast = model.TrainingConfig.DropLast;
         int window = model.Config.MaxSequenceLength;
@@ -310,11 +323,82 @@ public static class TrainingJobExtensions
 
         // 1. Begin training. This notifies other endpoint services that the model is busy training and should not be used.
         model.BeginTraining();
+
+        // --- Temp-checkpoint cadence ---
+        //The temp checkpoint is the job's resume pointer and costs the FULL
+        //parameter block (weights + gradients + the v5 AdamW m/v trailer), so
+        //at 208.8M parameters every write is ~3.34 GB. It used to be written
+        //once per outer batch, and the outer batch is capped at 8 steps - ~70
+        //writes, ~234 GB of traffic, on a 4.5M-token corpus. These counters
+        //decouple that from the progress-display grouping.
+        //
+        //Measured off model.GlobalStep rather than a counter incremented in the
+        //inner loops: it is already the authoritative optimiser step count, it
+        //is itself checkpointed so it stays consistent across a resume, and it
+        //keeps the hot path untouched (a plain property read).
+        int globalStepAtLastTempCheckpoint = model.GlobalStep;
+        DateTime lastTempCheckpointUtc = DateTime.UtcNow;
+
+        //Hoisted so the cancellation handler can still write a checkpoint: the
+        //epoch and its loss are locals inside the try block.
+        int lastEpochIndex = startEpoch - 1;
+        float lastEpochLoss = 0f;
+
+        //The model name only changes if the model row is renamed, so resolve it
+        //once per run rather than once per checkpoint.
+        string? checkpointModelName = null;
+
+        bool DueForTempCheckpoint() =>
+            CheckpointCadenceSettings.ShouldWriteTempCheckpoint(
+                model.GlobalStep - globalStepAtLastTempCheckpoint,
+                DateTime.UtcNow - lastTempCheckpointUtc);
+
+        void MarkTempCheckpointWritten()
+        {
+            globalStepAtLastTempCheckpoint = model.GlobalStep;
+            lastTempCheckpointUtc = DateTime.UtcNow;
+        }
+
+        //Shared by the streaming and legacy-batched paths, which previously each
+        //carried their own copy of this block.
+        async Task WriteTempCheckpointAsync(int epochIndex, float loss)
+        {
+            checkpointModelName ??= await GetModelNameFromId(dbFactory, modelEntry.EntryId);
+            string checkpointDirname = $"checkpoints/{checkpointModelName}";
+            Directory.CreateDirectory(checkpointDirname);
+
+            //Deterministic name, overwritten in place: one DB row per file via
+            //the upsert, and no unbounded pile of near-identical checkpoints.
+            string checkpointFilename = $"checkpoint-epoch-{epochIndex + 1}-temp.bin";
+            string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
+
+            await using (var ckptStream = File.Create(checkpointFilepath))
+            {
+                model.SaveCheckpoint(ckptStream, epochIndex, loss);
+            }
+
+            var entry = await UpsertCheckpointAsync(
+                dbFactory,
+                model.TransformerModelId,
+                $"{checkpointDirname}/",
+                checkpointFilename,
+                epochIndex + 1,
+                loss,
+                new FileInfo(checkpointFilepath).Length);
+
+            await UpdateJob(dbFactory, job.EntryId, j =>
+            {
+                j.CheckpointFilename = checkpointFilepath;
+                j.TrainingCheckpointId = entry.EntryId;
+            });
+        }
+
         try
         {
             // 2. Training loop
             for (int epoch = startEpoch; epoch < totalEpochs; epoch++)
             {
+                lastEpochIndex = epoch;
                 float epochLoss = 0f;
                 int stepsCompleted = 0;
                 // Deterministic per-epoch seed: streaming shuffles window
@@ -388,32 +472,11 @@ public static class TrainingJobExtensions
                                     Log.Information($"Epoch {epoch + 1}, Batch {batchNo}, Sub-Batch {subNo} training loss: {epochLoss:F6}");
                                 }
                             }
-                            var transformerModelName = await GetModelNameFromId(dbFactory, modelEntry.EntryId);
-                            var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-temp.bin";
-                            var checkpointDirname = $"checkpoints/{transformerModelName}";
-                            Directory.CreateDirectory(checkpointDirname);
-
-                            string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
-
-                            await using (var ckptStream = File.Create(checkpointFilepath))
+                            if (DueForTempCheckpoint())
                             {
-                                model.SaveCheckpoint(ckptStream, epoch, epochLoss);
+                                await WriteTempCheckpointAsync(epoch, epochLoss);
+                                MarkTempCheckpointWritten();
                             }
-
-                            var checkpointEntry = await UpsertCheckpointAsync(
-                                dbFactory,
-                                model.TransformerModelId,
-                                $"checkpoints/{transformerModelName}/",
-                                checkpointFilename,
-                                epoch + 1,
-                                epochLoss,
-                                new FileInfo(checkpointFilepath).Length);
-
-                            await UpdateJob(dbFactory, job.EntryId, job =>
-                            {
-                                job.CheckpointFilename = checkpointFilepath;
-                                job.TrainingCheckpointId = checkpointEntry.EntryId;
-                            });
                             batch++;
                         }
                     }
@@ -471,35 +534,14 @@ public static class TrainingJobExtensions
                         }
                         //It may be helpful to save temporary checkpoints here, and simply overwrite them. Possible name could be checkpoint-epoch-{epoch}-temp.bin
                         //This can help prevent loss of progress should a training run fail or be stopped.
-                        //Get the transformer config name from the model entry
-                        var transformerModelName = await GetModelNameFromId(dbFactory, modelEntry.EntryId);
-                        var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-temp.bin";
-                        var checkpointDirname = $"checkpoints/{transformerModelName}";
-                        Directory.CreateDirectory(checkpointDirname);
-
-                        string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
-
-                        await using (var ckptStream = File.Create(checkpointFilepath))
+                        //Cadence is decoupled from the display grouping above: on the
+                        //pre-change code this ran every 8 optimiser steps, which at
+                        //208.8M parameters is a ~3.34 GB write each time.
+                        if (DueForTempCheckpoint())
                         {
-                            model.SaveCheckpoint(ckptStream, epoch, epochLoss);
+                            await WriteTempCheckpointAsync(epoch, epochLoss);
+                            MarkTempCheckpointWritten();
                         }
-
-                        //The temp checkpoint file is overwritten in place, so upsert a single
-                        //DB record per file instead of inserting a new row after every batch.
-                        var checkpointEntry = await UpsertCheckpointAsync(
-                            dbFactory,
-                            model.TransformerModelId,
-                            $"checkpoints/{transformerModelName}/",
-                            checkpointFilename,
-                            epoch + 1,
-                            epochLoss,
-                            new FileInfo(checkpointFilepath).Length);
-
-                        await UpdateJob(dbFactory, job.EntryId, job =>
-                        {
-                            job.CheckpointFilename = checkpointFilepath;
-                            job.TrainingCheckpointId = checkpointEntry.EntryId;
-                        });
                     }
                     } // end legacy buffered >8 path
                 }
@@ -558,6 +600,7 @@ public static class TrainingJobExtensions
                 // Average over STEPS actually taken (streaming reuses 2 buffers,
                 // so miniBatches is empty there): identical scale on both paths.
                 epochLoss /= Math.Max(1, stepsCompleted);
+                lastEpochLoss = epochLoss;
 
                 Log.Information($"Epoch {epoch + 1}: Loss={epochLoss:F6}");
                 await UpdateJob(dbFactory, job.EntryId, job =>
@@ -593,8 +636,23 @@ public static class TrainingJobExtensions
                         Log.Information("Memory after epoch {Epoch}: {Memory}", epoch + 1, memory);
                 });
 
-                // Save checkpoint periodically via TransformerModel. Every 5 epochs or on the last epoch, save a checkpoint
-                if ((epoch + 1) % 5 == 0 || epoch == totalEpochs - 1)
+                // Refresh the resume pointer at EVERY epoch boundary, not just on the
+                //periodic epochs below. Without this, an epoch that is not a
+                //multiple of the checkpoint interval would leave the resume
+                //pointer wherever the last mid-epoch write put it, so a crash
+                //could cost a whole epoch of work. One extra write per epoch is
+                //cheap next to the traffic this cadence removes.
+                if (CheckpointCadenceSettings.Enabled)
+                {
+                    await WriteTempCheckpointAsync(epoch, epochLoss);
+                    MarkTempCheckpointWritten();
+                }
+
+                // Save checkpoint periodically via TransformerModel. Every
+                // CheckpointCadenceSettings.EpochCheckpointInterval epochs (floored at
+                // 5), or on the last epoch.
+                int epochInterval = CheckpointCadenceSettings.EpochCheckpointInterval;
+                if ((epoch + 1) % epochInterval == 0 || epoch == totalEpochs - 1)
                 {
                     var transformerModelName = await GetModelNameFromId(dbFactory, modelEntry.EntryId);
                     var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-loss-{epochLoss:F6}.bin";
@@ -650,6 +708,38 @@ public static class TrainingJobExtensions
                 "Training job {JobId} was stopped or cancelled.",
                 job.EntryId);
 
+            // A graceful stop must not throw away the work since the last temp
+            // checkpoint. Best-effort: a checkpoint failure here must never turn
+            // a clean stop into a crash, so it is swallowed and the stop still
+            // completes normally.
+            if (CheckpointCadenceSettings.Enabled)
+            {
+                try
+                {
+                    await WriteTempCheckpointAsync(lastEpochIndex, lastEpochLoss);
+                    MarkTempCheckpointWritten();
+                    Log.Information(
+                        "Training job {JobId} wrote a final temp checkpoint at step {Step}.",
+                        job.EntryId, model.GlobalStep);
+                }
+                catch (Exception ckptEx)
+                {
+                    Log.Warning(ckptEx,
+                        "Training job {JobId}: final temp checkpoint failed; the last one on disk still stands.",
+                        job.EntryId);
+
+                    //Worth keeping: a checkpoint that cannot be written means the
+                    //run's remaining work is unrecoverable, and this is otherwise
+                    //only a warning that scrolls past.
+                    FaultRecorder.Record(
+                        dbFactory,
+                        ckptEx,
+                        "training",
+                        jobId: job.EntryId,
+                        modelId: model.TransformerModelId);
+                }
+            }
+
             //Cancel records its own terminal status; a plain stop is recorded as
             //Stopped. Either way a cancelled run must not be reported as completed.
             await UpdateJob(dbFactory, job.EntryId, job =>
@@ -675,6 +765,9 @@ public static class TrainingJobExtensions
             //failure the user cannot act on.
             Log.Error(ex, "Training job {JobId} ran out of host memory.", job.EntryId);
 
+            //Not persisted: FaultRecorder deliberately skips OOM (the write
+            //allocates, and competing with an exhausted heap is the likeliest
+            //way to fail a second time). The job row below is the durable record.
             await UpdateJob(dbFactory, job.EntryId, job =>
             {
                 job.Status = TrainingJobStatus.Failed;
@@ -687,6 +780,16 @@ public static class TrainingJobExtensions
         {
             //Without this a faulting loop left the job reading as Running forever.
             Log.Error(ex, "Training job {JobId} failed.", job.EntryId);
+
+            //Recorded before the job row is updated: this is the failure that
+            //survives the log file's seven-day rotation, and the job can be
+            //deleted at any time.
+            FaultRecorder.Record(
+                dbFactory,
+                ex,
+                "training",
+                jobId: job.EntryId,
+                modelId: model.TransformerModelId);
 
             await UpdateJob(dbFactory, job.EntryId, job =>
             {

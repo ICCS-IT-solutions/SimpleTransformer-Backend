@@ -1,6 +1,7 @@
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
+using Serilog.Context;
 using SimpleTransformer.Api.Endpoints.Factories;
 using SimpleTransformer.Api.ManagementEngine;
 using SimpleTransformer.Api.Requests;
@@ -34,6 +35,11 @@ namespace SimpleTransformer.Api.Endpoints.Services
 
         public async Task<ApiResponse<InferenceResponse>> Infer(InferenceRequest req)
         {
+            //Inference is request-scoped (no detached loop), so the context lives
+            //for exactly this call and tags every log line and fault below.
+            using var componentScope = LogContext.PushProperty("Component", "inference");
+            using var modelScope = LogContext.PushProperty("ModelId", req.TransformerModelId);
+
             using var db = await _dbFactory.CreateDbContextAsync();
             var modelEntry = db.TransformerModels.FirstOrDefault(x => x.EntryId == req.TransformerModelId);
 
@@ -147,6 +153,15 @@ namespace SimpleTransformer.Api.Endpoints.Services
                     }
                     catch (Exception ex)
                     {
+                        //Recorded: a checkpoint that will not load is the failure a
+                        //user hits most often (corrupt or missing binary), and it
+                        //is otherwise only visible as a 500 in the response body.
+                        FaultRecorder.Record(
+                            _dbFactory,
+                            ex,
+                            "inference",
+                            modelId: model.TransformerModelId);
+
                         return new ApiResponse<InferenceResponse>
                         {
                             Message = $"Failed to load checkpoint '{checkpointEntry.Filename}': {ex.Message}",

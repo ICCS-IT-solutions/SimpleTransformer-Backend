@@ -10,6 +10,9 @@ using Microsoft.EntityFrameworkCore.Design;
 using SimpleTransformer.Api.Endpoints.Factories;
 using SimpleTransformer.Api.ManagementEngine;
 using MemSettings = SimpleTransformer.Model.MemoryPressureSettings;
+using AttentionSettings = SimpleTransformer.Model.AttentionMemorySettings;
+using CkptSettings = SimpleTransformer.Model.CheckpointCadenceSettings;
+using MaskSettings = SimpleTransformer.Model.AttentionMaskSettings;
 
 namespace SimpleTransformer.Api
 {
@@ -22,6 +25,13 @@ namespace SimpleTransformer.Api
 
         public void Start()
         {
+            //Hoisted out of the try so the catch can persist a startup fault: the
+            //factory is the one thing that survives a partially-built host, and
+            //a fault recorded before the container exists is exactly the one you
+            //most want to keep. Null until the container is built, and
+            //FaultRecorder tolerates a null factory (see Record).
+            IDbContextFactory<AppDbContext>? faultDbFactory = null;
+
             try
             {
                 _configManager.LoadFromFile("config/config.ini");
@@ -53,12 +63,23 @@ namespace SimpleTransformer.Api
                 //here, before any model is constructed, so the statics are set
                 //before the first TrainStep samples them.
                 ApplyMemoryPressureSettings(_configManager);
+                ApplyAttentionSettings(_configManager);
 
                 SQLitePCL.Batteries.Init();
 
                 var builder = WebApplication.CreateBuilder();
 
-                builder.Host.UseSerilog();
+                //UseSerilog() with no arguments builds a fresh configuration from
+                //appsettings and ignores the static Log.Logger set in
+                //Program.ConfigureLogging, which previously meant TWO loggers
+                //writing to the same file with different templates - and the
+                //unfiltered one defeating the EF Core noise filter. Reusing the
+                //shared policy keeps a single logger with a single template.
+                builder.Host.UseSerilog((hostContext, services, loggerConfig) =>
+                    Program.ApplySinkPolicy(
+                        loggerConfig.MinimumLevel.Information()),
+                    preserveStaticLogger: true,
+                    writeToProviders: false);
 
                 builder.WebHost.ConfigureKestrel(options =>
                 {
@@ -135,10 +156,17 @@ namespace SimpleTransformer.Api
                 builder.Services.AddScoped<TransformerModelService>();
                 builder.Services.AddScoped<ConfigService>();
 
+                // Diagnostics. LogService is stateless (reads logs/ on demand);
+                // FaultService only reads, since writes go through the static
+                // FaultRecorder so the detached training loop can record without DI.
+                builder.Services.AddScoped<LogService>();
+                builder.Services.AddScoped<FaultService>();
+
                 var app = builder.Build();
 
                 // 7. Safe Initialization via the singleton DbContext factory
                 var dbFactory = app.Services.GetRequiredService<IDbContextFactory<AppDbContext>>();
+                faultDbFactory = dbFactory;
                 using (var dbContext = dbFactory.CreateDbContext())
                 {
                     DbContextConfiguration.InitializeDatabase(dbContext);
@@ -166,7 +194,15 @@ namespace SimpleTransformer.Api
             }
             catch (Exception ex)
             {
-                Log.Warning($"{ex.Message}\nStack trace: {ex.StackTrace}");
+                //Error, not Warning: the console sink is restricted to errors, so
+                //this is the only line that surfaces a failure to start the
+                //server. At Warning it would be silently dropped from the console
+                //and the process would exit without explanation.
+                FaultRecorder.Record(
+                    faultDbFactory,
+                    ex,
+                    "server");
+                Log.Error(ex, "Server startup failed.");
             }
         }
 
@@ -192,6 +228,37 @@ namespace SimpleTransformer.Api
             MemSettings.WorkspaceCapFractionOfQuota = configManager.GetAs<double>("workspace_cap_fraction_of_quota", 0.35, "Memory");
             MemSettings.AllowBlockingCompact = configManager.GetAs<bool>("allow_blocking_compact", true, "Memory");
 
+            // Attention softmax-cache policy. See AttentionMemorySettings: the
+            // default (cache) is the fast path; recompute trades ~a third more
+            // attention FLOPs for an O(seq) working set instead of O(seq^2).
+            AttentionSettings.RecomputeSoftmaxWeights =
+                configManager.GetAs<bool>("recompute_attention_softmax", false, "Memory");
+
+            // Mid-epoch temp-checkpoint cadence. See CheckpointCadenceSettings:
+            // the temp checkpoint is the resume pointer and is the FULL parameter
+            // block, so its write cost scales with steps x parameters.
+            CkptSettings.Enabled = configManager.GetAs<bool>("save_temporary_checkpoints", true, "Training");
+            CkptSettings.TempCheckpointEverySteps =
+                Math.Max(0, configManager.GetAs<int>("temp_checkpoint_every_steps", 50, "Training"));
+            CkptSettings.TempCheckpointEveryMinutes =
+                Math.Max(0.0, configManager.GetAs<double>("temp_checkpoint_every_minutes", 5.0, "Training"));
+
+            // Epoch checkpoints are NOT overwritten - each carries its epoch and
+            // loss in the filename - so this is the knob that controls how many
+            // full 3.34 GB files accumulate on disk. Floored at 5 epochs: tighter
+            // than that is redundant against the temp-checkpoint cadence, which
+            // already bounds crash loss to a few steps.
+            CkptSettings.EpochCheckpointInterval =
+                CkptSettings.ClampEpochCheckpointInterval(
+                    configManager.GetAs<int>("checkpoint_interval", 5, "Training"));
+
+            Log.Information(
+                "Temp checkpoints: {State}, every {Steps} steps or {Minutes:F1} min (plus epoch end, stop and cancel). Epoch checkpoints every {EpochInterval}.",
+                CkptSettings.Enabled ? "enabled" : "disabled",
+                CkptSettings.TempCheckpointEverySteps,
+                CkptSettings.TempCheckpointEveryMinutes,
+                CkptSettings.EpochCheckpointInterval);
+
             long physical = System.GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
             long resolved = Model.MemoryPressureValve.ResolveQuotaBytes(
                 MemSettings.MaxQuotaBytes,
@@ -199,7 +266,7 @@ namespace SimpleTransformer.Api
                 physical);
 
             Log.Information(
-                "Memory valve: {State} (system monitor {SysMon}), quota {Quota:F0} MiB (configured {Configured:F0}, machine {Physical:F0} MiB), band {Lower:F0}-{Upper:F0}% of max(proc, sys), every {Every} steps, cooldown {Cooldown}, pool cap {PoolCap:P0} of quota.",
+                "Memory valve: {State} (system monitor {SysMon}), quota {Quota:F0} MiB (configured {Configured:F0}, machine {Physical:F0} MiB), band {Lower:F0}-{Upper:F0}% of max(proc, sys), every {Every} steps, cooldown {Cooldown}, pool cap {PoolCap:P0} of quota. Attention softmax: {Attn}.",
                 MemSettings.Enabled ? "enabled" : "disabled",
                 MemSettings.MonitorSystemPressure ? "on" : "off",
                 resolved / mb,
@@ -209,7 +276,28 @@ namespace SimpleTransformer.Api
                 MemSettings.UpperBoundPercent,
                 MemSettings.CheckEveryNSteps,
                 MemSettings.MinCooldownSteps,
-                MemSettings.WorkspaceCapFractionOfQuota);
+                MemSettings.WorkspaceCapFractionOfQuota,
+                AttentionSettings.RecomputeSoftmaxWeights
+                    ? "recomputed in Backward (no seq^2 cache)"
+                    : "cached for Backward");
+        }
+
+        /// <summary>
+        /// Model-behaviour settings that are neither memory budgets nor checkpoint
+        /// cadence. Kept separate from <see cref="ApplyMemoryPressureSettings"/> so
+        /// that method stays about what it says.
+        /// </summary>
+        public static void ApplyAttentionSettings(ConfigManager configManager)
+        {
+            MaskSettings.UseCausalMask =
+                configManager.GetAs<bool>("causal_mask", true, "TransformerConfig");
+
+            Log.Information(
+                "Attention mask: {Mode}. A decoder must not attend to future tokens; " +
+                "only set causal_mask = false to continue a legacy unmasked run.",
+                MaskSettings.UseCausalMask
+                    ? "causal (enabled)"
+                    : "none - LEGACY, model can attend to future tokens");
         }
 
         public class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>

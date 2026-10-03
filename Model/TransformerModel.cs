@@ -409,11 +409,18 @@ namespace SimpleTransformer.Model
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(x, "Embedding dropout contains NaN.");
 
+            // Causal (autoregressive) mask. This is a decoder-only language
+            // model, so position t must not attend to t+1..S: without it every
+            // position sees the whole window and next-token training degenerates
+            // into copying. Built once per sequence length and reused - it is
+            // constant, so rebuilding it per forward would be pure waste.
+            TensorBase? mask = GetCausalMask(x.Rows);
+
             for (int layerIndex = 0; layerIndex < _layers.Count; layerIndex++)
             {
                 var layer = _layers[layerIndex];
                 var layerWatch = Stopwatch.StartNew();
-                x = layer.Forward(x, _workspace);
+                x = layer.Forward(x, _workspace, mask);
                 layerWatch.Stop();
                 if (verbose)
                 {
@@ -1491,12 +1498,41 @@ namespace SimpleTransformer.Model
             return totalNorm;
         }
 
+        //Causal (autoregressive) attention mask for a window of this length, or null
+        //when AttentionMaskSettings.UseCausalMask is off.
+        //
+        //Owned by the model rather than borrowed from the workspace: it must stay
+        //valid for the whole step, because the recompute path in
+        //ScaledDotProductAttention re-applies it during Backward. Rebuilt only
+        //when the window length changes, which in practice means once per model.
+        //At seq 2048 this is a single 16 MiB tensor - constant, not per-step.
+        private TensorBase? _causalMask;
+        private int _causalMaskLength;
+
+        private TensorBase? GetCausalMask(int sequenceLength)
+        {
+            if (!AttentionMaskSettings.UseCausalMask)
+                return null;
+
+            if (_causalMask != null && _causalMaskLength == sequenceLength)
+                return _causalMask;
+
+            _causalMask?.Dispose();
+            _causalMask = MaskUtilitiesSimd.CreateCausalMask(sequenceLength);
+            _causalMaskLength = sequenceLength;
+            return _causalMask;
+        }
+
         public void Dispose()
         {
             // Dispose layers/resources that own unmanaged or pooled resources.
             _embedding?.Dispose();
             _position?.Dispose();
             _outputProjection?.Dispose();
+
+            //Model-owned, not workspace-pooled, so Reset() never reclaims it.
+            _causalMask?.Dispose();
+            _causalMask = null;
 
             foreach (var layer in _layers)
             {

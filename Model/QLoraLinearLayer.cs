@@ -200,20 +200,27 @@ namespace SimpleTransformer.Model
             // Frozen base weights: dequantized once, shared by all threads
             TensorBase dequantW = GetDequantizedBaseWeights(workspace);
 
+            // Scratch for the LoRA B product. Borrowed as ONE batched buffer and
+            // sliced per item, rather than `new Tensor(rows, _outputSize)` inside
+            // the loop: at seq 2048 that per-item allocation is 8 MiB, so a
+            // 16-layer 4-projection model churned ~4 GiB of Large Object Heap
+            // per forward purely as short-lived garbage. Same borrow-outside /
+            // slice-inside shape the surrounding code already uses for `output`.
+            TensorBase loraBScratch = workspace.Borrow(layers, rows, _outputSize,
+                shape => new Tensor(shape[0], shape[1], shape[2]));
+
             Parallel.For(0, layers, b =>
             {
                 TensorBase inputSlice = TensorUtilitiesSimd.GetLayer(input, b);
                 TensorBase outputSlice = TensorUtilitiesSimd.GetLayer(output, b);
                 TensorBase loraAOutSlice = TensorUtilitiesSimd.GetLayer(loraAOut, b);
+                TensorBase loraBOutSlice = TensorUtilitiesSimd.GetLayer(loraBScratch, b);
 
                 // Base pass
                 workspace.Backend.MatMul(inputSlice, dequantW, outputSlice, transposeB: true);
 
                 // LoRA pass
                 workspace.Backend.MatMul(inputSlice, _loraA, loraAOutSlice, transposeB: true);
-
-                // Slice scratch buffer for LoRA B product
-                Tensor loraBOutSlice = new Tensor(rows, _outputSize);
                 workspace.Backend.MatMul(loraAOutSlice, _loraB, loraBOutSlice, transposeB: true);
 
                 ScaleAndAccumulate(loraBOutSlice, outputSlice, _loraScale);
@@ -300,6 +307,16 @@ namespace SimpleTransformer.Model
             TensorBase inputGradient = workspace.Borrow(layers, rows, _inputSize, shape => new Tensor(shape[0], shape[1], shape[2]));
             TensorBase dequantW = GetDequantizedBaseWeights(workspace);
 
+            // Batched scratch for the two per-item temporaries below, borrowed
+            // outside the loop and sliced inside. Same LOH-churn reason as
+            // loraBScratch in ForwardBatch: `new Tensor(rows, _rank)` and
+            // `new Tensor(rows, _inputSize)` are multi-megabyte at long sequence
+            // lengths and were allocated once per batch item per layer.
+            TensorBase dLoraAOutScratch = workspace.Borrow(layers, rows, _rank,
+                shape => new Tensor(shape[0], shape[1], shape[2]));
+            TensorBase dInputAdapterScratch = workspace.Borrow(layers, rows, _inputSize,
+                shape => new Tensor(shape[0], shape[1], shape[2]));
+
             // Reset thread-local gradient buffers
             foreach (var localDA in _threadLocalDA.Values) workspace.Backend.Fill(localDA, 0f);
             foreach (var localDB in _threadLocalDB.Values) workspace.Backend.Fill(localDB, 0f);
@@ -317,6 +334,8 @@ namespace SimpleTransformer.Model
                 TensorBase inputSlice = TensorUtilitiesSimd.GetLayer(input, b);
                 TensorBase loraAOutSlice = TensorUtilitiesSimd.GetLayer(loraAOut, b);
                 TensorBase dInputSlice = TensorUtilitiesSimd.GetLayer(inputGradient, b);
+                TensorBase dLoraAOutSlice = TensorUtilitiesSimd.GetLayer(dLoraAOutScratch, b);
+                TensorBase dInputAdapterSlice = TensorUtilitiesSimd.GetLayer(dInputAdapterScratch, b);
 
                 Tensor localDA = _threadLocalDA.Value!;
                 Tensor localDB = _threadLocalDB.Value!;
@@ -328,14 +347,12 @@ namespace SimpleTransformer.Model
                 workspace.Backend.MatMulAccumulate(gradSlice, loraAOutSlice, localDB, transposeA: true);
 
                 // 3. dLoraAOut = Grad * B
-                Tensor dLoraAOutSlice = new Tensor(rows, _rank);
                 workspace.Backend.MatMul(gradSlice, _loraB, dLoraAOutSlice);
 
                 // 4. LoRA A Gradient: localDA += dLoraAOut^T * Input
                 workspace.Backend.MatMulAccumulate(dLoraAOutSlice, inputSlice, localDA, transposeA: true);
 
                 // 5. Adapter Input Gradient: dX_adapter = dLoraAOut * A
-                Tensor dInputAdapterSlice = new Tensor(rows, _inputSize);
                 workspace.Backend.MatMul(dLoraAOutSlice, _loraA, dInputAdapterSlice);
 
                 // Accumulate adapter contribution into dInput
