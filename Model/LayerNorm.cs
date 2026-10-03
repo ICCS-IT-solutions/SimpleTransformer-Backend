@@ -167,6 +167,11 @@ namespace SimpleTransformer.Model
             TensorBase inputGradient = workspace.BorrowLike(_lastInput!);
             ComputeLayerNormBackward(gradient, inputGradient, startCacheRow: 0, accumulationLock: null);
 
+            // Backward has read _lastNormalized; give the borrow back rather than
+            // leave a reference the workspace is free to recycle (see
+            // ReleaseNormalizedCache).
+            ReleaseNormalizedCache(workspace);
+
             return inputGradient;
         }
 
@@ -186,6 +191,10 @@ namespace SimpleTransformer.Model
 
                 ComputeLayerNormBackward(gradSlice, dInputSlice, cacheRowOffset, accumulationLock);
             });
+
+            // Parallel.For has joined, so every slice has read _lastNormalized;
+            // hand the borrow back (see ReleaseNormalizedCache).
+            ReleaseNormalizedCache(workspace);
 
             return inputGradient;
         }
@@ -293,14 +302,46 @@ namespace SimpleTransformer.Model
             }
 
             // Borrow lastNormalized from workspace pool using ReadOnlySpan<int> shape
-            if (_lastNormalized == null || _lastNormalized.Rows != totalRows || _lastNormalized.Cols != cols)
+            //
+            // Only ever reuse the existing buffer while this layer still OWNS the
+            // borrow. ReleaseNormalizedCache hands it back as soon as Backward has
+            // consumed it, so a retained reference can never outlive its borrow:
+            // the step's workspace Reset recycles every borrow, and a buffer that
+            // went back to the pool may already have been handed to another layer
+            // by the next forward. Writing into it here would silently corrupt that
+            // owner's data (this is what made the attention out-projection's cached
+            // input - the operand Backward needs for dW - differ between two models
+            // with identical weights).
+            if (_lastNormalized != null &&
+                (_lastNormalized.Rows != totalRows || _lastNormalized.Cols != cols))
+            {
+                ReleaseNormalizedCache(workspace);
+            }
+
+            if (_lastNormalized == null)
             {
                 _lastNormalized = workspace.Borrow2D(totalRows, cols);
             }
             else
             {
-                workspace.Backend.Fill(_lastNormalized!, 0f);
+                workspace.Backend.Fill(_lastNormalized, 0f);
             }
+        }
+
+        /// <summary>
+        /// Hands the normalised-activation buffer back to the workspace and forgets
+        /// it. Call once Backward has read it: from then on the layer must not
+        /// hold the reference, because the workspace is free to recycle the buffer
+        /// (immediately via <see cref="TensorWorkspace.Release"/>, or at the end of
+        /// the step via <see cref="TensorWorkspace.Reset"/>).
+        /// </summary>
+        private void ReleaseNormalizedCache(TensorWorkspace workspace)
+        {
+            if (_lastNormalized == null)
+                return;
+
+            workspace.Release(_lastNormalized);
+            _lastNormalized = null;
         }
 
         private void ValidateBackwardState(TensorBase gradient)
