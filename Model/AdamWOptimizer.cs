@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using SimpleTransformer.Model.Extensions.Numerics;
 
 namespace SimpleTransformer.Model
@@ -63,20 +64,48 @@ namespace SimpleTransformer.Model
                 }
 
                 UpdateParameterAdamW(
-                    p.Value, 
-                    p.Gradient, 
-                    moments.FirstMoment, 
-                    moments.SecondMoment, 
-                    alpha);
+                    p.Value,
+                    p.Gradient,
+                    moments.FirstMoment,
+                    moments.SecondMoment,
+                    alpha,
+                    ShouldDecayWeight(p));
             }
         }
 
+/// <summary>
+        /// Whether a parameter takes decoupled weight decay.
+        /// <para>
+        /// AdamW as specified decays the MATRIX weights only. Bias vectors and the
+        /// LayerNorm gain/bias are excluded: decaying a LayerNorm gain pulls the
+        /// normalisation scale toward zero as training proceeds, degrading the model
+        /// in a way that is easy to misdiagnose as a learning-rate problem. This is
+        /// the usual "do not decay 1-D parameters" convention, matched to the
+        /// checkpoint's own naming - biases are always "*.bias", and LayerNorm
+        /// registers its gain and shift as rank-1 ".weight"/".beta".
+        /// </summary>
+        public static bool ShouldDecayWeight(TrainableParameter parameter)
+        {
+            ArgumentNullException.ThrowIfNull(parameter);
+
+            // LayerNorm gain and shift are rank-1 tensors.
+            if (parameter.Value.Rank == 1)
+                return false;
+
+            // Bias vectors are held as [1, N] (rank 2), so rank alone will not catch
+            // them; the checkpoint name is the reliable signal.
+            if (parameter.Name.EndsWith(".bias", StringComparison.Ordinal))
+                return false;
+
+            return true;
+        }
         private void UpdateParameterAdamW(
             TensorBase weights, 
             TensorBase gradients, 
             TensorBase m, 
             TensorBase v, 
-            float alpha)
+            float alpha,
+            bool decay)
         {
             Span<float> wSpan = weights.Data;
             ReadOnlySpan<float> gSpan = gradients.Data;
@@ -91,8 +120,17 @@ namespace SimpleTransformer.Model
                 float g = gSpan[i];
                 float w = wSpan[i];
 
-                // 1. Decoupled Weight Decay (w = w - lr * decay * w)
-                w -= lrDecay * w;
+                // 1. Decoupled Weight Decay (w = w - lr * decay * w), applied ONLY to decayable
+                // parameters. The canonical AdamW rule (Loshchilov & Hutter, and
+                // what GPT-2 / LLaMA / every standard implementation do) is: decay
+                // the matrix weights, never the biases or the LayerNorm gain. A
+                // decaying LayerNorm gain is not merely untuned, it is harmful - it
+                // shrinks the normalisation scale toward zero over training. See
+                // ShouldDecayWeight.
+                if (decay)
+                {
+                    w -= lrDecay * w;
+                }
 
                 // 2. Update first moment: m = beta1 * m + (1 - beta1) * g
                 float mVal = Beta1 * mSpan[i] + (1.0f - Beta1) * g;

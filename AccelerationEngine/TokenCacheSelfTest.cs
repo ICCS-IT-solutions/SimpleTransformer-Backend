@@ -37,6 +37,7 @@ namespace SimpleTransformer.AccelerationEngine
                     DocBoundariesArePreserved(dir, tokenizer, vocabId);
                     WindowsMatchLegacySlicing(dir, vocab, tokenizer, vocabId);
                     StreamingMatchesLegacyBatching(dir, vocab, tokenizer, vocabId);
+                    PaddedTailWindow(dir, vocab, tokenizer, vocabId);
                     InputTargetAlignment(dir);
                     BufferedEpochIsASnapshot(dir);
                     U32FallbackRoundTrips(dir);
@@ -63,11 +64,31 @@ namespace SimpleTransformer.AccelerationEngine
         private const int Window = 4;
 
         /// <summary>
-        /// Legacy loop is: for (i = 0; i &lt;= n - window - 1; i += window).
-        /// That yields (n - 1) / window samples whenever n &gt;= window + 1.
+        /// Mirrors the windowing maths of TrainingDataExtensions.CreateTrainingSamples
+        /// AND StreamingBatchSource, which must agree exactly: floor division gives
+        /// the fully-populated windows, and a remainder adds one more that is
+        /// emitted padded rather than discarded.
         /// </summary>
-        private static long LegacySampleCount(long n, int window) =>
-            n >= window + 1 ? (n - 1) / window : 0;
+        private static long LegacySampleCount(long n, int window)
+        {
+            if (n <= 0) return 0;
+            long full = n > window ? (n - 1) / window : 0;
+            bool hasTail = full * window < n;
+            return full + (hasTail ? 1 : 0);
+        }
+
+        /// <summary>
+        /// Valid input/target prefix lengths for the window starting at
+        /// <paramref name="start"/>, matching both data paths.
+        /// </summary>
+        private static (int ValidInput, int ValidTarget) WindowPrefixes(
+            long tokenCount, long start, int window)
+        {
+            long available = tokenCount - start;
+            int validInput = (int)Math.Min(window, Math.Max(0L, available));
+            int validTarget = (int)Math.Min(window, Math.Max(0L, available - 1));
+            return (validInput, validTarget);
+        }
 
         /// <summary>Legacy CreateMiniBatches limit/batch count with DropLast.</summary>
         private static (int batches, long used) LegacyBatching(
@@ -289,29 +310,41 @@ namespace SimpleTransformer.AccelerationEngine
             using var fs = new FileStream(bin, FileMode.Open, FileAccess.Read, FileShare.Read);
             var row = new float[Window + 1];
             int samples = 0;
-            for (int i = 0; i <= flat.Length - Window - 1; i += Window)
+            // Walk EVERY window the source now emits, including a ragged tail.
+            // Only the valid prefix is on disk; the rest is padding, so compare
+            // just the prefix and let the padded tail be checked separately.
+            for (long w = 0; w < legacyCount; w++)
             {
-                TokenCacheIO.ReadWindowAsFloat(fs, h, i, Window + 1, row);
-                for (int c = 0; c < Window; c++)
-                {
-                    if ((int)row[c] != flat[i + c]) throw new Exception($"input mismatch @{i}+{c}");
-                    if ((int)row[c + 1] != flat[i + c + 1]) throw new Exception($"target mismatch @{i}+{c}");
-                }
+                long start = w * Window;
+                var (validInput, validTarget) = WindowPrefixes(flat.Length, start, Window);
+                int toRead = (int)Math.Min(Window + 1L, Math.Max(0L, flat.Length - start));
+                if (toRead > 0)
+                    TokenCacheIO.ReadWindowAsFloat(fs, h, start, toRead, row);
+                for (int c = 0; c < validInput; c++)
+                    if ((int)row[c] != flat[start + c])
+                        throw new Exception($"input mismatch @{start}+{c}");
+                for (int c = 0; c < validTarget; c++)
+                    if ((int)row[c + 1] != flat[start + c + 1])
+                        throw new Exception($"target mismatch @{start}+{c}");
                 samples++;
             }
-            Check(samples == legacyCount, "every legacy window paged back identically");
+            Check(samples == legacyCount, "every window paged back identically, tail included");
 
             // The hot path reuses ONE scratch buffer for every window: a fresh
             // page per window would be ~1KB of garbage per window, per epoch.
             var scratch = new byte[(Window + 1) * TokenCache.BytesPerToken(h.Dtype)];
             using var fs2 = new FileStream(bin, FileMode.Open, FileAccess.Read, FileShare.Read);
             var row2 = new float[Window + 1];
-            for (int i = 0; i <= flat.Length - Window - 1; i += Window)
+            for (long w = 0; w < legacyCount; w++)
             {
-                TokenCacheIO.ReadWindowAsFloat(fs2, h, i, Window + 1, row2, scratch);
-                for (int c = 0; c <= Window; c++)
-                    if ((int)row2[c] != flat[i + c])
-                        throw new Exception($"scratch-overload mismatch @{i}+{c}");
+                long start = w * Window;
+                var (validInput, _) = WindowPrefixes(flat.Length, start, Window);
+                int toRead = (int)Math.Min(Window + 1L, Math.Max(0L, flat.Length - start));
+                if (toRead <= 0) continue;
+                TokenCacheIO.ReadWindowAsFloat(fs2, h, start, toRead, row2, scratch);
+                for (int c = 0; c <= validInput && c < toRead; c++)
+                    if ((int)row2[c] != flat[start + c])
+                        throw new Exception($"scratch-overload mismatch @{start}+{c}");
             }
             Check(true, "scratch-buffer overload pages identical windows (no per-window alloc)");
 
@@ -421,10 +454,36 @@ namespace SimpleTransformer.AccelerationEngine
             {
                 for (int r = 0; r < batch.BatchSize; r++)
                 {
+                    // Where this row's target padding begins (-1 if it is fully real).
+                    int firstIgnore = -1;
+                    for (int c = 0; c < Window; c++)
+                        if ((int)batch.Targets[r, c] == TransformerModel.IgnoreIndex)
+                        {
+                            firstIgnore = c;
+                            break;
+                        }
+
                     for (int c = 0; c < Window; c++)
                     {
                         int input = (int)batch.Inputs[r, c];
                         int target = (int)batch.Targets[r, c];
+
+                        if (target == TransformerModel.IgnoreIndex)
+                        {
+                            // Past the valid prefix. The TARGET row is shifted by
+                            // one, so it runs out of tokens one position BEFORE
+                            // the input row: input[firstIgnore] is still a real
+                            // token (it simply has no successor), and only the
+                            // positions after it carry the pad id.
+                            if (c > firstIgnore + 1 && input != 0)
+                                throw new Exception(
+                                    $"padded input {input} != pad id at [{r},{c}]");
+                            if (c < firstIgnore)
+                                throw new Exception(
+                                    $"ignore index before the padding starts at [{r},{c}]");
+                            continue;
+                        }
+
                         if (target != input + 1)
                             throw new Exception($"target {target} != input {input} + 1 at [{r},{c}]");
                         if (input % Window != c)
@@ -512,10 +571,13 @@ namespace SimpleTransformer.AccelerationEngine
             int counter = 0;
             int[] EncodeSeq(string _)
             {
-                // 12 full batches' worth of samples plus the one extra token the
-                // windowing needs, so there is no trailing partial batch and
-                // every batch exercises the reused-buffer path.
-                var ids = new int[Window * 12 + 1];
+                // Exactly 12 whole windows, so every batch is full and exercises the
+                // reused-buffer path. A token count that is NOT a multiple of
+                // Window now yields one extra PADDED window, which would make the
+                // final batch a partial one that allocates its own tensors and
+                // mask the aliasing below - a different hazard, covered by
+                // PaddedTailWindow.
+                var ids = new int[Window * 12];
                 for (int i = 0; i < ids.Length; i++) ids[i] = counter++;
                 return ids;
             }
@@ -622,5 +684,84 @@ namespace SimpleTransformer.AccelerationEngine
         }
 
 
+
+        /// <summary>
+        /// The padded tail window: a corpus whose length is NOT a multiple of
+        /// window must yield one extra sample, with pad id in the input tail and
+        /// TransformerModel.IgnoreIndex in the target tail - and no EOF throw.
+        /// </summary>
+        private static void PaddedTailWindow(
+            string dir, Vocabulary vocab, ITokenizer tokenizer, Guid vocabId)
+        {
+            Console.WriteLine("padded tail window:");
+            string bin = PathIn(dir, "tail.stbin");
+
+            // 7 words repeated, window 4: deliberately ragged. The exact token
+            // count depends on the tokenizer's bos/eos framing, so the test asks
+            // for the arithmetic rather than assuming a fixed number.
+            var docs = new[] { string.Join(' ', Enumerable.Repeat("hello world foo", 3)) };
+            var h = WriteCache(bin, docs, tokenizer.Encode, tokenizer.Type, vocab.Count, vocabId);
+            var flat = ReadAllIds(bin, h);
+            int padId = tokenizer.PadTokenId;
+
+            long expectedSamples = LegacySampleCount(flat.Length, Window);
+            using (var src = new StreamingBatchSource(bin, Window, batchSize: 4, dropLast: false,
+                       padId))
+            {
+                Check(src.SampleCount == expectedSamples,
+                    $"sample count {src.SampleCount} == padded expectation {expectedSamples}");
+
+                // The ragged window must be last in STREAM order only by accident
+                // (windows are shuffled), so check every row of every batch.
+                var batches = src.StreamEpoch(4242).ToList();
+                Check(batches.Count > 0, "epoch enumerated at least one batch");
+
+                bool sawPadded = false;
+                foreach (var b in batches)
+                {
+                    for (int r = 0; r < b.BatchSize; r++)
+                    {
+                        int firstIgnored = -1;
+                        for (int c = 0; c < b.SequenceLength; c++)
+                            if ((int)b.Targets[r, c] == TransformerModel.IgnoreIndex)
+                            {
+                                firstIgnored = c;
+                                break;
+                            }
+
+                        if (firstIgnored < 0) continue;   // a fully-real window
+
+                        sawPadded = true;
+                        // Everything from the first ignore index onward must be
+                        // ignore index, and the input tail must be the pad id.
+                        bool targetsOk = true;
+                        for (int c = firstIgnored; c < b.SequenceLength; c++)
+                            if ((int)b.Targets[r, c] != TransformerModel.IgnoreIndex)
+                                targetsOk = false;
+
+                        bool inputsOk = true;
+                        for (int c = firstIgnored + 1; c < b.SequenceLength; c++)
+                            if ((int)b.Inputs[r, c] != padId)
+                                inputsOk = false;
+
+                        Check(targetsOk && inputsOk,
+                            $"padded row: targets ignore from {firstIgnored}, inputs pad id after it");
+                        break;
+                    }
+                    if (sawPadded) break;
+                }
+                Check(sawPadded, "the ragged window surfaced as a padded row");
+            }
+
+            // MaterializeEpoch must agree with the streaming view.
+            using (var src = new StreamingBatchSource(bin, Window, batchSize: 4, dropLast: false,
+                       padId))
+            {
+                var streamed = src.StreamEpoch(4242).ToList();
+                var materialized = src.MaterializeEpoch(4242);
+                Check(materialized.Count == streamed.Count,
+                    $"materialized {materialized.Count} == streamed {streamed.Count}");
+            }
+        }
     }
 }

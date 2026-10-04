@@ -3,22 +3,52 @@ using SimpleTransformer.Model.Tokenizer;
 
 public static class TrainingDataExtensions
 {
+    /// <summary>
+    /// Build the next-token training samples over a token stream.
+    /// <para>
+    /// Windows are non-overlapping with stride <c>window</c> (sample w covers
+    /// tokens w*window .. w*window+window), and each sample is
+    /// tokens[w..w+window) -> tokens[w+1..w+window+1). The final window is
+    /// emitted PADDED rather than discarded when the stream does not divide
+    /// evenly: its real tokens are kept, the input tail is filled with the pad
+    /// id, and the target tail is marked with
+    /// <see cref="TransformerModel.IgnoreIndex"/> so the loss ignores it and the
+    /// attention mask refuses to attend across it. Without this, up to
+    /// <c>window-1</c> tokens are dropped every epoch - negligible on a large
+    /// corpus, but a large fraction of a small one.
+    /// </para>
+    /// </summary>
     public static IReadOnlyList<TrainingSample> CreateTrainingSamples(TransformerModel model, ITokenizer tokenizer, string src)
     {
         int[] tokens = tokenizer.Encode(src);
         List<TrainingSample> data = new();
 
         int window = model.Config.MaxSequenceLength;
-        
-        for (int i = 0; i <= tokens.Length - window - 1; i += window)
+        int padId = tokenizer.PadTokenId;
+        int ignoreIndex = TransformerModel.IgnoreIndex;
+
+        // Floor division gives the count of fully-populated windows; add one more
+        // when a remainder exists so the tail is padded instead of discarded.
+        int fullWindows = tokens.Length > window ? (tokens.Length - 1) / window : 0;
+        bool hasTail = tokens.Length > 0 && fullWindows * window < tokens.Length;
+        int windows = fullWindows + (hasTail ? 1 : 0);
+
+        for (int w = 0; w < windows; w++)
         {
+            int start = w * window;
+
+            // Real tokens available for the input row, and for the (shifted by
+            // one) target row. The target row is always the shorter of the two.
+            int validInput = Math.Clamp(tokens.Length - start, 0, window);
+            int validTarget = Math.Clamp(tokens.Length - start - 1, 0, window);
+
             Tensor input = new(window);
             Tensor target = new(window);
-            
+
             for (int j = 0; j < window; j++)
             {
-                input[j] = tokens[i + j];
-                target[j] = tokens[i + j + 1];
+                input[j] = j < validInput ? tokens[start + j] : padId;
+                target[j] = j < validTarget ? tokens[start + j + 1] : ignoreIndex;
             }
 
             data.Add(new TrainingSample { Input = input, Target = target });

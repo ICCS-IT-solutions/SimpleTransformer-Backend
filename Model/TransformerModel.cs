@@ -387,7 +387,121 @@ namespace SimpleTransformer.Model
             return output;
         }
         
-        public (TensorBase logits, TensorBase hiddenState) Forward(TensorBase input)
+        /// <summary>
+        /// Composite attention mask for a batch: causal AND padding.
+        /// <para>
+        /// Returns the cached rank-2 causal mask when no item is padded (the
+        /// common case, and always the case for single-sequence inference), so
+        /// the steady-state cost is unchanged. Only a batch that actually carries
+        /// padding pays for a rank-3 [batch, seq, seq] buffer.
+        /// </para>
+        /// <para>
+        /// The valid prefix length per item is DERIVED from the targets rather than
+        /// carried alongside them: the data pipeline marks padding with the loss's
+        /// own ignore index, so the targets already say which positions are real.
+        /// That keeps the padding contract in exactly one place - the value
+        /// CrossEntropyLoss skips - instead of duplicating it into the batch
+        /// object and every caller that builds one.
+        /// </para>
+        /// </summary>
+        private TensorBase? BuildAttentionMask(TensorBase input, TensorBase? targets, bool poolMask = true)
+        {
+            TensorBase? causal = GetCausalMask(input.Rows);
+            if (causal == null)
+                return null;                       // masking disabled entirely
+
+            if (targets == null || input.Rank != 3)
+                return causal;                     // inference, or a single sequence
+
+            int batch = input.Layers;
+            int seq = input.Rows;
+
+            // Valid prefix = number of leading target positions that are not the
+            // ignore index. Scanning stops at the first ignore, so this is cheap
+            // and matches the pipeline's "real tokens first, padding last" layout.
+            Span<int> validTargets = stackalloc int[batch];
+            bool anyPadded = false;
+
+            ReadOnlySpan<float> targetData = targets.ReadOnlySpan;
+            int stride = targets.Stride;
+
+            for (int b = 0; b < batch; b++)
+            {
+                int valid = 0;
+                for (int c = 0; c < seq; c++)
+                {
+                    if ((int)targetData[b * stride + c] == IgnoreIndex) break;
+                    valid++;
+                }
+                validTargets[b] = valid;
+                if (valid < seq) anyPadded = true;
+            }
+
+            if (!anyPadded)
+                return causal;
+
+            // A valid key position is one the item actually has a token for. The
+            // target is the token AFTER the input, so a position is a valid key
+            // when its target is real OR it is the last valid input position.
+            //
+            // BORROWED from the workspace, never released: this buffer has to
+            // outlive the forward, because the recompute path in
+            // ScaledDotProductAttention re-applies it during Backward
+            // (_lastMasks). The step's workspace Reset reclaims it, which is the
+            // same lifetime the causal mask itself uses.
+            //
+            // It was `new Tensor(batch, seq, seq)`, and at batch 8 / seq 512 that
+            // is an 8 MiB allocation - far past the Large Object Heap threshold,
+            // so every padded step left 8 MiB of garbage that only a gen2
+            // collection could reclaim. It accumulated visibly across runs
+            // (managed heap 2824 -> 3384 MiB with the activation pool unchanged
+            // at 901 MiB) and was invisible to both the pool cap and the memory
+            // valve, which track pooled tensors only.
+            TensorBase combined = poolMask
+                ? Workspace.Borrow3D(batch, seq, seq)
+                : new Tensor(batch, seq, seq);
+            float[] dst = combined.Data;
+
+            for (int b = 0; b < batch; b++)
+            {
+                int validKeys = Math.Min(seq, validTargets[b] + 1);
+                int rowBase = b * seq * seq;
+
+                for (int r = 0; r < seq; r++)
+                {
+                    int rowStart = rowBase + r * seq;
+                    // Causal: attend to c <= r. Padding: c < validKeys.
+                    int attendTo = Math.Min(r, validKeys - 1);
+                    for (int c = 0; c <= attendTo; c++)
+                        dst[rowStart + c] = 1f;
+                }
+            }
+
+            return combined;
+        }
+
+        /// <summary>
+        /// Target id the loss skips. Padding is expressed with this single value,
+        /// so the pipeline (which writes it) and the loss (which reads it) cannot
+        /// drift apart. Matches CrossEntropyLoss's own default.
+        /// </summary>
+        public const int IgnoreIndex = -100;
+
+        public (TensorBase logits, TensorBase hiddenState) Forward(TensorBase input, TensorBase? targets = null)
+            => ForwardCore(input, targets, poolAttentionMask: true);
+
+        /// <summary>
+        /// Test-only entry point that can force the composite padding mask to be
+        /// allocated OFF the workspace pool, reproducing the pre-fix behaviour.
+        /// Exists so the allocation regression test can prove its threshold
+        /// actually separates pooled from leaked; never used in production.
+        /// </summary>
+        internal (TensorBase logits, TensorBase hiddenState) ForwardForAllocationTest(
+            TensorBase input, TensorBase? targets, bool poolAttentionMask)
+            => ForwardCore(input, targets, poolAttentionMask);
+
+        private (TensorBase logits, TensorBase hiddenState) ForwardCore(
+            TensorBase input, TensorBase? targets, bool poolAttentionMask)
         {
             MultiHeadAttention.WatchedConcatsForTest.Clear();
             bool verbose = TrainingStepProfile.Enabled;
@@ -409,12 +523,10 @@ namespace SimpleTransformer.Model
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(x, "Embedding dropout contains NaN.");
 
-            // Causal (autoregressive) mask. This is a decoder-only language
-            // model, so position t must not attend to t+1..S: without it every
-            // position sees the whole window and next-token training degenerates
-            // into copying. Built once per sequence length and reused - it is
+            // Causal (autoregressive) mask, optionally intersected with the batch's padding
+            // mask. Built once per sequence length and reused when unpadded - it is
             // constant, so rebuilding it per forward would be pure waste.
-            TensorBase? mask = GetCausalMask(x.Rows);
+            TensorBase? mask = BuildAttentionMask(x, targets, poolAttentionMask);
 
             for (int layerIndex = 0; layerIndex < _layers.Count; layerIndex++)
             {
@@ -1001,7 +1113,7 @@ namespace SimpleTransformer.Model
             {
                 // 1. Forward Pass
                 long tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
-                (prediction, auxOutput) = Forward(inputs);
+                (prediction, auxOutput) = Forward(inputs, expectedOutputs);
                 if (profiling) stepProfile.MarkForward(Stopwatch.GetTimestamp() - tPhase);
 
                 // 2. Compute Loss & Initial Backprop Gradient
@@ -1036,15 +1148,18 @@ namespace SimpleTransformer.Model
                 // A non-positive setting disables clipping for this step.
                 tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 float gradNorm = TrainingConfig.MaxGradientNorm > 0f
-                    ? ClipGradients(TrainingConfig.MaxGradientNorm)
-                    : ClipGradients(float.PositiveInfinity);
+                    ? ClipGradients(TrainingConfig.MaxGradientNorm, out string? culprit)
+                    : ClipGradients(float.PositiveInfinity, out culprit);
 
                 // Non-finite norm (NaN/Inf grads from an overflowed step) makes
                 // every scale factor NaN; stepping would poison all weights.
                 // Skip the step and keep last good weights instead.
                 if (!float.IsFinite(gradNorm))
                 {
-                    Log.Warning("[TrainStep] Non-finite gradient norm detected - skipping optimizer step to preserve last good weights.");
+                    Log.Warning(
+                        "[TrainStep] Non-finite gradient norm - skipping optimizer step to " +
+                        "preserve last good weights. Origin: {Culprit}.",
+                        culprit ?? "not isolated (gradient tensor vanished before inspection)");
                     ZeroGradients();
                     return float.NaN;
                 }
@@ -1367,7 +1482,7 @@ namespace SimpleTransformer.Model
             _embeddingDropout = new DropoutSite("embedding_dropout", TrainingConfig.DropoutRate);
             _workspace = new TensorWorkspace(_backend);
 
-            _loss = new CrossEntropyLoss();
+            _loss = new CrossEntropyLoss(IgnoreIndex);
             _optimizer = TrainingConfig.Optimizer switch
             {
                 OptimizerType.AdamW => new AdamWOptimizer(
@@ -1454,14 +1569,44 @@ namespace SimpleTransformer.Model
             Log.Information($"Transformer architecture initialisation completed in {watch.ElapsedMilliseconds}ms."); 
             watch.Stop();
         }
-        public float ClipGradients(float maxNorm = 1.0f)
+        /// <summary>
+        /// Names the exact tensor, element and magnitude behind a non-finite
+        /// gradient, so a divergence report says WHICH layer produced it rather
+        /// than only that one did. Also reports how far the tensor had already
+        /// drifted, which distinguishes "one layer blew up" from "the whole
+        /// network is NaN".
+        /// </summary>
+        private static string DescribeNonFiniteGradient(
+            TrainableParameter param, ReadOnlySpan<float> gData, int firstBad, float bad)
+        {
+            int nonFinite = 0;
+            float maxFinite = 0f;
+            for (int i = 0; i < gData.Length; i++)
+            {
+                float g = gData[i];
+                if (!float.IsFinite(g)) { nonFinite++; continue; }
+                float a = MathF.Abs(g);
+                if (a > maxFinite) maxFinite = a;
+            }
+
+            return $"{param.Name}[{firstBad}] = {(float.IsNaN(bad) ? "NaN" : "Inf")}; " +
+                   $"{nonFinite} of {gData.Length} entries non-finite; " +
+                   $"largest finite |g| in this tensor = {maxFinite:E3}";
+        }
+
+        public float ClipGradients(float maxNorm, out string? culprit)
         {
             double sumSquaredNorm = 0.0;
+            culprit = null;
 
             // 1. Accumulate squared gradients across ALL trainable parameters.
             // A single NaN/Inf gradient makes (g*g) NaN/Inf; without an explicit
             // finite check below, `NaN > maxNorm` is false so clipping is
             // silently skipped and the optimizer poisons every weight.
+            //
+            // The sum is accumulated in DOUBLE, and each element is checked before
+            // it is squared, so a merely-large gradient can never fabricate an
+            // infinite norm by overflowing the accumulation.
             foreach (var param in Parameters)
             {
                 if (param.Gradient == null) continue;
@@ -1471,7 +1616,10 @@ namespace SimpleTransformer.Model
                 {
                     float g = gData[i];
                     if (!float.IsFinite(g))
+                    {
+                        culprit = DescribeNonFiniteGradient(param, gData, i, g);
                         return float.NaN;
+                    }
                     sumSquaredNorm += (double)g * g;
                 }
             }

@@ -1,4 +1,4 @@
-﻿using Serilog;
+using Serilog;
 using Serilog.Events;
 using SimpleTransformer.Api;
 using SimpleTransformer.Model;
@@ -161,6 +161,30 @@ namespace SimpleTransformer
             if (args.Contains("--causal-mask-selftest"))
             {
                 bool ok = SimpleTransformer.Model.CausalMaskSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // Numerical gradient check (no server start): dotnet run -- --gradcheck-selftest
+            if (args.Contains("--gradcheck-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.GradientCheckSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // Padding allocation self-test (no server start):
+            // dotnet run -- --padding-alloc-selftest
+            // Asserts a padded forward allocates nothing off-pool, at a sequence
+            // length where the mask genuinely lands on the LOH.
+            if (args.Contains("--padding-alloc-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.PaddingAllocationSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // Padding self-test (no server start): dotnet run -- --padding-selftest
+            if (args.Contains("--padding-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.PaddingSelfTest.RunAndPrint();
                 Environment.Exit(ok ? 0 : 1);
             }
 

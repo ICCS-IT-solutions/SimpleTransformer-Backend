@@ -160,7 +160,8 @@ public static class TrainingJobExtensions
                 // text with a warning rather than training wrong.
                 var header = TokenCache.ReadHeader(cachePath);
                 TokenCache.Validate(header, TokenCache.Fingerprint(tokenizerVocabulary), tokenizerVocabulary.Count, (int)tokenizer.Type);
-                stream = new StreamingBatchSource(cachePath, window, batchSize, dropLast);
+                stream = new StreamingBatchSource(cachePath, window, batchSize, dropLast,
+                        tokenizerVocabulary.TokenToId[SpecialTokens.Pad]);
                 streamSamples = stream.SampleCount;
                 streamBatches = stream.BatchCount;
                 Log.Information(
@@ -401,6 +402,57 @@ public static class TrainingJobExtensions
                 lastEpochIndex = epoch;
                 float epochLoss = 0f;
                 int stepsCompleted = 0;
+
+                // Divergence accounting.
+                //
+                // TrainStep deliberately RETURNS NaN (rather than throwing) when
+                // the gradient norm goes non-finite: it skips the optimizer step
+                // so the last good weights survive, and lets training continue.
+                // Accumulating that NaN straight into epochLoss poisoned the
+                // running mean, and the next progress UPDATE tried to store NaN in
+                // a REAL column - which SQLite rejects outright ("Cannot store
+                // 'NaN' values"). So the mechanism meant to keep a run alive
+                // killed it with a DbUpdateException instead.
+                //
+                // Non-finite steps are therefore counted, excluded from the mean,
+                // and reported. The mean divides by the steps that actually
+                // produced a loss, so it stays a true average rather than being
+                // silently diluted.
+                int finiteLossSteps = 0;
+                int divergentSteps = 0;
+                float lastFiniteLoss = float.NaN;
+
+                float RecordStepLoss(float loss)
+                {
+                    if (float.IsFinite(loss))
+                    {
+                        epochLoss += loss;
+                        finiteLossSteps++;
+                        lastFiniteLoss = loss;
+                        return loss;
+                    }
+
+                    divergentSteps++;
+                    // Log once per epoch: the first divergence with context is
+                    // actionable, the thousandth is noise.
+                    if (divergentSteps == 1)
+                    {
+                        Log.Warning(
+                            "Training job {JobId} epoch {Epoch} step {Step}: non-finite loss " +
+                            "from a non-finite gradient norm (TrainStep skipped the optimizer " +
+                            "step and kept the previous weights). Last finite loss {LastLoss:F6}. " +
+                            "Diverging steps so far this epoch: {Divergent}. " +
+                            "If this persists, lower the learning rate.",
+                            job.EntryId, epoch + 1, stepsCompleted + 1,
+                            lastFiniteLoss, divergentSteps);
+                    }
+
+                    return lastFiniteLoss;
+                }
+
+                string DivergenceNote() => divergentSteps == 0
+                    ? string.Empty
+                    : $" | {divergentSteps} step(s) skipped: non-finite gradient";
                 // Deterministic per-epoch seed: streaming shuffles window
                 // indices (not tensors), legacy shuffles batch lists. Same
                 // corpus + same seed => same order, resumable and debuggable.
@@ -451,11 +503,11 @@ public static class TrainingJobExtensions
 
                                 // Only valid until the next MoveNext: train now.
                                 var item = epochBatches.Current;
-                                epochLoss += model.TrainStep(item.Inputs, item.Targets);
+                                RecordStepLoss(model.TrainStep(item.Inputs, item.Targets));
                                 stepsCompleted++;
                                 hasBatch = epochBatches.MoveNext();
 
-                                var runningMean = epochLoss / stepsCompleted;
+                                var runningMean = epochLoss / Math.Max(1, finiteLossSteps);
                                 int batchNo = batch + 1, subNo = subBatch + 1;
                                 await UpdateJob(dbFactory, job.EntryId, job =>
                                 {
@@ -464,7 +516,7 @@ public static class TrainingJobExtensions
                                     job.CurrentLoss = runningMean;
                                     job.Message =
                                         $"Epoch {epoch + 1}/{totalEpochs}, batch {batchNo}/{totalOuterBatches}, " +
-                                        $"sub-batch {subNo}/{chunkSize} - loss {runningMean:F6}";
+                                        $"sub-batch {subNo}/{chunkSize} - loss {runningMean:F6}" + DivergenceNote();
                                 });
 
                                 if (subNo % 4 == 0 || subNo == 1)
@@ -508,14 +560,14 @@ public static class TrainingJobExtensions
                             controlTokenSource.Token.ThrowIfCancellationRequested();
 
                             var item = currentSubBatch[subBatch];
-                            epochLoss += model.TrainStep(item.Inputs, item.Targets);
+                            RecordStepLoss(model.TrainStep(item.Inputs, item.Targets));
                             stepsCompleted++;
 
                             // Persist after every sub-batch (one TrainStep) so the
                             // frontend sees progress as fast as training actually moves.
                             // CurrentLoss is the running mean of per-step loss so it
                             // matches the scale of the epoch-end average.
-                            var runningMean = epochLoss / stepsCompleted;
+                            var runningMean = epochLoss / Math.Max(1, finiteLossSteps);
                             await UpdateJob(dbFactory, job.EntryId, job =>
                             {
                                 job.CurrentBatch = batch + 1;
@@ -523,7 +575,7 @@ public static class TrainingJobExtensions
                                 job.CurrentLoss = runningMean;
                                 job.Message =
                                     $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{shuffledSubBatches.Count}, " +
-                                    $"sub-batch {subBatch + 1}/{currentSubBatch.Count()} - loss {runningMean:F6}";
+                                    $"sub-batch {subBatch + 1}/{currentSubBatch.Count()} - loss {runningMean:F6}" + DivergenceNote();
                             });
 
                             // Correct parenthesis grouping for modulus
@@ -572,19 +624,19 @@ public static class TrainingJobExtensions
                         controlTokenSource.Token.ThrowIfCancellationRequested();
 
                         var item = shuffledMiniBatches[batch];
-                        epochLoss += model.TrainStep(item.Inputs, item.Targets);
+                        RecordStepLoss(model.TrainStep(item.Inputs, item.Targets));
                         stepsCompleted++;
 
                         // Persist after every batch so the frontend stays fresh here too
                         // (CurrentLoss = running mean, same scale as the epoch-end value).
-                        var runningMean = epochLoss / stepsCompleted;
+                        var runningMean = epochLoss / Math.Max(1, finiteLossSteps);
                         await UpdateJob(dbFactory, job.EntryId, job =>
                         {
                             job.CurrentBatch = batch + 1;
                             job.CurrentSubBatch = 1;
                             job.CurrentLoss = runningMean;
                             job.Message =
-                                $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{numBatches} - loss {runningMean:F6}";
+                                $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{numBatches} - loss {runningMean:F6}" + DivergenceNote();
                         });
 
                         // Correct parenthesis grouping for modulus
@@ -599,10 +651,24 @@ public static class TrainingJobExtensions
 
                 // Average over STEPS actually taken (streaming reuses 2 buffers,
                 // so miniBatches is empty there): identical scale on both paths.
-                epochLoss /= Math.Max(1, stepsCompleted);
+                epochLoss /= Math.Max(1, finiteLossSteps);
                 lastEpochLoss = epochLoss;
 
-                Log.Information($"Epoch {epoch + 1}: Loss={epochLoss:F6}");
+                Log.Information(divergentSteps > 0
+                    ? $"Epoch {epoch + 1}: Loss={epochLoss:F6} (mean over {finiteLossSteps} of {stepsCompleted} steps; " +
+                      $"{divergentSteps} skipped for a non-finite gradient)"
+                    : $"Epoch {epoch + 1}: Loss={epochLoss:F6}");
+
+                if (divergentSteps > stepsCompleted / 2)
+                {
+                    Log.Warning(
+                        "Training job {JobId} epoch {Epoch} lost the majority of its steps " +
+                        "({Divergent} of {Total}) to non-finite gradients. The weights are the " +
+                        "last good ones, but this epoch contributed little. Consider lowering " +
+                        "the learning rate or raising gradient clipping before resuming.",
+                        job.EntryId, epoch + 1, divergentSteps, stepsCompleted);
+                }
+
                 await UpdateJob(dbFactory, job.EntryId, job =>
                 {
                     job.CurrentEpoch = epoch + 1;

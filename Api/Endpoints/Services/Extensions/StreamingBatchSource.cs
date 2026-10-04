@@ -17,6 +17,7 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
         private readonly TokenCache.Header _header;
         private readonly int _window;
         private readonly int _batchSize;
+        private readonly int _padTokenId;
         private readonly bool _dropLast;
         private readonly long _sampleCount;
         private readonly Tensor _inBuf;
@@ -30,7 +31,8 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
         public int BatchCount { get; private set; }
         public TokenCache.Header Header => _header;
 
-        public StreamingBatchSource(string binPath, int window, int batchSize, bool dropLast)
+        public StreamingBatchSource(string binPath, int window, int batchSize, bool dropLast,
+            int padTokenId = 0)
         {
             _header = TokenCache.ReadHeader(binPath);
             _fs = new FileStream(binPath, FileMode.Open, FileAccess.Read,
@@ -38,10 +40,23 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
             _window = window;
             _batchSize = batchSize;
             _dropLast = dropLast;
-            // Need window+1 tokens per sample (input + shifted target).
-            _sampleCount = _header.TokenCount > window
+            // Id written into padded INPUT positions. The matching padded TARGET
+            // positions carry TransformerModel.IgnoreIndex instead, which is what
+            // the loss skips and what the attention mask reads to find the valid
+            // prefix. Defaults to 0, the id every vocabulary assigns to
+            // SpecialTokens.Pad.
+            _padTokenId = padTokenId;
+            // Floor division gives the count of fully-populated windows; a remainder adds
+            // one more, emitted PADDED rather than discarded. This mirrors
+            // TrainingDataExtensions.CreateTrainingSamples exactly - the two
+            // paths must agree, or a corpus that straddles the streaming
+            // threshold (numBatches > 8) would train on a different number of
+            // windows depending on which path served it.
+            long fullWindows = _header.TokenCount > window
                 ? (_header.TokenCount - 1) / window
                 : 0;
+            bool hasTail = _header.TokenCount > 0 && fullWindows * window < _header.TokenCount;
+            _sampleCount = fullWindows + (hasTail ? 1 : 0);
             _inBuf = new Tensor(batchSize, window);
             _tgtBuf = new Tensor(batchSize, window);
             _row = new float[window + 1];
@@ -90,12 +105,27 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
                 for (int r = 0; r < cur; r++)
                 {
                     long tokenOff = (long)order[b + r] * _window;
-                    TokenCacheIO.ReadWindowAsFloat(
-                        _fs, _header, tokenOff, _window + 1, _row, _scratch);
+
+                    // A tail window can run past the end of the stream. Read only
+                    // the tokens that actually exist - ReadWindowAsFloat uses
+                    // ReadExactly and would throw at EOF - then pad the rest,
+                    // exactly as CreateTrainingSamples does for the buffered path.
+                    long available = _header.TokenCount - tokenOff;
+                    int toRead = (int)Math.Min(_window + 1L, Math.Max(0L, available));
+                    if (toRead > 0)
+                    {
+                        TokenCacheIO.ReadWindowAsFloat(_fs, _header, tokenOff, toRead, _row, _scratch);
+                    }
+
+                    // Input row holds up to `window` tokens; the target row is
+                    // shifted by one, so it is always the shorter of the two.
+                    int validInput = (int)Math.Min(_window, Math.Max(0L, available));
+                    int validTarget = (int)Math.Min(_window, Math.Max(0L, available - 1));
+
                     for (int c = 0; c < _window; c++)
                     {
-                        _inBuf[r, c] = _row[c];
-                        _tgtBuf[r, c] = _row[c + 1];
+                        _inBuf[r, c] = c < validInput ? _row[c] : _padTokenId;
+                        _tgtBuf[r, c] = c < validTarget ? _row[c + 1] : TransformerModel.IgnoreIndex;
                     }
                 }
                 if (cur == _batchSize)

@@ -18,6 +18,7 @@ namespace SimpleTransformer.Api.Endpoints.Services.Extensions
         private readonly int _pad, _unk, _bos, _eos, _maxLen;
 
         public int EosTokenId => _eos;
+        public int PadTokenId => _pad;
         public int VocabularySize => _toId.Count;
 
         public GreedySubwordTokenizerAdapter(Vocabulary vocabulary)
