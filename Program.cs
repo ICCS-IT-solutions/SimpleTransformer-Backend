@@ -188,6 +188,21 @@ namespace SimpleTransformer
                 Environment.Exit(ok ? 0 : 1);
             }
 
+            // LR-schedule horizon self-test (no server start):
+            // dotnet run -- --lr-schedule-selftest
+            if (args.Contains("--lr-schedule-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.LRScheduleSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
+            // Gradient probe self-test (no server start): dotnet run -- --gradient-probe-selftest
+            if (args.Contains("--gradient-probe-selftest"))
+            {
+                bool ok = SimpleTransformer.Model.GradientProbeSelfTest.RunAndPrint();
+                Environment.Exit(ok ? 0 : 1);
+            }
+
             // Temp-checkpoint cadence self-test (no server start):
             // dotnet run -- --checkpoint-cadence-selftest
             // The policy is a pure function, so it is verified directly rather
@@ -227,8 +242,9 @@ namespace SimpleTransformer
         /// Two sinks with deliberately different policies:
         ///  - Console: errors only. A training loop emits a line per sub-batch, so
         ///    an information-level console is unusable during a real run and buries
-        ///    the failures that matter. The file keeps full detail.
-        ///  - File: rolling daily, seven files retained (see the filter below).
+        ///    the failures that matter.
+        ///  - File: rolling daily, seven files retained (see the filter below), and
+        ///    additionally split from the SQL log so training output stays readable.
         /// </summary>
         private static void ConfigureLogging()
         {
@@ -261,10 +277,12 @@ namespace SimpleTransformer
                 //buries the failures that actually matter.
                 .WriteTo.Console(restrictedToMinimumLevel: LogEventLevel.Error)
 
-                //File: full detail, gated by Conditional because the File sink
-                //takes no filterPredicate of its own.
+                //File: the real log. EF Core command chatter is redirected to its
+                //own sink below, so this file carries training and request events
+                //only. Gated by Conditional because the File sink takes no
+                //filterPredicate of its own.
                 .WriteTo.Conditional(
-                    static e => !IsEfCoreInformationNoise(e),
+                    static e => !IsEfCoreSqlChatter(e),
                     file => file.File(
                         "logs/server-.log",
                         rollingInterval: RollingInterval.Day,
@@ -272,25 +290,51 @@ namespace SimpleTransformer
                         //retention window the UI exposes. Pruning happens on
                         //rollover, so an idle server does not prune until it writes.
                         retainedFileCountLimit: 7,
-                        //Message renders literally (lj) so EF Core SQL and training
-                        //text stay readable instead of being escaped. {Properties:j}
-                        //carries the training/inference LogContext tags (Component,
-                        //JobId) onto the line - without it the context work would be
-                        //invisible in the file.
-                        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}"));
+                        //Message renders literally (lj) so training text stays
+                        //readable instead of being escaped. {Properties:j} carries
+                        //the LogContext tags (Component, JobId) onto the line -
+                        //without it the context work would be invisible in the file.
+                        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}"))
+
+                //EF Core SQL: kept, but in its own file. EF logs every command it
+                //runs, which is the overwhelming majority of log volume; interleaved
+                //with training output it buries the lines that matter and makes
+                //grepping a training run's diagnostics impractical. EF WARNING and
+                //above still reaches the main file - those are real diagnostics, not
+                //noise - so only the Information-level chatter is diverted here.
+                .WriteTo.Conditional(
+                    static e => IsEfCoreSqlChatter(e),
+                    file => file.File(
+                        "logs/sql-.log",
+                        rollingInterval: RollingInterval.Day,
+                        //SQL logs far faster than the application log during a run
+                        //(one entry per command, including the UI's polling of
+                        //train/jobs), so it gets a shorter retention window.
+                        retainedFileCountLimit: 3,
+                        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}"));
         }
 
         /// <summary>
-        /// True for EF Core's Information-level SQL chatter. EF logs every
-        /// command it executes, and it dominates the log file by volume (6,737
-        /// command dumps against 16 errors on a single day). Warning and above is
-        /// never treated as noise: EF warnings are real diagnostics.
+        /// True for EF Core's Information-level SQL chatter, which belongs in the
+        /// dedicated SQL log rather than the main one. EF logs every command it
+        /// executes and it dominates the log by volume (1,244 command dumps against
+        /// 0 training lines on a single run). Warning and above is never treated as
+        /// chatter: EF warnings are real diagnostics and stay in the main log.
         /// </summary>
-        internal static bool IsEfCoreInformationNoise(LogEvent logEvent)
+        internal static bool IsEfCoreSqlChatter(LogEvent logEvent)
         {
             if (logEvent.Level >= LogEventLevel.Warning)
                 return false;
 
+            return IsEfCoreEvent(logEvent);
+        }
+
+        /// <summary>
+        /// True when the event came from EF Core, at any level. Used to keep SQL
+        /// chatter and SQL-adjacent diagnostics in the same file.
+        /// </summary>
+        internal static bool IsEfCoreEvent(LogEvent logEvent)
+        {
             if (!logEvent.Properties.TryGetValue("SourceContext", out var src))
                 return false;
 

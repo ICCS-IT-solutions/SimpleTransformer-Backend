@@ -1,5 +1,6 @@
 using System;
 using SimpleTransformer.Model;
+using SimpleTransformer.Model.Extensions.Numerics;
 
 namespace SimpleTransformer.AccelerationEngine.CpuReference
 {
@@ -231,18 +232,10 @@ namespace SimpleTransformer.AccelerationEngine.CpuReference
 
                 for (int c = 0; c < dxRow.Length; c++)
                 {
-                    float value = xRow[c];
-                    float x2 = value * value;
-                    float x3 = x2 * value;
-
-                    float u = Sqrt2OverPi * (value + GeluC * x3);
-                    float t = MathF.Tanh(u);
-
-                    float derivative =
-                        0.5f * (1f + t)
-                        + 0.5f * value * (1f - t * t) * Sqrt2OverPi * (1f + 3f * GeluC * x2);
-
-                    dxRow[c] = dyRow[c] * derivative;
+                    // GeluDerivative is overflow-safe: the inline tanh polynomial
+                    // yields NaN for |x| beyond ~1.845e19 (0 * Inf), which poisons
+                    // every gradient downstream of the feed-forward.
+                    dxRow[c] = dyRow[c] * GeluDerivative.Evaluate(xRow[c]);
                 }
             }
         }

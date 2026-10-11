@@ -11,6 +11,14 @@ namespace SimpleTransformer.Model
     {
         public string Name { get; }
 
+        /// <summary>
+        /// Label for the NaN tripwire's log line. The model names every block
+        /// "layers.N", so Name already identifies the depth and no extra index is
+        /// needed; a block constructed with the default name falls back to that
+        /// name. Diagnostic only - it changes nothing about the computation.
+        /// </summary>
+        private string ProbeLabel => string.IsNullOrEmpty(Name) ? "transformer_block" : Name;
+
         private readonly ITrainableLayer _multiHeadAttention;
 
         /// <summary>Checkpoint/determinism tests: reach the attention module.</summary>
@@ -270,44 +278,78 @@ namespace SimpleTransformer.Model
             };
         }
 
-        private TensorBase BackwardSequence(TensorBase gradient, TensorWorkspace workspace)
+        /// <summary>
+        /// Backward with the NaN tripwire threaded down. The block runs its own probe
+        /// over its six internal stages so a non-finite gradient is attributed to the
+        /// exact operation (LayerNorm2, the FFN, a residual split) rather than to
+        /// "block 5", which is all the model-level probe can say.
+        /// <para>
+        /// The probe is skipped entirely when <paramref name="parent"/> has already
+        /// found a non-finite stage: once a stage upstream is condemned there is
+        /// nothing to learn here, and reporting six more poisoned tensors would bury
+        /// the real answer.
+        /// </para>
+        /// </summary>
+        public TensorBase Backward(TensorBase gradient, TensorWorkspace workspace, BackwardProbe? parent)
+        {
+            var probe = GradientProbeSettings.Enabled && parent is { Active: true }
+                ? new BackwardProbe(ProbeLabel, "block input gradient", parent)
+                : null;
+
+            return gradient.Rank switch
+            {
+                2 => BackwardSequence(gradient, workspace, probe),
+                3 => BackwardBatch(gradient, workspace, probe),
+                _ => throw new ArgumentException($"Gradient must be rank 2 or rank 3. Got Rank {gradient.Rank}.")
+            };
+        }
+
+        private TensorBase BackwardSequence(TensorBase gradient, TensorWorkspace workspace, BackwardProbe? probe = null)
         {
             if (TrainingStepProfile.Enabled)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Block Gradient");
 
             // 1. Backprop LayerNorm2
             TensorBase dResidual2 = _layerNorm2.Backward(gradient, workspace);
+            probe?.Check("layerNorm2 (_layerNorm2.Backward)", dResidual2);
 
             // 2. Backprop FFN-path dropout, then FeedForward
             TensorBase dDroppedFf = _dropoutFeedForward.ForItem(0).Backward(dResidual2, workspace);
+            probe?.Check("FFN-path dropout", dDroppedFf);
             TensorBase dFf = _feedForward.Backward(dDroppedFf, workspace);
+            probe?.Check("feed-forward (_feedForward.Backward)", dFf);
             workspace.Release(dDroppedFf);
 
             // 3. Split gradient at Residual 2 (FFN path + skip connection)
             TensorBase dNorm1 = workspace.BorrowLike(dFf);
             workspace.Backend.ElementWiseAddInto(dFf, dResidual2, dNorm1);
+            probe?.Check("residual-2 split (ElementWiseAddInto)", dNorm1);
             workspace.Release(dFf);
             workspace.Release(dResidual2);
 
             // 4. Backprop LayerNorm1
             TensorBase dResidual1 = _layerNorm1.Backward(dNorm1, workspace);
             workspace.Release(dNorm1);
+            probe?.Check("layerNorm1 (_layerNorm1.Backward)", dResidual1);
 
             // 5. Backprop attention-path dropout, then Attention
             TensorBase dDroppedAttention = _dropoutAttention.ForItem(0).Backward(dResidual1, workspace);
+            probe?.Check("attention-path dropout", dDroppedAttention);
             TensorBase dAttention = _multiHeadAttention.Backward(dDroppedAttention, workspace);
+            probe?.Check("multi-head attention (_multiHeadAttention.Backward)", dAttention);
             workspace.Release(dDroppedAttention);
 
             // 6. Split gradient at Residual 1 (Attention path + skip connection)
             TensorBase dInput = workspace.BorrowLike(dAttention);
             workspace.Backend.ElementWiseAddInto(dAttention, dResidual1, dInput);
+            probe?.Check("residual-1 split (ElementWiseAddInto)", dInput);
             workspace.Release(dAttention);
             workspace.Release(dResidual1);
 
             return dInput;
         }
 
-        private TensorBase BackwardBatch(TensorBase gradient, TensorWorkspace workspace)
+        private TensorBase BackwardBatch(TensorBase gradient, TensorWorkspace workspace, BackwardProbe? probe = null)
         {
             bool verbose = TrainingStepProfile.Enabled;
             if (verbose)
@@ -315,30 +357,38 @@ namespace SimpleTransformer.Model
 
             // 1. Backprop LayerNorm2
             TensorBase dFfResidual = _layerNorm2.Backward(gradient, workspace);
+            probe?.Check("layerNorm2 (_layerNorm2.Backward)", dFfResidual);
 
             // 2. Backprop FFN-path dropout, then FeedForward
             TensorBase dDroppedFf = BackwardResidualDropout(_dropoutFeedForward, dFfResidual, workspace);
+            probe?.Check("FFN-path dropout", dDroppedFf);
             TensorBase dFf = _feedForward.Backward(dDroppedFf, workspace);
+            probe?.Check("feed-forward (_feedForward.Backward)", dFf);
             workspace.Release(dDroppedFf);
 
             // 3. Split gradient at Residual 2
             TensorBase dNorm1 = workspace.BorrowLike(dFf);
             workspace.Backend.ElementWiseAddInto(dFf, dFfResidual, dNorm1);
+            probe?.Check("residual-2 split (ElementWiseAddInto)", dNorm1);
             workspace.Release(dFf);
             workspace.Release(dFfResidual);
 
             // 4. Backprop LayerNorm1
             TensorBase dAttnResidual = _layerNorm1.Backward(dNorm1, workspace);
             workspace.Release(dNorm1);
+            probe?.Check("layerNorm1 (_layerNorm1.Backward)", dAttnResidual);
 
             // 5. Backprop attention-path dropout, then MultiHeadAttention
             TensorBase dDroppedAttention = BackwardResidualDropout(_dropoutAttention, dAttnResidual, workspace);
+            probe?.Check("attention-path dropout", dDroppedAttention);
             TensorBase dAttention = _multiHeadAttention.Backward(dDroppedAttention, workspace);
+            probe?.Check("multi-head attention (_multiHeadAttention.Backward)", dAttention);
             workspace.Release(dDroppedAttention);
 
             // 6. Split gradient at Residual 1
             TensorBase dInput = workspace.BorrowLike(dAttention);
             workspace.Backend.ElementWiseAddInto(dAttention, dAttnResidual, dInput);
+            probe?.Check("residual-1 split (ElementWiseAddInto)", dInput);
             workspace.Release(dAttention);
             workspace.Release(dAttnResidual);
 

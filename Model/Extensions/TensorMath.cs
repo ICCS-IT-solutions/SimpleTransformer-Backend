@@ -1,3 +1,5 @@
+using SimpleTransformer.Model.Extensions.Numerics;
+
 namespace SimpleTransformer.Model.Extensions
 {
     public static class TensorMath
@@ -471,26 +473,10 @@ namespace SimpleTransformer.Model.Extensions
 
             for (int i = 0; i < length; i++)
             {
-                float value = x[i];
-
-                float x2 = value * value;
-                float x3 = x2 * value;
-
-                float u =
-                    sqrt2OverPi *
-                    (value + 0.044715f * x3);
-
-                float t = MathF.Tanh(u);
-
-                float derivative =
-                    0.5f * (1f + t)
-                    +
-                    0.5f * value
-                    * (1f - t * t)
-                    * sqrt2OverPi
-                    * (1f + 3f * 0.044715f * x2);
-
-                dx[i] = dy[i] * derivative;
+                // GeluDerivative is overflow-safe: the inline tanh polynomial yields
+                // NaN for |x| beyond ~1.845e19 (1+3c*x^2 overflows to Inf while
+                // 1-t*t is exactly 0, so the product is 0*Inf).
+                dx[i] = dy[i] * GeluDerivative.Evaluate(x[i]);
             }
         }
 

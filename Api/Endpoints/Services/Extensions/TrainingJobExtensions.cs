@@ -268,12 +268,50 @@ public static class TrainingJobExtensions
         var totalEpochs = startEpoch + (config?.Epochs ?? 10); // Default to 10 epochs if not specified
 
         // LR schedule budget: one optimizer step per mini-batch per epoch.
-        // The horizon MUST span the full run (totalEpochs x steps), not just
-        // the remaining epochs: the model's checkpointed GlobalStep lands
-        // mid-curve, and a remaining-only horizon would leave it past the end
-        // (LR pinned at the floor). The factory-built model reads the live
-        // TrainingConfig, so peak/warmup/floor come from the current config.
-        int scheduleSteps = Math.Max(1, totalEpochs * Math.Max(1, numBatches));
+        //
+        // The horizon is an ABSOLUTE step count, compared against the model's
+        // checkpointed GlobalStep by LRScheduler.GetLR - which returns the floor once
+        // step >= TotalSteps. It must therefore span every step this invocation will
+        // take PLUS the steps already banked by earlier runs.
+        //
+        // The previous expression was `totalEpochs * numBatches`, where totalEpochs is
+        // the ABSOLUTE end epoch (startEpoch + config.Epochs). That conflated an epoch
+        // index with a step count and ignored the startEpoch component entirely, so a
+        // resumed run got a horizon far shorter than the training already done: every
+        // step fell past the end of the curve and GetLR returned MinLearningRate for
+        // the whole run. Observed in the field as
+        //
+        //     LR schedule: 120 total steps, warmup 12, peak 0.0003,
+        //                  floor 5E-05, resuming at step 982
+        //
+        // i.e. 862 steps past a 120-step horizon, where LR is pinned to the floor
+        // exactly. It was invisible because the log line printed the SETTINGS, which
+        // looked perfectly healthy while none of them were in effect.
+        //
+        // Note what this does and does not fix. The peak is a ONE-TIME event at the
+        // warmup boundary - after warmup the cosine only decays - so no horizon can
+        // make the peak reachable again for a model already past warmup. What this
+        // restores is that the LR follows the cosine instead of being clamped to the
+        // floor, which means the FLOOR value is no longer the de-facto learning rate.
+        // Choosing a peak worth reaching still requires a FRESH run; for a long-lived
+        // model, MinLearningRate is the setting that governs the whole cosine.
+        int stepsThisRun = Math.Max(1, config?.Epochs ?? 10) * Math.Max(1, numBatches);
+        int scheduleSteps = Math.Max(1, model.GlobalStep + stepsThisRun);
+
+        // Guard the invariant the rest of the pipeline relies on: GetLR returns the
+        // floor once step >= TotalSteps, so a horizon at or below GlobalStep silently
+        // discards the peak, the warmup and the entire decay curve.
+        if (scheduleSteps <= model.GlobalStep)
+        {
+            Log.Warning(
+                "LR horizon {Steps} does not exceed GlobalStep {Step}: peak and warmup " +
+                "would be unreachable and the run would train entirely at the floor. " +
+                "Extending the horizon by one epoch of steps.",
+                scheduleSteps, model.GlobalStep);
+
+            scheduleSteps = model.GlobalStep + Math.Max(1, numBatches);
+        }
+
         // Brief re-warmup when resuming mid-schedule: Adam moments reset
         // while weights are trained, so jumping to mid-curve LR spikes the
         // loss (measured +0.05 at epoch 16). ~10% of WarmupSteps, min 1.
@@ -288,13 +326,41 @@ public static class TrainingJobExtensions
         // Invalidate the cache; inference must re-read the selected file
         // instead of silently serving post-training weights for it.
         model.LoadedCheckpointId = null;
+
+        // Report the LR this run will actually START at, not just the configured
+        // peak. A horizon shorter than GlobalStep produced a log line that looked
+        // healthy (peak 0.0003, warmup 12) while every step actually ran at the
+        // floor - the numbers on the line were the settings, not the behaviour.
+        // Surfacing the projected first-step LR makes that class of mistake
+        // visible in one glance instead of only via a loss curve.
+        float projectedFirstLr = model.GetStepLearningRate();
+
         Log.Information(
-            "LR schedule: {Steps} total steps, warmup {Warmup}, peak {Peak}, floor {Floor}, resuming at step {AtStep}.",
+            "LR schedule: {Steps} total steps, warmup {Warmup}, peak {Peak}, floor {Floor}, " +
+            "resuming at step {AtStep}; next step LR {FirstLr} ({FirstLrPct} of peak), " +
+            "{StepsRemaining} step(s) of schedule remaining.",
             scheduleSteps,
             model.TrainingConfig.WarmupSteps,
             model.TrainingConfig.LearningRate,
             model.TrainingConfig.MinLearningRate,
-            model.GlobalStep);
+            model.GlobalStep,
+            projectedFirstLr,
+            model.TrainingConfig.LearningRate > 0
+                ? $"{100f * projectedFirstLr / model.TrainingConfig.LearningRate:F1}%"
+                : "n/a",
+            Math.Max(0, scheduleSteps - model.GlobalStep));
+
+        if (projectedFirstLr <= model.TrainingConfig.MinLearningRate
+            && model.TrainingConfig.LearningRate > model.TrainingConfig.MinLearningRate)
+        {
+            Log.Warning(
+                "This run begins at the learning-rate FLOOR ({Lr}), not near the peak ({Peak}): " +
+                "{Steps} of {Total} schedule steps are already spent, so the cosine is nearly " +
+                "exhausted. Training still progresses, but slowly and without the configured " +
+                "peak. Resume with a larger epoch count to give the schedule room to decay.",
+                projectedFirstLr, model.TrainingConfig.LearningRate,
+                model.GlobalStep, scheduleSteps);
+        }
 
         //Update the job status
         await UpdateJob(dbFactory, job.EntryId, job =>
@@ -373,6 +439,11 @@ public static class TrainingJobExtensions
             string checkpointFilename = $"checkpoint-epoch-{epochIndex + 1}-temp.bin";
             string checkpointFilepath = $"{checkpointDirname}/{checkpointFilename}";
 
+            // The binary payload keeps the true value (NaN round-trips fine in a
+            // float stream and means "no finite loss this epoch"); only the DB
+            // column needs the finite placeholder.
+            float dbLoss = float.IsFinite(loss) ? loss : 0f;
+
             await using (var ckptStream = File.Create(checkpointFilepath))
             {
                 model.SaveCheckpoint(ckptStream, epochIndex, loss);
@@ -384,7 +455,7 @@ public static class TrainingJobExtensions
                 $"{checkpointDirname}/",
                 checkpointFilename,
                 epochIndex + 1,
-                loss,
+                dbLoss,
                 new FileInfo(checkpointFilepath).Length);
 
             await UpdateJob(dbFactory, job.EntryId, j =>
@@ -453,6 +524,31 @@ public static class TrainingJobExtensions
                 string DivergenceNote() => divergentSteps == 0
                     ? string.Empty
                     : $" | {divergentSteps} step(s) skipped: non-finite gradient";
+
+                // A fully-skipped epoch has NO loss to report, and that must never
+                // be rendered as a number. Formatting `epochLoss / Math.Max(1, 0)`
+                // yields a confident "0.000000" - byte-for-byte identical to a
+                // model that has genuinely converged to zero loss. That is the most
+                // dangerous thing this job can display: the run looks perfect while
+                // every step was discarded and the weights never changed. So when
+                // nothing finite was recorded, say so and give the skip count.
+                string FormatRunningLoss()
+                {
+                    if (finiteLossSteps == 0)
+                        return divergentSteps == 0
+                            ? "n/a (no steps recorded)"
+                            : $"n/a (all {divergentSteps} step(s) skipped)";
+
+                    return (epochLoss / finiteLossSteps).ToString("F6");
+                }
+
+                // Numeric counterpart for job.CurrentLoss, which is a REAL column
+                // and rejects NaN outright (the original DbUpdateException). There
+                // is no finite loss to store when finiteLossSteps == 0, so 0 is
+                // written as a placeholder and the message string above carries
+                // the truth; the caller-facing text never claims a real 0.000000.
+                float RunningLossValue()
+                    => finiteLossSteps == 0 ? 0f : (float)(epochLoss / finiteLossSteps);
                 // Deterministic per-epoch seed: streaming shuffles window
                 // indices (not tensors), legacy shuffles batch lists. Same
                 // corpus + same seed => same order, resumable and debuggable.
@@ -507,16 +603,16 @@ public static class TrainingJobExtensions
                                 stepsCompleted++;
                                 hasBatch = epochBatches.MoveNext();
 
-                                var runningMean = epochLoss / Math.Max(1, finiteLossSteps);
+                                var lossText = FormatRunningLoss();
                                 int batchNo = batch + 1, subNo = subBatch + 1;
                                 await UpdateJob(dbFactory, job.EntryId, job =>
                                 {
                                     job.CurrentBatch = batchNo;
                                     job.CurrentSubBatch = subNo;
-                                    job.CurrentLoss = runningMean;
+                                    job.CurrentLoss = RunningLossValue();
                                     job.Message =
                                         $"Epoch {epoch + 1}/{totalEpochs}, batch {batchNo}/{totalOuterBatches}, " +
-                                        $"sub-batch {subNo}/{chunkSize} - loss {runningMean:F6}" + DivergenceNote();
+                                        $"sub-batch {subNo}/{chunkSize} - loss {lossText}" + DivergenceNote();
                                 });
 
                                 if (subNo % 4 == 0 || subNo == 1)
@@ -526,7 +622,11 @@ public static class TrainingJobExtensions
                             }
                             if (DueForTempCheckpoint())
                             {
-                                await WriteTempCheckpointAsync(epoch, epochLoss);
+                                // Running MEAN, not the raw sum: a mid-epoch
+                                // checkpoint whose recorded loss is the accumulated
+                                // total is not comparable to any other checkpoint.
+                                // RunningLossValue is NaN-safe by construction.
+                                await WriteTempCheckpointAsync(epoch, RunningLossValue());
                                 MarkTempCheckpointWritten();
                             }
                             batch++;
@@ -567,15 +667,15 @@ public static class TrainingJobExtensions
                             // frontend sees progress as fast as training actually moves.
                             // CurrentLoss is the running mean of per-step loss so it
                             // matches the scale of the epoch-end average.
-                            var runningMean = epochLoss / Math.Max(1, finiteLossSteps);
+                            var lossText = FormatRunningLoss();
                             await UpdateJob(dbFactory, job.EntryId, job =>
                             {
                                 job.CurrentBatch = batch + 1;
                                 job.CurrentSubBatch = subBatch + 1;
-                                job.CurrentLoss = runningMean;
+                                job.CurrentLoss = RunningLossValue();
                                 job.Message =
                                     $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{shuffledSubBatches.Count}, " +
-                                    $"sub-batch {subBatch + 1}/{currentSubBatch.Count()} - loss {runningMean:F6}" + DivergenceNote();
+                                    $"sub-batch {subBatch + 1}/{currentSubBatch.Count()} - loss {lossText}" + DivergenceNote();
                             });
 
                             // Correct parenthesis grouping for modulus
@@ -591,7 +691,8 @@ public static class TrainingJobExtensions
                         //208.8M parameters is a ~3.34 GB write each time.
                         if (DueForTempCheckpoint())
                         {
-                            await WriteTempCheckpointAsync(epoch, epochLoss);
+                            // Running MEAN, not the raw sum (see the streaming path).
+                            await WriteTempCheckpointAsync(epoch, RunningLossValue());
                             MarkTempCheckpointWritten();
                         }
                     }
@@ -629,14 +730,14 @@ public static class TrainingJobExtensions
 
                         // Persist after every batch so the frontend stays fresh here too
                         // (CurrentLoss = running mean, same scale as the epoch-end value).
-                        var runningMean = epochLoss / Math.Max(1, finiteLossSteps);
+                        var lossText = FormatRunningLoss();
                         await UpdateJob(dbFactory, job.EntryId, job =>
                         {
                             job.CurrentBatch = batch + 1;
                             job.CurrentSubBatch = 1;
-                            job.CurrentLoss = runningMean;
+                            job.CurrentLoss = RunningLossValue();
                             job.Message =
-                                $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{numBatches} - loss {runningMean:F6}" + DivergenceNote();
+                                $"Epoch {epoch + 1}/{totalEpochs}, batch {batch + 1}/{numBatches} - loss {lossText}" + DivergenceNote();
                         });
 
                         // Correct parenthesis grouping for modulus
@@ -651,13 +752,28 @@ public static class TrainingJobExtensions
 
                 // Average over STEPS actually taken (streaming reuses 2 buffers,
                 // so miniBatches is empty there): identical scale on both paths.
-                epochLoss /= Math.Max(1, finiteLossSteps);
-                lastEpochLoss = epochLoss;
+                // lastEpochLoss is NaN, not 0, when every step was skipped: this
+                // value feeds the checkpoint filename and the job's CurrentLoss,
+                // and a fabricated 0.0 there would both look like perfect
+                // convergence and persist a meaningless "loss-0.000000" name.
+                // TrainStep/ClipGradients already return NaN deliberately, so NaN
+                // is the established "no valid result" signal in this pipeline.
+                lastEpochLoss = finiteLossSteps > 0 ? epochLoss / finiteLossSteps : float.NaN;
+                string epochLossText = FormatRunningLoss();
+
+                // Downstream (DB columns, checkpoint filename) needs the epoch MEAN,
+                // and job.CurrentLoss is a REAL column that rejects NaN outright -
+                // the original DbUpdateException this whole divergence path grew
+                // around. So the mean goes to disk where it is finite, and a fully
+                // skipped epoch stores 0 purely as a non-crashing placeholder; the
+                // message text (epochLossText) is what tells the truth on screen,
+                // and lastEpochLoss stays NaN for the binary checkpoint payload.
+                float dbEpochLoss = float.IsFinite(lastEpochLoss) ? lastEpochLoss : 0f;
 
                 Log.Information(divergentSteps > 0
-                    ? $"Epoch {epoch + 1}: Loss={epochLoss:F6} (mean over {finiteLossSteps} of {stepsCompleted} steps; " +
+                    ? $"Epoch {epoch + 1}: Loss={epochLossText} (mean over {finiteLossSteps} of {stepsCompleted} steps; " +
                       $"{divergentSteps} skipped for a non-finite gradient)"
-                    : $"Epoch {epoch + 1}: Loss={epochLoss:F6}");
+                    : $"Epoch {epoch + 1}: Loss={epochLossText}");
 
                 if (divergentSteps > stepsCompleted / 2)
                 {
@@ -676,7 +792,7 @@ public static class TrainingJobExtensions
                     //mini-batch count in the small path - never the raw mini-batch
                     //count here, or the frontend renders e.g. "229 / 29".
                     job.CurrentBatch = job.TotalBatches;
-                    job.CurrentLoss = epochLoss;
+                    job.CurrentLoss = dbEpochLoss;
 
                     //One-line memory snapshot so VRAM fill-up is visible per epoch
                     //in both the log and the frontend job message (empty on CPU
@@ -710,7 +826,7 @@ public static class TrainingJobExtensions
                 //cheap next to the traffic this cadence removes.
                 if (CheckpointCadenceSettings.Enabled)
                 {
-                    await WriteTempCheckpointAsync(epoch, epochLoss);
+                    await WriteTempCheckpointAsync(epoch, lastEpochLoss);
                     MarkTempCheckpointWritten();
                 }
 
@@ -721,7 +837,15 @@ public static class TrainingJobExtensions
                 if ((epoch + 1) % epochInterval == 0 || epoch == totalEpochs - 1)
                 {
                     var transformerModelName = await GetModelNameFromId(dbFactory, modelEntry.EntryId);
-                    var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-loss-{epochLoss:F6}.bin";
+
+                    // Filename token must be filesystem-safe AND must not read as a
+                    // real 0.000000 loss. epochLossText can be "n/a (all 5 step(s)
+                    // skipped)" - spaces and parentheses are legal on NTFS but make a
+                    // poor checkpoint name and re-parse badly, so use a flat token.
+                    string lossToken = finiteLossSteps > 0
+                        ? dbEpochLoss.ToString("F6", System.Globalization.CultureInfo.InvariantCulture)
+                        : "diverged";
+                    var checkpointFilename = $"checkpoint-epoch-{epoch + 1}-loss-{lossToken}.bin";
                     var checkpointDirname = $"checkpoints/{transformerModelName}";
                     Directory.CreateDirectory(checkpointDirname);
 
@@ -729,7 +853,7 @@ public static class TrainingJobExtensions
 
                     await using (var ckptFile = File.Create(checkpointFilepath))
                     {
-                        model.SaveCheckpoint(ckptFile, epoch, epochLoss);
+                        model.SaveCheckpoint(ckptFile, epoch, lastEpochLoss);
                     }
 
                     //Filenames are deterministic, so upsert to guarantee one record per file
@@ -740,13 +864,13 @@ public static class TrainingJobExtensions
                         $"checkpoints/{transformerModelName}/",
                         checkpointFilename,
                         epoch + 1,
-                        epochLoss,
+                        dbEpochLoss,
                         new FileInfo(checkpointFilepath).Length);
 
                     await UpdateJob(dbFactory, job.EntryId, job =>
                     {
                         job.CheckpointFilename = checkpointFilepath;
-                        job.CurrentLoss = epochLoss;
+                        job.CurrentLoss = dbEpochLoss;
                         job.Message =
                             $"Epoch {epoch + 1} completed. Checkpoint saved.";
                         job.TrainingCheckpointId = checkpointEntry.EntryId;
@@ -916,7 +1040,16 @@ public static class TrainingJobExtensions
         }
 
         entry.Epoch = epoch;
-        entry.Loss = loss;
+
+        // SQLite cannot store NaN in a REAL column: BindDouble throws
+        // "Cannot store 'NaN' values" and the whole training job dies on
+        // SaveChanges. A fully-skipped epoch legitimately has no loss, and NaN is
+        // the established signal for that throughout the pipeline, so sanitise
+        // HERE rather than trusting every caller to have pre-filtered. This is the
+        // only place checkpoint loss reaches the database, so guarding it once
+        // closes the path for all of them.
+        entry.Loss = float.IsFinite(loss) ? loss : 0f;
+
         entry.FileSize = fileSize;
 
         await db.SaveChangesAsync();
@@ -937,6 +1070,15 @@ public static class TrainingJobExtensions
             return;
 
         update(jobEntry);
+
+        // Same SQLite constraint as UpsertCheckpointAsync: a REAL column rejects
+        // NaN with "Cannot store 'NaN' values" and takes the whole job down with
+        // it. CurrentLoss is the field most exposed to it, because the training
+        // loop assigns an epoch-mean that is deliberately NaN when every step was
+        // skipped. Guard the column centrally rather than relying on each of the
+        // dozen call sites in the loop to remember.
+        if (!float.IsFinite(jobEntry.CurrentLoss))
+            jobEntry.CurrentLoss = 0f;
 
         jobEntry.DateUpdated = DateTime.UtcNow;
 

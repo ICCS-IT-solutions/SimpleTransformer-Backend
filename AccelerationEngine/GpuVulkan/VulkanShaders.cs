@@ -181,15 +181,28 @@ layout(set = 0, binding = 0) buffer X { float x[]; };
 layout(set = 0, binding = 1) buffer DY { float dy[]; };
 layout(set = 0, binding = 2) buffer DX { float dx[]; };
 layout(push_constant) uniform Push { uint rows; uint cols; float _e; uint _f; } p;
+
+// Overflow-safe GELU derivative, mirroring GeluDerivative.Evaluate on the CPU.
+// Beyond |v| ~ 1.845e19 the term (1 + 3c*v*v) is +Inf while (1 - t*t) is exactly
+// 0, so the product is 0 * Inf = NaN. That NaN propagates through every gradient
+// downstream of the feed-forward. GELU' saturates to 1 for large +v and 0 for
+// large -v, and both limits are reached far below the overflow point, so
+// short-circuiting is exact in the limit and leaves ordinary inputs untouched.
+float gelu_deriv(float v) {
+    if (v >  1.0e4) return 1.0;
+    if (v < -1.0e4) return 0.0;
+    float t  = tanh(0.7978845608 * (v + 0.044715 * v * v * v));
+    float dt = 0.7978845608 * (1.0 + 3.0 * 0.044715 * v * v);
+    float d = 0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * dt;
+    return (d == d) ? d : (v > 0.0 ? 1.0 : 0.0);
+}
+
 void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= p.rows) return;
     for (uint c = 0u; c < p.cols; c++) {
         uint i = row * p.cols + c;
-        float v = x[i];
-        float t = tanh(0.7978845608 * (v + 0.044715 * v * v * v));
-        float dt = 0.7978845608 * (1.0 + 3.0 * 0.044715 * v * v);
-        dx[i] = dy[i] * (0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * dt);
+        dx[i] = dy[i] * gelu_deriv(x[i]);
     }
 }";
 

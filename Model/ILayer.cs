@@ -19,6 +19,19 @@ namespace SimpleTransformer.Model
             => Forward(input, workspace);
 
         TensorBase Backward(TensorBase gradient, TensorWorkspace workspace);
+
+        /// <summary>
+        /// Backward with an optional NaN tripwire. Only layers that can host a
+        /// meaningful sub-stage probe consume it - today TransformerBlock, to
+        /// attribute a non-finite gradient to one of its six internal steps.
+        /// <para>
+        /// The default implementation ignores the probe and delegates, so every
+        /// other layer keeps its 2-argument entry point and nothing else changes.
+        /// This mirrors the mask overload above.
+        /// </para>
+        /// </summary>
+        TensorBase Backward(TensorBase gradient, TensorWorkspace workspace, BackwardProbe? probe)
+            => Backward(gradient, workspace);
         //Leaving this disabled for now until I need to bring it in.
         // IEnumerable<Tensor> Parameters { get; }
     }

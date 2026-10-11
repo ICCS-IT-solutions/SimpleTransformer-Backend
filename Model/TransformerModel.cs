@@ -561,39 +561,71 @@ namespace SimpleTransformer.Model
             bool verbose = TrainingStepProfile.Enabled;
             if (verbose)
                 Log.Information("Starting backward pass through the transformer model...");
+
+            // Tripwire: record the FIRST stage whose gradient tensor is non-finite.
+            // BackwardProbe reports the stage BEFORE the first non-finite one as the
+            // origin, because the stage that receives a NaN is downstream of the
+            // operation that created it.
+            var probe = GradientProbeSettings.Enabled
+                ? new BackwardProbe("model", "loss gradient (entering backward)")
+                : null;
+
             var backwardWatch = Stopwatch.StartNew();
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Gradient contains NaN.");
 
+            probe?.Check("loss gradient (entering backward)", gradient);
+
             gradient = _outputProjection.Backward(gradient, _workspace);
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through output projection contains NaN.");
+            probe?.Check("output projection (_outputProjection.Backward)", gradient);
 
             for (int i = _layers.Count - 1; i >= 0; i--)
             {
                 var thislayer = _layers[i];
                 var layerWatch = Stopwatch.StartNew();
 
-                gradient = _layers[i].Backward(gradient, _workspace);
+                // The block runs its own probe over its six internal stages, but only
+                // while this model-level chain is still healthy: once a block has been
+                // condemned there is nothing to learn from probing the rest, and the
+                // cascade would bury the real answer.
+                gradient = _layers[i].Backward(gradient, _workspace, probe);
                 layerWatch.Stop();
                 if (verbose)
                 {
                     Log.Information($"Backward pass through layer {i} ({thislayer.GetType().Name}) completed in {layerWatch.ElapsedMilliseconds} ms.");
                     DiagonisticUtilities.AssertNoNaN(gradient, $"Gradient after backward pass through layer {i} contains NaN.");
                 }
+                probe?.Check($"block {i} ({thislayer.GetType().Name}.Backward)", gradient);
             }
 
             gradient = BackwardEmbeddingDropout(gradient, _workspace);
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through embedding dropout contains NaN.");
+            probe?.Check("embedding dropout", gradient);
 
             gradient = _position.Backward(gradient, _workspace);
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through positional encoding contains NaN.");
+            probe?.Check("positional encoding (_position.Backward)", gradient);
 
             gradient = _embedding.Backward(gradient, _workspace);
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Gradient after backward pass through embedding contains NaN.");
+
+            // The embedding's own parameter gradient is NOT probed here:
+            // _embedding.Backward consumes the gradient into _embeddingGradient and
+            // returns a dummy, so the NaN is now in the PARAMETER, not this tensor.
+            // Probing it would name the embedding as the cause - precisely the
+            // misattribution this probe exists to remove.
+            if (probe is { FoundNonFinite: true })
+            {
+                Log.Error(
+                    "[GradientProbe] Backward sweep complete. First non-finite stage: {Stage}. " +
+                    "token_embeddings is a downstream symptom of that, not the origin.",
+                    probe.FirstBadStage);
+            }
 
             // REMOVED: _embedding.ClipGradients(1.0f); -> Handled globally in TrainStep!
             backwardWatch.Stop();
@@ -1139,7 +1171,28 @@ namespace SimpleTransformer.Model
                 // (OpStart/OpFinish) instead. CPU backends are unaffected either
                 // way.
                 tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
-                Backward(gradient);
+                tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
+                try
+                {
+                    Backward(gradient);
+                }
+                catch (InvalidOperationException ex) when (
+                    GradientProbeSettings.Enabled
+                    && GradientProbeSettings.ThrowOnFirstNonFinite
+                    && ex.Message.StartsWith("[GradientProbe]", StringComparison.Ordinal))
+                {
+                    // The probe aborted the sweep deliberately. Unwinding here would
+                    // fail the whole training job over a diagnostic, so the step is
+                    // abandoned instead: gradients are discarded, no optimizer step
+                    // runs, and the caller sees NaN exactly as for any other divergent
+                    // step. The probe has already logged which stage it was.
+                    Log.Warning(
+                        "[TrainStep] Gradient probe aborted the backward sweep at global step " +
+                        "{Step}; step skipped, weights preserved. {Detail}",
+                        _globalStep, ex.Message);
+                    ZeroGradients();
+                    return float.NaN;
+                }
                 if (profiling) stepProfile.MarkModelBackward(Stopwatch.GetTimestamp() - tPhase);
 
                 // 4. Clip ALL parameter gradients globally + NaN validation.
@@ -1577,52 +1630,63 @@ namespace SimpleTransformer.Model
         /// network is NaN".
         /// </summary>
         private static string DescribeNonFiniteGradient(
-            TrainableParameter param, ReadOnlySpan<float> gData, int firstBad, float bad)
+            TrainableParameter param, ReadOnlySpan<float> gData, int nonFinite,
+            int firstBad, float bad, float maxFinite)
         {
-            int nonFinite = 0;
-            float maxFinite = 0f;
-            for (int i = 0; i < gData.Length; i++)
-            {
-                float g = gData[i];
-                if (!float.IsFinite(g)) { nonFinite++; continue; }
-                float a = MathF.Abs(g);
-                if (a > maxFinite) maxFinite = a;
-            }
-
             return $"{param.Name}[{firstBad}] = {(float.IsNaN(bad) ? "NaN" : "Inf")}; " +
-                   $"{nonFinite} of {gData.Length} entries non-finite; " +
-                   $"largest finite |g| in this tensor = {maxFinite:E3}";
+                   $"{nonFinite}/{gData.Length} bad; max finite |g| {maxFinite:E3}";
         }
 
         public float ClipGradients(float maxNorm, out string? culprit)
         {
+            // Parameters yields embeddings FIRST, but embeddings are the DEEPEST layer in
+            // the backward chain - NaN there is a SYMPTOM, not the origin. So
+            // every tensor is scanned (never returning on the first hit) and the
+            // offenders are reported in REVERSE parameter order: lm_head first,
+            // then the blocks, embeddings last. The first one listed is the one
+            // nearest the loss, which is where the NaN was born.
+            var offenders = new List<string>();
             double sumSquaredNorm = 0.0;
-            culprit = null;
 
-            // 1. Accumulate squared gradients across ALL trainable parameters.
-            // A single NaN/Inf gradient makes (g*g) NaN/Inf; without an explicit
-            // finite check below, `NaN > maxNorm` is false so clipping is
-            // silently skipped and the optimizer poisons every weight.
-            //
-            // The sum is accumulated in DOUBLE, and each element is checked before
-            // it is squared, so a merely-large gradient can never fabricate an
-            // infinite norm by overflowing the accumulation.
-            foreach (var param in Parameters)
+            foreach (var param in Parameters.Reverse())
             {
                 if (param.Gradient == null) continue;
 
                 ReadOnlySpan<float> gData = param.Gradient.Data.AsSpan();
+                int nonFinite = 0;
+                int firstBad = -1;
+                float firstBadValue = 0f;
+                float maxFinite = 0f;
+
                 for (int i = 0; i < gData.Length; i++)
                 {
                     float g = gData[i];
                     if (!float.IsFinite(g))
                     {
-                        culprit = DescribeNonFiniteGradient(param, gData, i, g);
-                        return float.NaN;
+                        if (firstBad < 0) { firstBad = i; firstBadValue = g; }
+                        nonFinite++;
+                        continue;
                     }
                     sumSquaredNorm += (double)g * g;
+                    float a = MathF.Abs(g);
+                    if (a > maxFinite) maxFinite = a;
                 }
+
+                if (nonFinite > 0)
+                    offenders.Add(DescribeNonFiniteGradient(param, gData, nonFinite, firstBad, firstBadValue, maxFinite));
             }
+
+            if (offenders.Count > 0)
+            {
+                culprit = $"{offenders.Count} tensor(s) non-finite, nearest the loss first: "
+                          + string.Join(" | ", offenders.Take(6))
+                          + (offenders.Count > 6 ? $" ... +{offenders.Count - 6} more" : string.Empty);
+                return float.NaN;
+            }
+
+            culprit = null;
+
+            culprit = null;
 
             float totalNorm = (float)Math.Sqrt(sumSquaredNorm);
 

@@ -12,7 +12,10 @@ namespace SimpleTransformer.Model.Extensions.Numerics
         private const float C1 = 0.7978845608f; // sqrt(2 / pi)
         private const float Sqrt2OverPi = 0.7978845608f;
         private const float GeluC = 0.044715f;
-        private const float Gelu3C = 0.134145f; // 3 * 0.044715f
+        // Computed, not the literal 0.134145f: the two differ in float32
+    // (0.134145 vs 0.13414499). Sourced from GeluDerivative so the vectorised and
+    // scalar paths cannot drift apart.
+    private static float Gelu3C => GeluDerivative.ThreeC;
         public static void ValidateSameShape(TensorBase a, TensorBase b) => TensorUtilitiesSimd.ValidateSameShape(a, b);
 
         #region Multiple tensor operations
@@ -680,9 +683,13 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             var vConstC = new Vector<float>(GeluC);
             var vConst3C = new Vector<float>(Gelu3C);
             var vOne = Vector<float>.One;
+            var vZero = Vector<float>.Zero;
             var vNegOne = new Vector<float>(-1.0f);
             var vHalf = new Vector<float>(0.5f);
             var vPolyCoeff = new Vector<float>(0.5857f);
+            // Must match GeluDerivative's scalar guard so the vectorised and scalar
+            // paths agree lane-for-lane, including at the threshold itself.
+            var vOverflowGuard = new Vector<float>(GeluDerivative.OverflowGuard);
 
             int i = 0;
 
@@ -760,7 +767,28 @@ namespace SimpleTransformer.Model.Extensions.Numerics
 
                 Vector<float> term1 = vHalf * (vOne + t);
                 Vector<float> term2 = vHalf * value * (vOne - (t * t)) * vSqrt2OverPi * (vOne + vConst3C * x2);
-                Vector<float> dx = dy * (term1 + term2);
+
+                // Overflow guard, mirroring GeluDerivative.Evaluate: beyond the
+                // threshold 1+3c*x^2 is +Inf while 1-t*t is exactly 0, so term2
+                // evaluates to 0*Inf = NaN. GELU' saturates to 1 (x>0) / 0 (x<=0)
+                // there, which is what the guard substitutes lane-wise.
+                // |value| > guard as a disjunction of two float comparisons, since the obvious
+                // Vector.Abs / BitwiseOr route widens to Vector<int>/<double> here.
+                Vector<float> negValue = vZero - value;
+                Vector<float> tooBig = Vector.ConditionalSelect(
+                    Vector.GreaterThan(value, vOverflowGuard),
+                    Vector<float>.One,
+                    Vector.ConditionalSelect(
+                        Vector.GreaterThan(negValue, vOverflowGuard),
+                        Vector<float>.One,
+                        Vector<float>.Zero));
+                // GELU' saturates to 1 for large +x and 0 for large -x.
+                Vector<float> saturated = Vector.ConditionalSelect(
+                    Vector.GreaterThan(value, Vector<float>.Zero), vOne, vZero);
+                Vector<float> dx = Vector.ConditionalSelect(
+                    tooBig,
+                    dy * saturated,
+                    dy * (term1 + term2));
 
                 Vector.StoreUnsafe(dx, ref pDx, (uint)i);
             }
@@ -768,16 +796,9 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             // 3. Scalar Cleanup Loop for tail elements
             for (; i < len; i++)
             {
-                float val = Unsafe.Add(ref pX, i);
-                float dy = Unsafe.Add(ref pDy, i);
-
-                float x2 = val * val;
-                float x3 = x2 * val;
-                float u = Sqrt2OverPi * (val + GeluC * x3);
-                float t = MathF.Tanh(u);
-
-                float deriv = 0.5f * (1f + t) + 0.5f * val * (1f - t * t) * Sqrt2OverPi * (1f + Gelu3C * x2);
-                Unsafe.Add(ref pDx, i) = dy * deriv;
+                // Shared overflow-safe helper: same saturated limits, same result.
+                float deriv = GeluDerivative.Evaluate(Unsafe.Add(ref pX, i));
+                Unsafe.Add(ref pDx, i) = Unsafe.Add(ref pDy, i) * deriv;
             }
         }
         /// <summary>

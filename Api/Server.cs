@@ -64,6 +64,7 @@ namespace SimpleTransformer.Api
                 //before the first TrainStep samples them.
                 ApplyMemoryPressureSettings(_configManager);
                 ApplyAttentionSettings(_configManager);
+                ApplyGradientProbeSettings(_configManager);
 
                 SQLitePCL.Batteries.Init();
 
@@ -298,6 +299,28 @@ namespace SimpleTransformer.Api
                 MaskSettings.UseCausalMask
                     ? "causal (enabled)"
                     : "none - LEGACY, model can attend to future tokens");
+        }
+
+        /// <summary>
+        /// Arms the backward-pass NaN tripwire. Off by default: it finite-scans the
+        /// gradient after every stage of every step, which is a debugging cost, not
+        /// a training cost.
+        /// </summary>
+        public static void ApplyGradientProbeSettings(ConfigManager configManager)
+        {
+            GradientProbeSettings.Enabled =
+                configManager.GetAs<bool>("gradient_probe", false, "TransformerConfig");
+            GradientProbeSettings.ThrowOnFirstNonFinite =
+                configManager.GetAs<bool>("gradient_probe_throw", false, "TransformerConfig");
+
+            if (GradientProbeSettings.Enabled)
+            {
+                Log.Information(
+                    "Gradient probe: ARMED - checking the gradient tensor after every " +
+                    "backward stage to name the first non-finite one. " +
+                    "Throw on first: {Throw}. Per-stage cost applies to every step.",
+                    GradientProbeSettings.ThrowOnFirstNonFinite ? "on (aborts step)" : "off (logs only)");
+            }
         }
 
         public class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>
