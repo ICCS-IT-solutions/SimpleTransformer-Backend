@@ -110,5 +110,7 @@ namespace SimpleTransformer.AccelerationEngine.CpuAvx512
         {
             throw new NotImplementedException();
         }
+
+        public void ClampInPlace(TensorBase tensor, float min, float max) => throw new NotImplementedException();
     }
 }

@@ -818,6 +818,12 @@ namespace SimpleTransformer.Model.Extensions.Numerics
             // If TensorBase already provides a Span property
             return tensor.Span;
         }        
-        #endregion 
+        #endregion
+
+        public static void ClampInPlace(TensorBase tensor, float min, float max)
+        {
+            var fallback = new SimpleTransformer.AccelerationEngine.CpuReference.CpuReferenceBackend();
+            fallback.ClampInPlace(tensor, min, max);
+        }
     }
 }

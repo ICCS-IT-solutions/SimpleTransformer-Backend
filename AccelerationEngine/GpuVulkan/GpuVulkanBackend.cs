@@ -1358,6 +1358,21 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             return flat;
         }
 
+        public void ClampInPlace(TensorBase tensor, float min, float max)
+        {
+            if (_launcher == null) { _fallback.ClampInPlace(tensor, min, max); return; }
+            using var op = new GpuOpScope(_launcher);
+            int count = RowCount(tensor) * tensor.Cols;
+            var b = RentBuffer(count);
+            try
+            {
+                PackBuffer(tensor, b, count);
+                _launcher.DispatchClamp(b, (uint)count, min, max);
+                UnpackBuffer(b, tensor, count);
+            }
+            finally { ReturnBuffer(b); }
+        }
+
         public void Synchronize()
         {
             //Recorded-but-unsent work has to go out first, otherwise there is

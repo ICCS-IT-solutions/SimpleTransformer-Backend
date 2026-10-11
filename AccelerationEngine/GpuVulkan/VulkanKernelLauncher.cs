@@ -25,7 +25,8 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         SoftmaxBackward,
         ApplyMask,
         Transpose,
-        Copy
+        Copy,
+        Clamp
     }
 
     internal struct PushConstants
@@ -52,6 +53,13 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public uint TransposeB;
         public uint Accumulate;
         public uint Pad;
+    }
+
+    internal struct ClampPushConstants
+    {
+        public uint N;
+        public float Min;
+        public float Max;
     }
 
     /// <summary>
@@ -266,6 +274,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             Register(VulkanKernel.ApplyMask, compiler, VulkanShaders.ApplyMask, 2, 16);
             Register(VulkanKernel.Transpose, compiler, VulkanShaders.Transpose, 2, 16);
             Register(VulkanKernel.Copy, compiler, VulkanShaders.Copy, 2, 16);
+            Register(VulkanKernel.Clamp, compiler, VulkanShaders.Clamp, 1, 16);
 
             // Sized for a batch, not for one op: a coalesced batch can carry one
             // distinct binding tuple per dispatch (every Parallel.For worker in a
@@ -592,6 +601,16 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             RunOp(() => RecordTranspose(buffers, rows, cols));
         }
 
+        public void DispatchClamp(
+            VulkanBuffer tensor,
+            uint n,
+            float min,
+            float max)
+        {
+            var buffers = new[] { tensor };
+            RunOp(() => RecordClamp(buffers, n, min, max));
+        }
+
         /// <summary>
         /// Copies bytes from a host-visible staging buffer into a device-resident
         /// one (VRAM) and makes the write visible to the compute stage. Used once
@@ -752,6 +771,31 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
             vk.CmdDispatch(
                 cmd, Groups(cols, TransposeTileSize), Groups(rows, TransposeTileSize), 1);
+            FinishDispatch(buffers);
+        }
+
+        private void RecordClamp(VulkanBuffer[] buffers, uint n, float min, float max)
+        {
+            var vk = _ctx.Vk;
+            var cmd = _cmds[_activeSlot];
+            var layout = _layouts[VulkanKernel.Clamp];
+            DescriptorSet set = AllocateAndBind(buffers, _setLayouts[VulkanKernel.Clamp]);
+
+            RecordTransfersIn(buffers);
+            SyncWithPrevious(RecordKind.Dispatch);
+
+            vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _pipelines[VulkanKernel.Clamp]);
+            vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, layout, 0, 1, in set, 0, null);
+
+            var push = new ClampPushConstants
+            {
+                N = n, Min = min, Max = max
+            };
+            vk.CmdPushConstants(
+                cmd, layout, ShaderStageFlags.ComputeBit, 0,
+                (uint)sizeof(ClampPushConstants), &push);
+
+            vk.CmdDispatch(cmd, Groups(n, ScalarWorkgroupSize), 1, 1);
             FinishDispatch(buffers);
         }
 

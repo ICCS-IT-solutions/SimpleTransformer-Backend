@@ -146,6 +146,11 @@ namespace SimpleTransformer.AccelerationEngine
             float value);
 
         /// <summary>
+        /// Clamps all values in <paramref name="tensor"/> to the range [<paramref name="min"/>, <paramref name="max"/>].
+        /// </summary>
+        void ClampInPlace(TensorBase tensor, float min, float max);
+
+        /// <summary>
         /// Optional hint: <paramref name="tensor"/> is immutable for the model's
         /// lifetime (e.g. frozen QLoRA base weights) and may therefore be kept in
         /// device memory and reused by later ops instead of being uploaded per

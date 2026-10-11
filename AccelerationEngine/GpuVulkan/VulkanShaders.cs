@@ -329,5 +329,24 @@ void main() {
     if (i >= p.n) return;
     d[i] = s[i];
 }";
+
+        public const string Clamp = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InBuf { float x[]; };
+layout(push_constant) uniform Push { uint n; float min; float max; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x * 4u;
+    if (idx >= p.n) return;
+    uint remaining = min(4u, p.n - idx);
+    vec4 v = vec4(x[idx], 
+                   remaining > 1 ? x[idx + 1] : 0.0,
+                   remaining > 2 ? x[idx + 2] : 0.0,
+                   remaining > 3 ? x[idx + 3] : 0.0);
+    v = clamp(v, vec4(p.min), vec4(p.max));
+    x[idx] = v.x;
+    if (remaining > 1) x[idx + 1] = v.y;
+    if (remaining > 2) x[idx + 2] = v.z;
+    if (remaining > 3) x[idx + 3] = v.w;
+}";
     }
 }

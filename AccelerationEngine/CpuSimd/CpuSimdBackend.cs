@@ -220,6 +220,12 @@ namespace SimpleTransformer.AccelerationEngine.CpuSimd
         #region Lifecycle
 
         /// <summary>
+        /// Clamps all values in <paramref name="tensor"/> to the range [<paramref name="min"/>, <paramref name="max"/>].
+        /// </summary>
+        public void ClampInPlace(TensorBase tensor, float min, float max)
+            => TensorMathSimd.ClampInPlace(tensor, min, max);
+
+        /// <summary>
         /// The SIMD backend is stateless - nothing to release.
         /// </summary>
         public void Dispose()

@@ -588,6 +588,24 @@ namespace SimpleTransformer.AccelerationEngine.CpuReference
 
         #endregion
 
+        /// <summary>
+        /// Clamps all values in <paramref name="tensor"/> to the range [<paramref name="min"/>, <paramref name="max"/>].
+        /// </summary>
+        public void ClampInPlace(TensorBase tensor, float min, float max)
+        {
+            int rows = GetRowCount(tensor);
+            for (int r = 0; r < rows; r++)
+            {
+                Span<float> row = GetRow(tensor, r);
+                for (int i = 0; i < row.Length; i++)
+                {
+                    float v = row[i];
+                    if (v < min) row[i] = min;
+                    else if (v > max) row[i] = max;
+                }
+            }
+        }
+
         #region Lifecycle
 
         /// <summary>

@@ -1,0 +1,3 @@
+$content = Get-Content 'Model\Extensions\Numerics\TensorMathSimd.cs' -Raw
+$content = $content -replace '        #endregion\r\n    }\r\n}', '        public static void ClampInPlace(TensorBase tensor, float min, float max)\r\n            {\r\n                var fallback = new SimpleTransformer.AccelerationEngine.CpuReference.CpuReferenceBackend();\r\n                fallback.ClampInPlace(tensor, min, max);\r\n            }\r\n        #endregion\r\n    }\r\n}'
+Set-Content 'Model\Extensions\Numerics\TensorMathSimd.cs' -Value $content
