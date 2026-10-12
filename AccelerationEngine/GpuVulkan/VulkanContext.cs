@@ -27,11 +27,16 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         private bool _disposed;
         private bool _supportsProperties2;
         private bool _memoryBudgetEnabled;
+        private bool _shaderFP16Enabled;
+        private bool _shaderBF16Enabled;
 
         //VK_API_VERSION_1_1 = (major << 22) | (minor << 12)
         private const uint ApiVersion11 = (1u << 22) | (1u << 12);
 
         private const string MemoryBudgetExtensionName = "VK_EXT_memory_budget";
+        
+        private const string ShaderFP16ExtensionName = "VK_KHR_shader_fp16";
+        private const string ShaderBF16ExtensionName = "VK_KHR_shader_bfloat16";
 
         /// <summary>
         /// Largest DEVICE_LOCAL heap of the chosen device - the card's VRAM
@@ -268,33 +273,71 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             //VK_EXT_memory_budget exposes the driver's live per-heap budget/usage
             //(what is actually free right now) instead of only the fixed heap size.
             //It is a device extension, so it must be requested here.
+            //Also request shader FP16 and BF16 extensions for mixed precision support.
             bool budgetRequested = false;
+            bool fp16Requested = false;
+            bool bf16Requested = false;
             Result result;
 
+            // Build extension list
+            var extensions = new List<string>();
+            
             if (_supportsProperties2 && DeviceSupportsExtension(MemoryBudgetExtensionName))
             {
-                using var extName = SilkMarshal.StringToMemory(MemoryBudgetExtensionName);
-                byte** extList = stackalloc byte*[1];
-                extList[0] = (byte*)extName.AsPtr<byte>();
-
-                createInfo.EnabledExtensionCount = 1;
-                createInfo.PpEnabledExtensionNames = extList;
+                extensions.Add(MemoryBudgetExtensionName);
                 budgetRequested = true;
+            }
+            
+            if (DeviceSupportsExtension(ShaderFP16ExtensionName))
+            {
+                extensions.Add(ShaderFP16ExtensionName);
+                fp16Requested = true;
+            }
+            
+            if (DeviceSupportsExtension(ShaderBF16ExtensionName))
+            {
+                extensions.Add(ShaderBF16ExtensionName);
+                bf16Requested = true;
+            }
+
+            if (extensions.Count > 0)
+            {
+                // Use stackalloc for the array of pointers (max 3 extensions)
+                byte** extList = stackalloc byte*[extensions.Count];
+                
+                // Create StringToMemory objects and keep them alive in local variables
+                // The 'using' pattern doesn't work with arrays, so we store the objects
+                // and let them be disposed at the end of the method scope
+                var extObjs = new object[extensions.Count];
+                for (int i = 0; i < extensions.Count; i++)
+                {
+                    var mem = SilkMarshal.StringToMemory(extensions[i]);
+                    extObjs[i] = mem;
+                    extList[i] = (byte*)mem.AsPtr<byte>();
+                }
+
+                createInfo.EnabledExtensionCount = (uint)extensions.Count;
+                createInfo.PpEnabledExtensionNames = extList;
 
                 result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
+
+                // The extObjs array keeps the StringToMemory objects alive until here
+                // They will be disposed when the method exits
             }
             else
             {
                 result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
             }
 
-            if (result != Result.Success && budgetRequested)
+            if (result != Result.Success && (budgetRequested || fp16Requested || bf16Requested))
             {
                 //The driver listed the extension but refused the device with it
                 //enabled; retry without it rather than losing the GPU entirely.
                 createInfo.EnabledExtensionCount = 0;
                 createInfo.PpEnabledExtensionNames = null;
                 budgetRequested = false;
+                fp16Requested = false;
+                bf16Requested = false;
                 result = Vk.CreateDevice(PhysicalDevice, in createInfo, null, out Device);
             }
 
@@ -302,6 +345,8 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 throw new InvalidOperationException($"vkCreateDevice failed: {result}");
 
             _memoryBudgetEnabled = budgetRequested;
+            _shaderFP16Enabled = fp16Requested;
+            _shaderBF16Enabled = bf16Requested;
 
             Vk.CurrentDevice = Device;
             Vk.GetDeviceQueue(Device, QueueFamilyIndex, 0, out Queue);

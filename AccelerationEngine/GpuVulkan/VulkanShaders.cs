@@ -1,7 +1,11 @@
+using System;
+
 namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 {
     public static class VulkanShaders
     {
+        // ===================== FP32 Shaders (Original) =====================
+
         public const string Scale = @"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer InBuf { float x[]; };
@@ -347,6 +351,165 @@ void main() {
     if (remaining > 1) x[idx + 1] = v.y;
     if (remaining > 2) x[idx + 2] = v.z;
     if (remaining > 3) x[idx + 3] = v.w;
+}";
+
+
+        // ===================== FP16 Shaders =====================
+        // Note: VK_KHR_shader_fp16 must be enabled when creating the Vulkan device
+        
+        public const string ScaleFP16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InBuf { uint x[]; };
+layout(push_constant) uniform Push { uint n; float alpha; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float val = unpackHalf2x16(x[i]).x;
+    val = val * p.alpha;
+    x[i] = packHalf2x16(vec2(val, 0.0));
+}";
+
+        public const string FillFP16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InBuf { uint x[]; };
+layout(push_constant) uniform Push { uint n; float value; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    x[i] = packHalf2x16(vec2(p.value, 0.0));
+}";
+
+        public const string AddInPlaceFP16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackHalf2x16(a[i]).x;
+    float bv = unpackHalf2x16(b[i]).x;
+    a[i] = packHalf2x16(vec2(av + bv, 0.0));
+}";
+
+        public const string AddIntoFP16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(set = 0, binding = 2) buffer RBuf { uint r[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackHalf2x16(a[i]).x;
+    float bv = unpackHalf2x16(b[i]).x;
+    r[i] = packHalf2x16(vec2(av + bv, 0.0));
+}";
+
+        public const string MulInPlaceFP16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackHalf2x16(a[i]).x;
+    float bv = unpackHalf2x16(b[i]).x;
+    a[i] = packHalf2x16(vec2(av * bv, 0.0));
+}";
+
+        public const string MulIntoFP16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(set = 0, binding = 2) buffer RBuf { uint r[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackHalf2x16(a[i]).x;
+    float bv = unpackHalf2x16(b[i]).x;
+    r[i] = packHalf2x16(vec2(av * bv, 0.0));
+}";
+
+        // ===================== BF16 Shaders =====================
+        // Note: VK_KHR_shader_bfloat16 must be enabled when creating the Vulkan device
+        
+        public const string ScaleBF16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InBuf { uint x[]; };
+layout(push_constant) uniform Push { uint n; float alpha; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float val = unpackBFloat16(x[i]);
+    val = val * p.alpha;
+    x[i] = packBFloat16(val);
+}";
+
+        public const string FillBF16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InBuf { uint x[]; };
+layout(push_constant) uniform Push { uint n; float value; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    x[i] = packBFloat16(p.value);
+}";
+
+        public const string AddInPlaceBF16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackBFloat16(a[i]);
+    float bv = unpackBFloat16(b[i]);
+    a[i] = packBFloat16(av + bv);
+}";
+
+        public const string AddIntoBF16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(set = 0, binding = 2) buffer RBuf { uint r[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackBFloat16(a[i]);
+    float bv = unpackBFloat16(b[i]);
+    r[i] = packBFloat16(av + bv);
+}";
+
+        public const string MulInPlaceBF16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackBFloat16(a[i]);
+    float bv = unpackBFloat16(b[i]);
+    a[i] = packBFloat16(av * bv);
+}";
+
+        public const string MulIntoBF16 = @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer ABuf { uint a[]; };
+layout(set = 0, binding = 1) buffer BBuf { uint b[]; };
+layout(set = 0, binding = 2) buffer RBuf { uint r[]; };
+layout(push_constant) uniform Push { uint n; float _pad; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float av = unpackBFloat16(a[i]);
+    float bv = unpackBFloat16(b[i]);
+    r[i] = packBFloat16(av * bv);
 }";
     }
 }
