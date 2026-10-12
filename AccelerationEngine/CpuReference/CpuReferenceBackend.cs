@@ -626,6 +626,13 @@ namespace SimpleTransformer.AccelerationEngine.CpuReference
         {
         }
 
+        // Loss scaling - CPU reference backend doesn't need loss scaling
+        public bool RequiresLossScaling => false;
+
+        public float GetLossScale() => 1.0f;
+
+        public bool UpdateLossScale(bool hasOverflow) => false;
+
         #endregion
     }
 }

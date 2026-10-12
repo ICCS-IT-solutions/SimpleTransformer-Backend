@@ -1140,6 +1140,11 @@ namespace SimpleTransformer.Model
             TensorBase? auxOutput = null;
             TensorBase? gradient = null;
 
+            // Loss scaling for FP16 training
+            bool useLossScaling = _workspace.Backend.RequiresLossScaling;
+            float lossScale = useLossScaling ? _workspace.Backend.GetLossScale() : 1.0f;
+            bool hasOverflow = false;
+
             // Per-step profiler: one bool check when disabled (default), one
             // log line per step when enabled via --train-profile.
             bool profiling = TrainingStepProfile.Enabled;
@@ -1161,6 +1166,11 @@ namespace SimpleTransformer.Model
                 if (accumSteps > 1)
                 {
                     loss = loss / accumSteps;
+                }
+                // Apply loss scaling for FP16
+                if (useLossScaling)
+                {
+                    loss = loss * lossScale;
                 }
                 // A non-finite loss means activations already diverged (logits
                 // overflowed to Inf/NaN upstream). Failing here preserves the
@@ -1204,6 +1214,54 @@ namespace SimpleTransformer.Model
                     return float.NaN;
                 }
                 if (profiling) stepProfile.MarkModelBackward(Stopwatch.GetTimestamp() - tPhase);
+
+                // Loss scaling: check for gradient overflow (Inf/NaN) after backward
+                if (useLossScaling)
+                {
+                    hasOverflow = false;
+                    foreach (var p in Parameters)
+                    {
+                        if (p.Gradient != null)
+                        {
+                            DiagonisticUtilities.AssertNoNaN(p.Gradient, "Gradient contains NaN prior to loss scaling check.");
+                            // Check for Inf values
+                            var gradData = p.Gradient.Data.AsSpan();
+                            for (int i = 0; i < gradData.Length; i++)
+                            {
+                                if (!float.IsFinite(gradData[i]))
+                                {
+                                    hasOverflow = true;
+                                    break;
+                                }
+                            }
+                            if (hasOverflow) break;
+                        }
+                    }
+
+                    // Update loss scale based on overflow
+                    bool scaleChanged = _workspace.Backend.UpdateLossScale(hasOverflow);
+                    if (hasOverflow)
+                    {
+                        Log.Warning(
+                            "[TrainStep] Gradient overflow detected - loss scale reduced to {Scale}, skipping optimizer step.",
+                            _workspace.Backend.GetLossScale());
+                        ZeroGradients();
+                        return float.NaN;
+                    }
+
+                    // Unscale gradients before clipping
+                    if (lossScale != 1.0f)
+                    {
+                        float invScale = 1.0f / lossScale;
+                        foreach (var p in Parameters)
+                        {
+                            if (p.Gradient != null)
+                            {
+                                _workspace.Backend.ScaleInPlace(p.Gradient, invScale);
+                            }
+                        }
+                    }
+                }
 
                 // 4. Clip ALL parameter gradients globally + NaN validation.
                 // Honor the configured norm (default 1.0); the previous

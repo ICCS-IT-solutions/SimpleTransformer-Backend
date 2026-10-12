@@ -114,5 +114,13 @@ namespace SimpleTransformer.AccelerationEngine.CpuAvx512
         }
 
         public void ClampInPlace(TensorBase tensor, float min, float max) => throw new NotImplementedException();
+
+        // Loss scaling - CPU AVX512 backend doesn't need loss scaling
+        public bool RequiresLossScaling => false;
+
+        public float GetLossScale() => 1.0f;
+
+        public bool UpdateLossScale(bool hasOverflow) => false;
+
     }
 }

@@ -198,5 +198,22 @@ namespace SimpleTransformer.AccelerationEngine
 
         // Synchronization
         void Synchronize();
+
+        // Loss scaling for mixed precision (FP16)
+        /// <summary>
+        /// True when the backend requires loss scaling (e.g. FP16 training).
+        /// </summary>
+        bool RequiresLossScaling { get; }
+
+        /// <summary>
+        /// Gets the current loss scale factor for FP16 training.
+        /// </summary>
+        float GetLossScale();
+
+        /// <summary>
+        /// Updates the loss scale based on whether gradient overflow was detected.
+        /// Returns true if the scale was changed.
+        /// </summary>
+        bool UpdateLossScale(bool hasOverflow);
     }
 }

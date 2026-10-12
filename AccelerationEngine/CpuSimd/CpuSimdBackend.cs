@@ -243,6 +243,13 @@ namespace SimpleTransformer.AccelerationEngine.CpuSimd
         {
         }
 
+        // Loss scaling - CPU SIMD backend doesn't need loss scaling
+        public bool RequiresLossScaling => false;
+
+        public float GetLossScale() => 1.0f;
+
+        public bool UpdateLossScale(bool hasOverflow) => false;
+
         #endregion
     }
 }

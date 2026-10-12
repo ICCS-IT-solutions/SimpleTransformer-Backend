@@ -8,6 +8,58 @@ using SimpleTransformer.Model.Extensions.Numerics;
 namespace SimpleTransformer.Model
 {
     /// <summary>
+    /// State saved during checkpointed forward pass for recomputation during backward.
+    /// </summary>
+    internal sealed class CheckpointState : IDisposable
+    {
+        public TensorBase SavedInput { get; private set; }
+        public long SavedStep { get; private set; }
+        public bool IsValid => SavedInput != null;
+
+        public void Save(TensorBase input, long step, TensorWorkspace workspace)
+        {
+            // Make a copy of the input tensor for recomputation
+            SavedInput = workspace.BorrowLike(input);
+            workspace.Backend.CopyInto(input, SavedInput);
+            SavedStep = step;
+        }
+
+        public void Dispose()
+        {
+            SavedInput = null!;
+        }
+    }
+
+    /// <summary>
+    /// Holds all intermediate tensors from a recomputed forward pass for checkpointed backward.
+    /// </summary>
+    internal sealed class RecomputedForwardState : IDisposable
+    {
+        public TensorBase Attention { get; set; }
+        public TensorBase DroppedAttention { get; set; }
+        public TensorBase Residual1 { get; set; }
+        public TensorBase Norm1 { get; set; }
+        public TensorBase FeedForward { get; set; }
+        public TensorBase DroppedFeedForward { get; set; }
+        public TensorBase Residual2 { get; set; }
+        public TensorBase Output { get; set; }
+        public TensorBase Mask { get; set; }
+
+        public void Dispose()
+        {
+            Attention = null!;
+            DroppedAttention = null!;
+            Residual1 = null!;
+            Norm1 = null!;
+            FeedForward = null!;
+            DroppedFeedForward = null!;
+            Residual2 = null!;
+            Output = null!;
+            Mask = null!;
+        }
+    }
+
+    /// <summary>
     /// Activation checkpointing utility to reduce activation memory.
     /// When enabled, intermediate activations are not stored during forward pass.
     /// Instead, they are recomputed during backward pass using the stored inputs and RNG state.
@@ -152,6 +204,12 @@ namespace SimpleTransformer.Model
         /// </summary>
         public bool ShouldCheckpoint => ActivationCheckpointing.ShouldCheckpoint(CheckpointPolicy, LayerIndex, TotalLayers);
 
+        /// <summary>
+        /// State saved during checkpointed forward pass for recomputation during backward.
+        /// </summary>
+        private CheckpointState? _checkpointState;
+        private long _currentStep = -1;
+
         public void SetDropoutEnabled(bool enabled)
         {
             _dropoutAttention.SetEnabled(enabled);
@@ -172,6 +230,7 @@ namespace SimpleTransformer.Model
 
         public void PrepareDropoutForStep(long step)
         {
+            _currentStep = step;
             _dropoutAttention.PrepareForStep(step);
             _dropoutFeedForward.PrepareForStep(step);
 
@@ -208,6 +267,13 @@ namespace SimpleTransformer.Model
 
         private TensorBase ForwardSequence(TensorBase input, TensorWorkspace workspace, TensorBase? mask)
         {
+            // Save checkpoint state if checkpointing is enabled
+            if (ShouldCheckpoint)
+            {
+                _checkpointState = new CheckpointState();
+                _checkpointState.Save(input, _currentStep, workspace);
+            }
+
             // Sub-layer 1: Attention + Dropout + Residual 1 + Norm 1
             TensorBase attention = _multiHeadAttention.Forward(input, workspace, mask);
             TensorBase droppedAttention = _dropoutAttention.ForItem(0).Forward(attention, workspace);
@@ -242,8 +308,93 @@ namespace SimpleTransformer.Model
             return output;
         }
 
+        /// <summary>
+        /// Recomputes the forward pass for checkpointed backward, keeping all intermediate tensors alive.
+        /// </summary>
+        private RecomputedForwardState RecomputeForwardSequence(TensorBase input, TensorWorkspace workspace, TensorBase? mask)
+        {
+            var state = new RecomputedForwardState { Mask = mask };
+
+            // Sub-layer 1: Attention + Dropout + Residual 1 + Norm 1
+            state.Attention = _multiHeadAttention.Forward(input, workspace, mask);
+            state.DroppedAttention = _dropoutAttention.ForItem(0).Forward(state.Attention, workspace);
+            // Keep attention alive for backward
+
+            state.Residual1 = workspace.BorrowLike(input);
+            workspace.Backend.ElementWiseAddInto(state.DroppedAttention, input, state.Residual1);
+
+            state.Norm1 = _layerNorm1.Forward(state.Residual1, workspace);
+
+            // Sub-layer 2: FeedForward + Dropout + Residual 2 + Norm 2
+            state.FeedForward = _feedForward.Forward(state.Norm1, workspace);
+            state.DroppedFeedForward = _dropoutFeedForward.ForItem(0).Forward(state.FeedForward, workspace);
+            // Keep feed forward alive for backward
+
+            state.Residual2 = workspace.BorrowLike(state.Norm1);
+            workspace.Backend.ElementWiseAddInto(state.DroppedFeedForward, state.Norm1, state.Residual2);
+
+            state.Output = _layerNorm2.Forward(state.Residual2, workspace);
+
+            return state;
+        }
+
+        /// <summary>
+        /// Recomputes the forward pass for checkpointed backward, keeping all intermediate tensors alive.
+        /// </summary>
+        private RecomputedForwardState RecomputeForwardBatch(TensorBase input, TensorWorkspace workspace, TensorBase? mask)
+        {
+            var state = new RecomputedForwardState { Mask = mask };
+
+            // 1. Attention Pass
+            state.Attention = _multiHeadAttention.Forward(input, workspace, mask);
+            if (TrainingStepProfile.Enabled)
+                DiagonisticUtilities.AssertNoNaN(state.Attention, "Attention Pre-Residual");
+
+            // 1b. Attention-path dropout
+            state.DroppedAttention = ApplyResidualDropout(_dropoutAttention, state.Attention, workspace);
+            // Keep attention alive for backward
+
+            // 2. Residual Addition 1
+            state.Residual1 = workspace.BorrowLike(state.DroppedAttention);
+            TensorMathSimd.ElementWiseAddInto(state.DroppedAttention, input, state.Residual1);
+            if (TrainingStepProfile.Enabled)
+                DiagonisticUtilities.AssertNoNaN(state.Residual1, "Attention Post-Residual");
+
+            // 3. LayerNorm 1
+            state.Norm1 = _layerNorm1.Forward(state.Residual1, workspace);
+            if (TrainingStepProfile.Enabled)
+                DiagonisticUtilities.AssertNoNaN(state.Norm1, "Norm1");
+
+            // 4. FeedForward Pass
+            state.FeedForward = _feedForward.Forward(state.Norm1, workspace);
+            if (TrainingStepProfile.Enabled)
+                DiagonisticUtilities.AssertNoNaN(state.FeedForward, "FeedForward Pre-Residual");
+
+            // 4b. FFN-path dropout
+            state.DroppedFeedForward = ApplyResidualDropout(_dropoutFeedForward, state.FeedForward, workspace);
+            // Keep feed forward alive for backward
+
+            // 5. Residual Addition 2
+            state.Residual2 = workspace.BorrowLike(state.DroppedFeedForward);
+            TensorMathSimd.ElementWiseAddInto(state.DroppedFeedForward, state.Norm1, state.Residual2);
+            if (TrainingStepProfile.Enabled)
+                DiagonisticUtilities.AssertNoNaN(state.Residual2, "FeedForward Post-Residual");
+
+            // 6. LayerNorm 2
+            state.Output = _layerNorm2.Forward(state.Residual2, workspace);
+
+            return state;
+        }
+
         private TensorBase ForwardBatch(TensorBase input, TensorWorkspace workspace, TensorBase? mask)
         {
+            // Save checkpoint state if checkpointing is enabled
+            if (ShouldCheckpoint)
+            {
+                _checkpointState = new CheckpointState();
+                _checkpointState.Save(input, _currentStep, workspace);
+            }
+
             bool verbose = TrainingStepProfile.Enabled;
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(input, "Block Input");
@@ -389,12 +540,31 @@ namespace SimpleTransformer.Model
             if (TrainingStepProfile.Enabled)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Block Gradient");
 
+            // Check if we need to recompute forward from checkpoint
+            RecomputedForwardState? recomputedState = null;
+            if (ShouldCheckpoint && _checkpointState?.IsValid == true)
+            {
+                // Recompute forward from saved input to get intermediate tensors
+                recomputedState = RecomputeForwardSequence(_checkpointState.SavedInput, workspace, null);
+                // Clear checkpoint state after use
+                _checkpointState.Dispose();
+                _checkpointState = null;
+            }
+
             // 1. Backprop LayerNorm2
             TensorBase dResidual2 = _layerNorm2.Backward(gradient, workspace);
             probe?.Check("layerNorm2 (_layerNorm2.Backward)", dResidual2);
 
             // 2. Backprop FFN-path dropout, then FeedForward
-            TensorBase dDroppedFf = _dropoutFeedForward.ForItem(0).Backward(dResidual2, workspace);
+            TensorBase dDroppedFf;
+            if (recomputedState != null)
+            {
+                dDroppedFf = _dropoutFeedForward.ForItem(0).Backward(dResidual2, workspace);
+            }
+            else
+            {
+                dDroppedFf = _dropoutFeedForward.ForItem(0).Backward(dResidual2, workspace);
+            }
             probe?.Check("FFN-path dropout", dDroppedFf);
             TensorBase dFf = _feedForward.Backward(dDroppedFf, workspace);
             probe?.Check("feed-forward (_feedForward.Backward)", dFf);
@@ -426,6 +596,9 @@ namespace SimpleTransformer.Model
             workspace.Release(dAttention);
             workspace.Release(dResidual1);
 
+            // Dispose recomputed state if used
+            recomputedState?.Dispose();
+
             return dInput;
         }
 
@@ -434,6 +607,17 @@ namespace SimpleTransformer.Model
             bool verbose = TrainingStepProfile.Enabled;
             if (verbose)
                 DiagonisticUtilities.AssertNoNaN(gradient, "Block Input Gradient");
+
+            // Check if we need to recompute forward from checkpoint
+            RecomputedForwardState? recomputedState = null;
+            if (ShouldCheckpoint && _checkpointState?.IsValid == true)
+            {
+                // Recompute forward from saved input to get intermediate tensors
+                recomputedState = RecomputeForwardBatch(_checkpointState.SavedInput, workspace, null);
+                // Clear checkpoint state after use
+                _checkpointState.Dispose();
+                _checkpointState = null;
+            }
 
             // 1. Backprop LayerNorm2
             TensorBase dFfResidual = _layerNorm2.Backward(gradient, workspace);
@@ -471,6 +655,9 @@ namespace SimpleTransformer.Model
             probe?.Check("residual-1 split (ElementWiseAddInto)", dInput);
             workspace.Release(dAttention);
             workspace.Release(dAttnResidual);
+
+            // Dispose recomputed state if used
+            recomputedState?.Dispose();
 
             return dInput;
         }
