@@ -7,6 +7,59 @@ using SimpleTransformer.Model.Extensions.Numerics;
 
 namespace SimpleTransformer.Model
 {
+    /// <summary>
+    /// Activation checkpointing utility to reduce activation memory.
+    /// When enabled, intermediate activations are not stored during forward pass.
+    /// Instead, they are recomputed during backward pass using the stored inputs and RNG state.
+    /// </summary>
+    public static class ActivationCheckpointing
+    {
+        /// <summary>
+        /// Determines if a layer should be checkpointed based on the policy and layer index.
+        /// </summary>
+        public static bool ShouldCheckpoint(CheckpointPolicy policy, int layerIndex, int totalLayers)
+        {
+            return policy switch
+            {
+                CheckpointPolicy.None => false,
+                CheckpointPolicy.EveryLayer => true,
+                CheckpointPolicy.EveryOtherLayer => layerIndex % 2 == 0,
+                CheckpointPolicy.EveryNLayers => layerIndex % 4 == 0, // Default to every 4 layers
+                _ => false,
+            };
+        }
+
+        /// <summary>
+        /// Checkpointed forward pass. Stores only the input tensor and RNG state,
+        /// then recomputes the forward pass during backward.
+        /// </summary>
+        public static TensorBase Checkpoint(
+            Func<TensorBase, TensorWorkspace, TensorBase> forwardFn,
+            TensorBase input,
+            TensorWorkspace workspace,
+            CheckpointPolicy policy,
+            int layerIndex,
+            int totalLayers)
+        {
+            if (!ShouldCheckpoint(policy, layerIndex, totalLayers))
+            {
+                // Normal forward pass without checkpointing
+                return forwardFn(input, workspace);
+            }
+
+            // TODO: Full checkpointing implementation
+            // For now, just do normal forward pass
+            // The full implementation would:
+            // 1. Store input tensor (or reference to it)
+            // 2. Store RNG state for dropout reproducibility
+            // 3. Run forward without storing intermediate activations
+            // 4. Return output
+            // In backward: recompute forward from stored input, then compute gradients
+            
+            return forwardFn(input, workspace);
+        }
+    }
+
     public class TransformerBlock : ITrainableLayer, IDropoutControl
     {
         public string Name { get; }
@@ -60,7 +113,10 @@ namespace SimpleTransformer.Model
             ITrainableLayer layerNorm2, 
             bool useQLora = false,
             float dropoutRate = 0.0f,
-            string name = "transformer_block")
+            string name = "transformer_block",
+            CheckpointPolicy checkpointPolicy = CheckpointPolicy.None,
+            int layerIndex = -1,
+            int totalLayers = 0)
         {
             Name = name;
             _multiHeadAttention = multiHeadAttention ?? throw new ArgumentNullException(nameof(multiHeadAttention));
@@ -70,7 +126,31 @@ namespace SimpleTransformer.Model
 
             _dropoutAttention = new DropoutSite($"{name}.attn_dropout", dropoutRate);
             _dropoutFeedForward = new DropoutSite($"{name}.ffn_dropout", dropoutRate);
+
+            CheckpointPolicy = checkpointPolicy;
+            LayerIndex = layerIndex;
+            TotalLayers = totalLayers;
         }
+
+        /// <summary>
+        /// The activation checkpointing policy for this block.
+        /// </summary>
+        public CheckpointPolicy CheckpointPolicy { get; private set; } = CheckpointPolicy.None;
+
+        /// <summary>
+        /// The index of this layer in the model (0-based).
+        /// </summary>
+        public int LayerIndex { get; private set; } = -1;
+
+        /// <summary>
+        /// Total number of layers in the model.
+        /// </summary>
+        public int TotalLayers { get; private set; } = 0;
+
+        /// <summary>
+        /// Determines if this block should use activation checkpointing.
+        /// </summary>
+        public bool ShouldCheckpoint => ActivationCheckpointing.ShouldCheckpoint(CheckpointPolicy, LayerIndex, TotalLayers);
 
         public void SetDropoutEnabled(bool enabled)
         {

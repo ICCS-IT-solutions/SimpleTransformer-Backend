@@ -311,8 +311,6 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         private bool DeviceSupportsExtension(string extensionName)
         {
             uint count = 0;
-            //Explicit byte* casts: Silk also offers string-marshalling overloads
-            //and a bare null would be ambiguous between the two.
             if (Vk.EnumerateDeviceExtensionProperties(PhysicalDevice, (byte*)null, &count, (ExtensionProperties*)null) != Result.Success ||
                 count == 0)
                 return false;
@@ -325,9 +323,6 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 
                 for (uint i = 0; i < count; i++)
                 {
-                    //ExtensionName is the first field of ExtensionProperties
-                    //(char[VK_MAX_EXTENSION_NAME_SIZE] in vk.xml), so the struct's
-                    //address is the string's address.
                     var name = SilkMarshal.PtrToString((nint)(&ptr[i]), NativeStringEncoding.UTF8);
                     if (name == extensionName)
                         return true;
@@ -335,6 +330,34 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Returns all supported device extension names.
+        /// </summary>
+        public HashSet<string> GetDeviceExtensions()
+        {
+            var extensions = new HashSet<string>();
+            uint count = 0;
+            if (Vk.EnumerateDeviceExtensionProperties(PhysicalDevice, (byte*)null, &count, (ExtensionProperties*)null) != Result.Success ||
+                count == 0)
+                return extensions;
+
+            var props = new ExtensionProperties[count];
+            fixed (ExtensionProperties* ptr = props)
+            {
+                if (Vk.EnumerateDeviceExtensionProperties(PhysicalDevice, (byte*)null, &count, ptr) != Result.Success)
+                    return extensions;
+
+                for (uint i = 0; i < count; i++)
+                {
+                    var name = SilkMarshal.PtrToString((nint)(&ptr[i]), NativeStringEncoding.UTF8);
+                    if (!string.IsNullOrEmpty(name))
+                        extensions.Add(name);
+                }
+            }
+
+            return extensions;
         }
 
         /// <summary>

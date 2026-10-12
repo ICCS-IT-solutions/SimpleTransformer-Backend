@@ -18,6 +18,10 @@ namespace SimpleTransformer.AccelerationEngine.CpuSimd
         public bool IsGpuAccelerated => false;
         public bool IsAvailable => true;
 
+        public PrecisionMode Precision { get; set; } = PrecisionMode.FP32;
+
+        public CheckpointPolicy CheckpointPolicy { get; set; } = CheckpointPolicy.None;
+
         #region Element-wise operations
 
         public void ScaleInPlace(TensorBase tensor, float scalar)

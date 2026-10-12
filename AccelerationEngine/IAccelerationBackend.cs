@@ -30,6 +30,17 @@ namespace SimpleTransformer.AccelerationEngine
         bool IsAvailable { get; }
 
         /// <summary>
+        /// Current precision mode. Defaults to FP32. Backends that support mixed
+        /// precision can switch at runtime; others ignore the setting.
+        /// </summary>
+        PrecisionMode Precision { get; set; }
+
+        /// <summary>
+        /// Current checkpointing policy. Defaults to None.
+        /// </summary>
+        CheckpointPolicy CheckpointPolicy { get; set; }
+
+        /// <summary>
         /// Opens an explicit batch scope: every op issued through this backend
         /// until the scope is disposed should land in as few device submissions
         /// as possible, with the scope owner blocking for completion on dispose.

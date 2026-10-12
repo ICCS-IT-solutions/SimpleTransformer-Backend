@@ -28,6 +28,10 @@ namespace SimpleTransformer.AccelerationEngine.CpuReference
         public bool IsGpuAccelerated => false;
         public bool IsAvailable => true;
 
+        public PrecisionMode Precision { get; set; } = PrecisionMode.FP32;
+
+        public CheckpointPolicy CheckpointPolicy { get; set; } = CheckpointPolicy.None;
+
         #region Shared helpers
 
         /// <summary>

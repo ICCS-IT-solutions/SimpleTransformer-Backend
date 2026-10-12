@@ -5,11 +5,13 @@ namespace SimpleTransformer.AccelerationEngine.CpuAvx2
 {
     public class CpuAvx2Backend : IAccelerationBackend
     {
-        public string Name => throw new NotImplementedException();
-
-        public bool IsGpuAccelerated => throw new NotImplementedException();
-
+        public string Name => "CpuAvx2 (stub)";
+        public bool IsGpuAccelerated => false;
         public bool IsAvailable => false;
+
+        public PrecisionMode Precision { get; set; } = PrecisionMode.FP32;
+
+        public CheckpointPolicy CheckpointPolicy { get; set; } = CheckpointPolicy.None;
 
         public void ApplyMaskInPlace(TensorBase scores, TensorBase mask)
         {

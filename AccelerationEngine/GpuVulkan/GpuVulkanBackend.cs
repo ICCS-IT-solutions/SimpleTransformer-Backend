@@ -20,6 +20,12 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         private readonly VulkanKernelLauncher? _launcher;
         private readonly VulkanBufferPool? _pool;
 
+        // Mixed precision support
+        private bool _bf16Supported;
+        private bool _fp16Supported;
+        private float _lossScale = 1.0f; // For FP16 loss scaling
+        private const float DefaultLossScale = 65536.0f; // 2^16
+
         private bool _disposed;
 
         private static int _memoryInfoLogged;
@@ -486,11 +492,14 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 ResizableBarInfo = ctx.DescribeResizableBar();
                 _pool = new VulkanBufferPool(ctx, GpuMemoryBudgetBytes, HostStagingBudgetBytes);
 
+                // Detect BF16/FP16 support
+                DetectMixedPrecisionSupport();
+
                 //One line per process so repeated backend probes (the /backends
                 //endpoint constructs one) do not spam the log.
                 if (Interlocked.Exchange(ref _memoryInfoLogged, 1) == 0)
                     Console.WriteLine(
-                        $"[GpuVulkan] {ctx.DeviceName}: {GpuMemoryInfo} | {HostStagingInfo}");
+                        $"[GpuVulkan] {ctx.DeviceName}: {GpuMemoryInfo} | {HostStagingInfo} | BF16={_bf16Supported} FP16={_fp16Supported}");
             }
             catch (Exception ex)
             {
@@ -506,6 +515,10 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public bool IsGpuAccelerated => _launcher != null;
 
         public bool IsAvailable => _launcher != null;
+
+        public PrecisionMode Precision { get; set; } = PrecisionMode.FP32;
+
+        public CheckpointPolicy CheckpointPolicy { get; set; } = CheckpointPolicy.None;
 
         /// <summary>Number of pooled Vulkan buffers (perf introspection).</summary>
         public int PooledBufferCount => _pool?.LiveBufferCount ?? 0;
@@ -869,18 +882,41 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         }
 
 
-        private static void PackBuffer(TensorBase t, VulkanBuffer buf, int count)
+        private void PackBuffer(TensorBase t, VulkanBuffer buf, int count)
         {
+            int elementSize = GetElementSize();
+            int byteCount = count * elementSize;
+            
             if (VulkanPhaseProfile.Enabled)
             {
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                PackInto(t, buf.HostFloats(count));
-                buf.CommitUpload(count);
+                if (Precision == PrecisionMode.FP32)
+                {
+                    PackInto(t, buf.HostFloats(count));
+                }
+                else
+                {
+                    // For mixed precision, we need to pack to bytes
+                    float[] temp = new float[count];
+                    PackInto(t, temp);
+                    PackToPrecision(temp, buf.HostBytes(count, elementSize), count);
+                }
+                buf.CommitUploadBytes(byteCount);
                 VulkanPhaseProfile.RecordStageIn(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
                 return;
             }
-            PackInto(t, buf.HostFloats(count));
-            buf.CommitUpload(count);
+            
+            if (Precision == PrecisionMode.FP32)
+            {
+                PackInto(t, buf.HostFloats(count));
+            }
+            else
+            {
+                float[] temp = new float[count];
+                PackInto(t, temp);
+                PackToPrecision(temp, buf.HostBytes(count, elementSize), count);
+            }
+            buf.CommitUploadBytes(byteCount);
         }
 
         /// <summary>
@@ -894,16 +930,40 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         private void UnpackBuffer(VulkanBuffer buf, TensorBase t, int count)
         {
             _launcher?.EnsureRecordedWorkComplete();
+            int elementSize = GetElementSize();
+            int byteCount = count * elementSize;
+            
             if (VulkanPhaseProfile.Enabled)
             {
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                buf.CommitDownload(count);
-                Unpack(buf.ReadOnlyHostFloats(count), t);
+                if (Precision == PrecisionMode.FP32)
+                {
+                    buf.CommitDownload(count);
+                    Unpack(buf.ReadOnlyHostFloats(count), t);
+                }
+                else
+                {
+                    buf.CommitDownloadBytes(byteCount);
+                    float[] temp = new float[count];
+                    UnpackFromPrecision(buf.ReadOnlyHostBytes(count, elementSize), temp, count);
+                    Unpack(temp, t);
+                }
                 VulkanPhaseProfile.RecordStageOut(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
                 return;
             }
-            buf.CommitDownload(count);
-            Unpack(buf.ReadOnlyHostFloats(count), t);
+            
+            if (Precision == PrecisionMode.FP32)
+            {
+                buf.CommitDownload(count);
+                Unpack(buf.ReadOnlyHostFloats(count), t);
+            }
+            else
+            {
+                buf.CommitDownloadBytes(byteCount);
+                float[] temp = new float[count];
+                UnpackFromPrecision(buf.ReadOnlyHostBytes(count, elementSize), temp, count);
+                Unpack(temp, t);
+            }
         }
 
         private void RunUnary(VulkanKernel kernel, TensorBase tensor, float alpha)
@@ -1372,6 +1432,155 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             }
             finally { ReturnBuffer(b); }
         }
+
+        // Mixed precision support methods
+        private void DetectMixedPrecisionSupport()
+        {
+            if (_ctx == null) return;
+
+            try
+            {
+                var extensions = _ctx.GetDeviceExtensions();
+                _bf16Supported = extensions.Contains("VK_KHR_shader_bfloat16");
+                _fp16Supported = extensions.Contains("VK_KHR_shader_fp16") || 
+                                 extensions.Contains("VK_KHR_16bit_storage");
+                Console.WriteLine($"[GpuVulkan] Mixed precision: BF16={_bf16Supported}, FP16={_fp16Supported}");
+            }
+            catch
+            {
+                _bf16Supported = false;
+                _fp16Supported = false;
+                Console.WriteLine("[GpuVulkan] Mixed precision detection failed, defaulting to FP32");
+            }
+        }
+
+        private int GetElementSize()
+        {
+            return Precision switch
+            {
+                PrecisionMode.FP16 => 2,
+                PrecisionMode.BF16 => 2,
+                _ => 4,
+            };
+        }
+
+        private ulong GetByteCount(int floatCount)
+        {
+            return (ulong)floatCount * (ulong)GetElementSize();
+        }
+
+        private void PackToPrecision(float[] src, Span<byte> dst, int count)
+        {
+            switch (Precision)
+            {
+                case PrecisionMode.FP16:
+                    PackToFP16(src, dst, count);
+                    break;
+                case PrecisionMode.BF16:
+                    PackToBF16(src, dst, count);
+                    break;
+                default:
+                    PackToFP32(src, dst, count);
+                    break;
+            }
+        }
+
+        private void UnpackFromPrecision(ReadOnlySpan<byte> src, float[] dst, int count)
+        {
+            switch (Precision)
+            {
+                case PrecisionMode.FP16:
+                    UnpackFromFP16(src, dst, count);
+                    break;
+                case PrecisionMode.BF16:
+                    UnpackFromBF16(src, dst, count);
+                    break;
+                default:
+                    UnpackFromFP32(src, dst, count);
+                    break;
+            }
+        }
+
+        private static void PackToFP32(float[] src, Span<byte> dst, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                byte[] bytes = BitConverter.GetBytes(src[i]);
+                dst[i * 4] = bytes[0];
+                dst[i * 4 + 1] = bytes[1];
+                dst[i * 4 + 2] = bytes[2];
+                dst[i * 4 + 3] = bytes[3];
+            }
+        }
+
+        private static void UnpackFromFP32(ReadOnlySpan<byte> src, float[] dst, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                dst[i] = BitConverter.ToSingle(src.Slice(i * 4, 4));
+            }
+        }
+
+        private static void PackToFP16(float[] src, Span<byte> dst, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                Half half = (Half)src[i];
+                byte[] bytes = BitConverter.GetBytes(half);
+                dst[i * 2] = bytes[0];
+                dst[i * 2 + 1] = bytes[1];
+            }
+        }
+
+        private static void UnpackFromFP16(ReadOnlySpan<byte> src, float[] dst, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                Half half = BitConverter.ToHalf(src.Slice(i * 2, 2));
+                dst[i] = (float)half;
+            }
+        }
+
+        private static void PackToBF16(float[] src, Span<byte> dst, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                uint bits = (uint)BitConverter.SingleToUInt32Bits(src[i]);
+                ushort bf16 = (ushort)(bits >> 16);
+                dst[i * 2] = (byte)bf16;
+                dst[i * 2 + 1] = (byte)(bf16 >> 8);
+            }
+        }
+
+        private static void UnpackFromBF16(ReadOnlySpan<byte> src, float[] dst, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                ushort bf16 = (ushort)(src[i * 2] | (src[i * 2 + 1] << 8));
+                uint bits = ((uint)bf16) << 16;
+                dst[i] = BitConverter.UInt32BitsToSingle(bits);
+            }
+        }
+
+        public bool UpdateLossScale(bool hasOverflow)
+        {
+            if (Precision != PrecisionMode.FP16) return false;
+
+            if (hasOverflow)
+            {
+                _lossScale = Math.Max(1.0f, _lossScale * 0.5f);
+                return true;
+            }
+            else
+            {
+                _lossScale = Math.Min(DefaultLossScale, _lossScale * 1.0001f);
+                return false;
+            }
+        }
+
+        public float GetLossScale() => _lossScale;
+
+        public bool RequiresLossScaling => Precision == PrecisionMode.FP16;
 
         public void Synchronize()
         {

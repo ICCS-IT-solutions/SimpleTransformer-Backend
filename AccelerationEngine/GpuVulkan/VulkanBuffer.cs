@@ -401,6 +401,32 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public ReadOnlySpan<float> ReadOnlyHostFloats(int floatCount) => HostFloats(floatCount);
 
         /// <summary>
+        /// Direct byte-level access to the mapped host memory for mixed precision.
+        /// Returns a span of bytes for the given element count at current precision.
+        /// </summary>
+        public Span<byte> HostBytes(int elementCount, int elementSize)
+        {
+            void* target = _mapped;
+            if (target == null && _staging != null)
+                target = _staging.Mapped;
+            if (target == null)
+                throw new InvalidOperationException("Buffer has no mapped host memory.");
+
+            int bytes = elementCount * elementSize;
+            if ((ulong)bytes > SizeBytes)
+                throw new ArgumentOutOfRangeException(
+                    nameof(elementCount),
+                    $"Payload {bytes} B exceeds buffer capacity {SizeBytes} B.");
+
+            return new Span<byte>(target, bytes);
+        }
+
+        /// <summary>
+        /// Read-only byte-level access for mixed precision.
+        /// </summary>
+        public ReadOnlySpan<byte> ReadOnlyHostBytes(int elementCount, int elementSize) => HostBytes(elementCount, elementSize);
+
+        /// <summary>
         /// Marks that the caller wrote bytes directly into <see cref="HostFloats"/>
         /// and they are ready for the staged upload copy.
         /// </summary>
@@ -408,6 +434,17 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         {
             int bytes = floatCount * 4;
             TotalUploadedBytes += bytes;
+            if (_staging != null)
+                PendingUpload = true;
+        }
+
+        /// <summary>
+        /// Marks that the caller wrote bytes directly into <see cref="HostBytes"/>
+        /// and they are ready for the staged upload copy.
+        /// </summary>
+        public void CommitUploadBytes(int byteCount)
+        {
+            TotalUploadedBytes += byteCount;
             if (_staging != null)
                 PendingUpload = true;
         }
@@ -425,6 +462,21 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                     "call MarkReadback() before the dispatch that produces this result.");
             }
             TotalDownloadedBytes += floatCount * 4L;
+        }
+
+        /// <summary>
+        /// Marks that bytes were read directly from <see cref="HostBytes"/> after
+        /// a completed dispatch.
+        /// </summary>
+        public void CommitDownloadBytes(int byteCount)
+        {
+            if (_staging != null && ReadbackWanted)
+            {
+                throw new InvalidOperationException(
+                    "Downloaded a staged buffer whose read-back copy was never recorded: " +
+                    "call MarkReadback() before the dispatch that produces this result.");
+            }
+            TotalDownloadedBytes += byteCount;
         }
 
         public void Upload(ReadOnlySpan<float> data)
