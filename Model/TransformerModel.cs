@@ -1123,7 +1123,13 @@ namespace SimpleTransformer.Model
 
         public float TrainStep(TensorBase inputs, TensorBase expectedOutputs)
         {
-            ZeroGradients();
+            // Gradient accumulation: only zero gradients at the start of an accumulation cycle
+            int accumSteps = TrainingConfig.GradientAccumulationSteps;
+            bool isAccumulationBoundary = (_globalStep % accumSteps) == 0;
+            if (isAccumulationBoundary)
+            {
+                ZeroGradients();
+            }
 
             // Re-key every dropout site for this step before the forward pass, so
             // the masks are a pure function of (site salt, step, batch item) and a
@@ -1151,6 +1157,11 @@ namespace SimpleTransformer.Model
                 // 2. Compute Loss & Initial Backprop Gradient
                 tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 float loss = _loss.Forward(prediction, expectedOutputs);
+                // Scale loss by accumulation steps for proper gradient scaling
+                if (accumSteps > 1)
+                {
+                    loss = loss / accumSteps;
+                }
                 // A non-finite loss means activations already diverged (logits
                 // overflowed to Inf/NaN upstream). Failing here preserves the
                 // last good optimizer state instead of backpropping NaN into
@@ -1170,7 +1181,6 @@ namespace SimpleTransformer.Model
                 // path relies on the launcher's automatic wave coalescing
                 // (OpStart/OpFinish) instead. CPU backends are unaffected either
                 // way.
-                tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 tPhase = profiling ? Stopwatch.GetTimestamp() : 0;
                 try
                 {

@@ -6,6 +6,31 @@ namespace SimpleTransformer.Model
         Sgd
     }
 
+    /// <summary>
+    /// Policy for activation checkpointing to reduce activation memory.
+    /// </summary>
+    public enum CheckpointPolicy
+    {
+        /// <summary>No checkpointing - store all activations.</summary>
+        None = 0,
+        
+        /// <summary>Checkpoint every layer - maximum memory savings, ~30% compute overhead.</summary>
+        EveryLayer = 1,
+        
+        /// <summary>Checkpoint every other layer - balanced memory/compute tradeoff.</summary>
+        EveryOtherLayer = 2,
+        
+        /// <summary>Checkpoint every N layers - configurable tradeoff.</summary>
+        EveryNLayers = 3,
+    }
+
+    public enum PrecisionMode
+    {
+        FP32 = 0,
+        FP16 = 1,
+        BF16 = 2,
+    }
+
     public class TrainingConfig
     {
         // --- Core Hyperparameters ---
@@ -49,6 +74,22 @@ namespace SimpleTransformer.Model
         /// </summary>
         public float MaxGradientNorm { get; set; } = 1.0f;
 
+        /// <summary>
+        /// Number of steps to accumulate gradients before performing an optimizer step.
+        /// Allows simulating larger batch sizes with limited memory.
+        /// </summary>
+        public int GradientAccumulationSteps { get; set; } = 1;
+
+        /// <summary>
+        /// Compute precision mode for training.
+        /// </summary>
+        public PrecisionMode Precision { get; set; } = PrecisionMode.FP32;
+
+        /// <summary>
+        /// Activation checkpointing policy to reduce activation memory.
+        /// </summary>
+        public CheckpointPolicy CheckpointPolicy { get; set; } = CheckpointPolicy.None;
+
         // --- Learning Rate Scheduler ---
         public int WarmupSteps { get; set; } = 0;
         public float MinLearningRate { get; set; } = 1e-5f;
@@ -86,13 +127,16 @@ namespace SimpleTransformer.Model
 
         //Update existing config using a new set of core hyperparameters
         public void UpdateCoreConfig(
-            float? learningRate = null, 
-            int? batchSize = null, 
-            int? epochs = null, 
-            float? dropoutRate = null, 
-            float? weightDecay = null, 
+            float? learningRate = null,
+            int? batchSize = null,
+            int? epochs = null,
+            float? dropoutRate = null,
+            float? weightDecay = null,
             float? maxGradientNorm = null,
-            bool? dropLast = null)
+            bool? dropLast = null,
+            int? gradientAccumulationSteps = null,
+            PrecisionMode? precision = null,
+            CheckpointPolicy? checkpointPolicy = null)
         {
             // Validate arguments before assigning if values exist
             if (learningRate.HasValue && learningRate.Value <= 0f)
@@ -107,6 +151,9 @@ namespace SimpleTransformer.Model
             if (dropoutRate.HasValue && (dropoutRate.Value < 0f || dropoutRate.Value >= 1f))
                 throw new ArgumentOutOfRangeException(nameof(dropoutRate), "Dropout rate must be between [0.0, 1.0).");
 
+            if (gradientAccumulationSteps.HasValue && gradientAccumulationSteps.Value <= 0)
+                throw new ArgumentOutOfRangeException(nameof(gradientAccumulationSteps), "Gradient accumulation steps must be greater than 0.");
+
             // Modern C# Null-Coalescing Assignment
             LearningRate = learningRate ?? LearningRate;
             BatchSize = batchSize ?? BatchSize;
@@ -115,6 +162,9 @@ namespace SimpleTransformer.Model
             WeightDecay = weightDecay ?? WeightDecay;
             MaxGradientNorm = maxGradientNorm ?? MaxGradientNorm;
             DropLast = dropLast ?? DropLast;
+            GradientAccumulationSteps = gradientAccumulationSteps ?? GradientAccumulationSteps;
+            Precision = precision ?? Precision;
+            CheckpointPolicy = checkpointPolicy ?? CheckpointPolicy;
         }
     }
 }
