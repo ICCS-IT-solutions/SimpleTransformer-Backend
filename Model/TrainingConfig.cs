@@ -1,36 +1,5 @@
 namespace SimpleTransformer.Model
 {
-    public enum OptimizerType
-    {
-        AdamW,
-        Sgd
-    }
-
-    /// <summary>
-    /// Policy for activation checkpointing to reduce activation memory.
-    /// </summary>
-    public enum CheckpointPolicy
-    {
-        /// <summary>No checkpointing - store all activations.</summary>
-        None = 0,
-        
-        /// <summary>Checkpoint every layer - maximum memory savings, ~30% compute overhead.</summary>
-        EveryLayer = 1,
-        
-        /// <summary>Checkpoint every other layer - balanced memory/compute tradeoff.</summary>
-        EveryOtherLayer = 2,
-        
-        /// <summary>Checkpoint every N layers - configurable tradeoff.</summary>
-        EveryNLayers = 3,
-    }
-
-    public enum PrecisionMode
-    {
-        FP32 = 0,
-        FP16 = 1,
-        BF16 = 2,
-    }
-
     public class TrainingConfig
     {
         // --- Core Hyperparameters ---
