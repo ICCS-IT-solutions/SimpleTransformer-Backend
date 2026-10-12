@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using SimpleTransformer.Model;
 
 using Silk.NET.Vulkan;
 
@@ -8,6 +9,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
 {
     public enum VulkanKernel
     {
+        // FP32 kernels
         Scale,
         Fill,
         AddInPlace,
@@ -26,7 +28,23 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         ApplyMask,
         Transpose,
         Copy,
-        Clamp
+        Clamp,
+
+        // FP16 kernels
+        ScaleFP16,
+        FillFP16,
+        AddInPlaceFP16,
+        AddIntoFP16,
+        MulInPlaceFP16,
+        MulIntoFP16,
+
+        // BF16 kernels
+        ScaleBF16,
+        FillBF16,
+        AddInPlaceBF16,
+        AddIntoBF16,
+        MulInPlaceBF16,
+        MulIntoBF16,
     }
 
     internal struct PushConstants
@@ -141,6 +159,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         [ThreadStatic] private static bool t_recorded;
 
         private readonly VulkanContext _ctx;
+        private readonly PrecisionMode _precision = PrecisionMode.FP32;
         private readonly Dictionary<VulkanKernel, Pipeline> _pipelines = new();
         private readonly Dictionary<VulkanKernel, PipelineLayout> _layouts = new();
         private readonly Dictionary<VulkanKernel, DescriptorSetLayout> _setLayouts = new();
@@ -253,9 +272,12 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
                 => HashCode.Combine(_h0, _h1, _h2, _h3, _count);
         }
 
-        public VulkanKernelLauncher(VulkanContext ctx, VulkanShaderCompiler compiler)
+        public VulkanKernelLauncher(VulkanContext ctx, VulkanShaderCompiler compiler, PrecisionMode precision = PrecisionMode.FP32)
         {
             _ctx = ctx;
+            _precision = precision;
+
+            // Always register FP32 kernels (fallback)
             Register(VulkanKernel.Scale, compiler, VulkanShaders.Scale, 1, 8);
             Register(VulkanKernel.Fill, compiler, VulkanShaders.Fill, 1, 8);
             Register(VulkanKernel.AddInPlace, compiler, VulkanShaders.AddInPlace, 2, 8);
@@ -275,6 +297,28 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             Register(VulkanKernel.Transpose, compiler, VulkanShaders.Transpose, 2, 16);
             Register(VulkanKernel.Copy, compiler, VulkanShaders.Copy, 2, 16);
             Register(VulkanKernel.Clamp, compiler, VulkanShaders.Clamp, 1, 16);
+
+            // Register FP16 kernels if device supports them and precision is FP16
+            if (precision == PrecisionMode.FP16 && ctx != null && ctx.SupportsFP16)
+            {
+                Register(VulkanKernel.ScaleFP16, compiler, VulkanShaders.ScaleFP16, 1, 8);
+                Register(VulkanKernel.FillFP16, compiler, VulkanShaders.FillFP16, 1, 8);
+                Register(VulkanKernel.AddInPlaceFP16, compiler, VulkanShaders.AddInPlaceFP16, 2, 8);
+                Register(VulkanKernel.AddIntoFP16, compiler, VulkanShaders.AddIntoFP16, 3, 8);
+                Register(VulkanKernel.MulInPlaceFP16, compiler, VulkanShaders.MulInPlaceFP16, 2, 8);
+                Register(VulkanKernel.MulIntoFP16, compiler, VulkanShaders.MulIntoFP16, 3, 8);
+            }
+
+            // Register BF16 kernels if device supports them and precision is BF16
+            if (precision == PrecisionMode.BF16 && ctx != null && ctx.SupportsBF16)
+            {
+                Register(VulkanKernel.ScaleBF16, compiler, VulkanShaders.ScaleBF16, 1, 8);
+                Register(VulkanKernel.FillBF16, compiler, VulkanShaders.FillBF16, 1, 8);
+                Register(VulkanKernel.AddInPlaceBF16, compiler, VulkanShaders.AddInPlaceBF16, 2, 8);
+                Register(VulkanKernel.AddIntoBF16, compiler, VulkanShaders.AddIntoBF16, 3, 8);
+                Register(VulkanKernel.MulInPlaceBF16, compiler, VulkanShaders.MulInPlaceBF16, 2, 8);
+                Register(VulkanKernel.MulIntoBF16, compiler, VulkanShaders.MulIntoBF16, 3, 8);
+            }
 
             // Sized for a batch, not for one op: a coalesced batch can carry one
             // distinct binding tuple per dispatch (every Parallel.For worker in a

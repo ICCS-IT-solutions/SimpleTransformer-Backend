@@ -104,6 +104,16 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
         public bool SupportsVramWorkingSet => ResizableBarEnabled;
 
         /// <summary>
+        /// True when the device supports VK_KHR_shader_fp16 extension and it was enabled.
+        /// </summary>
+        public bool SupportsFP16 => _shaderFP16Enabled;
+
+        /// <summary>
+        /// True when the device supports VK_KHR_shader_bfloat16 extension and it was enabled.
+        /// </summary>
+        public bool SupportsBF16 => _shaderBF16Enabled;
+
+        /// <summary>
         /// Device memory a resident working set could use: the mappable device-local
         /// size when ReBAR is on, otherwise 0 because the BAR window is too small
         /// and too slow to be useful for per-op data.

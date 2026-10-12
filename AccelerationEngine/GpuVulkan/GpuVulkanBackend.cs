@@ -480,7 +480,7 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             try
             {
                 var compiler = new VulkanShaderCompiler();
-                var launcher = new VulkanKernelLauncher(ctx, compiler);
+                var launcher = new VulkanKernelLauncher(ctx, compiler, Precision);
                 _ctx = ctx;
                 _compiler = compiler;
                 _launcher = launcher;
@@ -1135,23 +1135,66 @@ namespace SimpleTransformer.AccelerationEngine.GpuVulkan
             }
         }
 
+        // Precision-aware kernel selection helpers
+        private VulkanKernel GetScaleKernel() => Precision switch
+        {
+            PrecisionMode.FP16 => VulkanKernel.ScaleFP16,
+            PrecisionMode.BF16 => VulkanKernel.ScaleBF16,
+            _ => VulkanKernel.Scale,
+        };
+
+        private VulkanKernel GetFillKernel() => Precision switch
+        {
+            PrecisionMode.FP16 => VulkanKernel.FillFP16,
+            PrecisionMode.BF16 => VulkanKernel.FillBF16,
+            _ => VulkanKernel.Fill,
+        };
+
+        private VulkanKernel GetAddInPlaceKernel() => Precision switch
+        {
+            PrecisionMode.FP16 => VulkanKernel.AddInPlaceFP16,
+            PrecisionMode.BF16 => VulkanKernel.AddInPlaceBF16,
+            _ => VulkanKernel.AddInPlace,
+        };
+
+        private VulkanKernel GetMulInPlaceKernel() => Precision switch
+        {
+            PrecisionMode.FP16 => VulkanKernel.MulInPlaceFP16,
+            PrecisionMode.BF16 => VulkanKernel.MulInPlaceBF16,
+            _ => VulkanKernel.MulInPlace,
+        };
+
+        private VulkanKernel GetAddIntoKernel() => Precision switch
+        {
+            PrecisionMode.FP16 => VulkanKernel.AddIntoFP16,
+            PrecisionMode.BF16 => VulkanKernel.AddIntoBF16,
+            _ => VulkanKernel.AddInto,
+        };
+
+        private VulkanKernel GetMulIntoKernel() => Precision switch
+        {
+            PrecisionMode.FP16 => VulkanKernel.MulIntoFP16,
+            PrecisionMode.BF16 => VulkanKernel.MulIntoBF16,
+            _ => VulkanKernel.MulInto,
+        };
+
         public void ScaleInPlace(TensorBase tensor, float scalar)
-            => RunUnary(VulkanKernel.Scale, tensor, scalar);
+            => RunUnary(GetScaleKernel(), tensor, scalar);
 
         public void Fill(TensorBase tensor, float value)
-            => RunUnary(VulkanKernel.Fill, tensor, value);
+            => RunUnary(GetFillKernel(), tensor, value);
 
         public void ElementWiseAddInPlace(TensorBase target, TensorBase source)
-            => RunBinaryInPlace(VulkanKernel.AddInPlace, target, source);
+            => RunBinaryInPlace(GetAddInPlaceKernel(), target, source);
 
         public void ElementWiseAddInto(TensorBase a, TensorBase b, TensorBase result)
-            => RunBinaryInto(VulkanKernel.AddInto, a, b, result);
+            => RunBinaryInto(GetAddIntoKernel(), a, b, result);
 
         public void ElementWiseMultiplyInPlace(TensorBase target, TensorBase source)
-            => RunBinaryInPlace(VulkanKernel.MulInPlace, target, source);
+            => RunBinaryInPlace(GetMulInPlaceKernel(), target, source);
 
         public void ElementWiseMultiplyInto(TensorBase a, TensorBase b, TensorBase result)
-            => RunBinaryInto(VulkanKernel.MulInto, a, b, result);
+            => RunBinaryInto(GetMulIntoKernel(), a, b, result);
 
         public void GeluInPlace(TensorBase tensor)
         {
